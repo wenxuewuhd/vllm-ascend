@@ -70,43 +70,63 @@ class EngramLayout:
 
     # -- the convention both sides use ---------------------------------------
 
-    def row_index(self, token_index: int, hash_col: int) -> int:
-        """Where a (token, hash column) pair lives in the staging buffer.
+    def row_index(self, token_index: int, local_col: int,
+                  local_cols: int) -> int:
+        """Where a (token, local hash column) pair lives in the staging buffer.
 
-        The single definition: the CPU writes here and the kernel recomputes
-        the same value from its program id.
+        The single definition: the CPU gather writes row-major in this order.
+        ``local_cols`` is the number of hash columns THIS RANK owns, not the
+        model's total: the staging buffer only ever holds this rank's columns.
+        At TP=1 the two coincide, which is why the global count worked until
+        sharding was attempted. The dequant kernel does not re-derive this --
+        it walks flat rows by program id -- so this is the only definition.
         """
-        return token_index * self.n_hash_cols + hash_col
+        return token_index * local_cols + local_col
 
-    def staging_shapes(self, num_tokens: int) -> tuple[tuple[int, int],
-                                                        tuple[int, int]]:
-        rows = num_tokens * self.n_hash_cols
+    def staging_shapes(self, num_tokens: int, local_cols: int | None = None
+                       ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Shapes for ``local_cols`` owned columns (default: all of them)."""
+        cols = self.n_hash_cols if local_cols is None else local_cols
+        rows = num_tokens * cols
         return (rows, self.dim), (rows, self.n_scales)
 
-    def staging_bytes(self, num_tokens: int) -> int:
-        return num_tokens * self.n_hash_cols * self.row_bytes
+    def staging_bytes(self, num_tokens: int,
+                      local_cols: int | None = None) -> int:
+        cols = self.n_hash_cols if local_cols is None else local_cols
+        return num_tokens * cols * self.row_bytes
 
     # -- the two guards ------------------------------------------------------
 
-    def assert_head_sharding_is_degenerate(self, local_heads: int,
+    def assert_column_shard_is_well_formed(self, local_heads: int,
                                            total_heads: int,
                                            head_start: int) -> None:
-        """``row_index`` assumes every rank owns all hash columns (TP=1).
+        """This rank's hash columns must be a contiguous in-range window.
 
-        Under sharding it would return valid row numbers for the wrong rows,
-        so this refuses instead.
+        Replaces an earlier guard that refused any sharding at all. Staging is
+        sharding-correct now because the ids are GLOBAL row numbers and every
+        rank maps the whole table, so a rank only has to gather its own
+        columns. What must still hold is that the window is real: a bad
+        head_start would gather valid row numbers for the wrong columns, which
+        no downstream check would notice, so it is asserted loudly here.
         """
-        if not (local_heads == total_heads == self.n_hash_cols
-                and head_start == 0):
+        if total_heads != self.n_hash_cols:
             raise ValueError(
-                f"engram staging assumes undivided hash columns, but this rank "
-                f"has local_heads={local_heads}, total_heads={total_heads}, "
-                f"head_start={head_start} against n_hash_cols="
-                f"{self.n_hash_cols}. row_index() numbers rows as "
-                "token * n_hash_cols + head, which is only the whole picture "
-                "when the columns are not split. Under sharding it would keep "
-                "returning valid row numbers for the wrong rows, so this "
-                "refuses rather than continuing.")
+                f"engram staging: total_heads={total_heads} disagrees with the "
+                f"layout's n_hash_cols={self.n_hash_cols}; they are the same "
+                "quantity derived twice, so a mismatch means the layout and "
+                "the module were built from different configs.")
+        if local_heads <= 0 or head_start < 0:
+            raise ValueError(
+                f"engram staging: degenerate column shard local_heads="
+                f"{local_heads}, head_start={head_start}.")
+        if head_start + local_heads > total_heads:
+            raise ValueError(
+                f"engram staging: this rank claims columns "
+                f"[{head_start}, {head_start + local_heads}) of only "
+                f"{total_heads}. Upstream pads the last rank's window "
+                "(pad_heads) when n_hash_cols is not divisible by the TP size; "
+                "that padding is not implemented for the staged path, so this "
+                "refuses rather than gathering out-of-range columns.")
 
     def validate_against_files(self, stage_dir: str,
                                file_name) -> None:
@@ -155,9 +175,10 @@ def gather_into_staging(weight_table, scale_table, row_ids,
     """Copy the rows a step needs into the staging buffers.
 
     ``row_ids[r]`` is the table row wanted at staging row ``r``, where ``r`` is
-    ``layout.row_index(token, hash_col)``. No de-duplication: repeated ids are
+    ``layout.row_index(token, local_col, local_cols)`` -- the columns counted
+    there are THIS RANK's, not the model's. No de-duplication: repeated ids are
     copied repeatedly, which keeps the row count a function of the token count
-    (the capture route relies on that).
+    alone (the capture route relies on that).
     """
     import numpy as np
 

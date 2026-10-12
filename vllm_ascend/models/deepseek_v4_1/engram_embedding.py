@@ -230,7 +230,11 @@ class AscendStagedEngramEmbedding:
         their device addresses stay fixed for graph replay."""
         import numpy as np
 
-        (wshape, sshape) = layout.staging_shapes(max_tokens)
+        # This rank's columns only. Sizing with the model-wide n_hash_cols
+        # would over-allocate by the TP size and, worse, disagree with the
+        # row count the fill path computes from part_n_hash_cols.
+        (wshape, sshape) = layout.staging_shapes(max_tokens,
+                                                 self.part_n_hash_cols)
         self._layout = layout
         self._max_tokens = max_tokens
         self._host_weight = np.empty(wshape, dtype=np.uint8)
@@ -296,7 +300,9 @@ class AscendStagedEngramEmbedding:
             raise AssertionError(
                 f"{flat.numel()} ids for {rows} staging rows -- the row "
                 "numbering the gather recomputes would not match. "
-                "(EngramLayout.row_index is the only definition of it.)")
+                "(EngramLayout.row_index is the only definition of it; ids "
+                "must already be narrowed to this rank's columns by "
+                "own_columns().)")
         if flat.dtype == torch.int64:
             pin_ids, ids_np = self._pin_ids64, self._pin_ids64_np
         elif flat.dtype == torch.int32:
@@ -325,6 +331,27 @@ class AscendStagedEngramEmbedding:
 
         self._dequantize_staged(rows, out)
 
+    def own_columns(self, ids: torch.Tensor) -> torch.Tensor:
+        """Narrow ``[tokens, n_hash_cols]`` to this rank's hash columns.
+
+        Callers upstream compute all of the model's hash columns (the hash
+        kernel writes every column for every token), while the staging buffer
+        holds only this rank's. The ids are GLOBAL table row numbers and every
+        rank maps the whole table, so narrowing is all that is needed -- no
+        rebase by vocab_start, which is what upstream's sharded-buffer
+        backends do instead (vllm engram.py:602).
+        """
+        cols = self.part_n_hash_cols
+        self._layout.assert_column_shard_is_well_formed(
+            cols, self.n_hash_cols, self.head_start)
+        if ids.shape[-1] == cols:
+            return ids                      # already narrowed (or TP=1)
+        if ids.shape[-1] != self.n_hash_cols:
+            raise ValueError(
+                f"engram ids have {ids.shape[-1]} columns, expected either "
+                f"this rank's {cols} or the model's {self.n_hash_cols}.")
+        return ids[..., self.head_start:self.head_start + cols]
+
     def lookup(self, indices: torch.Tensor, out: torch.Tensor,
                background: bool = False) -> None:
         """Gather on the host, copy once, let the kernel read HBM.
@@ -332,7 +359,7 @@ class AscendStagedEngramEmbedding:
         ``indices`` is ``[num_tokens, n_hash_cols]`` of table rows. Flattened
         row-major it is already in staging order (``EngramLayout.row_index``)
         while the hash columns are undivided, which is checked by
-        ``assert_head_sharding_is_degenerate``.
+        ``own_columns`` narrowing them to this rank's.
         """
         from vllm_ascend.models.deepseek_v4_1.engram_layout import \
             gather_into_staging
@@ -347,8 +374,7 @@ class AscendStagedEngramEmbedding:
             raise RuntimeError(
                 "engram staging buffers are not allocated; call "
                 "allocate_staging() after construction.")
-        layout.assert_head_sharding_is_degenerate(
-            self.part_n_hash_cols, self.n_hash_cols, self.head_start)
+        indices = self.own_columns(indices)
         if num_tokens > self._max_tokens:
             raise ValueError(
                 f"{num_tokens} tokens exceeds the {self._max_tokens} the "
@@ -425,8 +451,7 @@ class AscendStagedEngramEmbedding:
                 "synchronises and runs host code, so it must run before the "
                 "captured forward.")
         cols = self.part_n_hash_cols
-        self._layout.assert_head_sharding_is_degenerate(
-            cols, self.n_hash_cols, self.head_start)
+        host_ids = self.own_columns(host_ids)
         if not 0 <= num_actual_tokens <= num_tokens <= self._max_tokens:
             raise ValueError(
                 f"engram staging for {num_actual_tokens} real of {num_tokens} "
