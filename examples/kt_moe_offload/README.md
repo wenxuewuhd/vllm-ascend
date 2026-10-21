@@ -421,13 +421,34 @@ curl --noproxy '*' -s "http://127.0.0.1:$PORT/metrics" \
   | sed -n '/^vllm:spec_decode_.*_total/p'
 ```
 
-The 2026-10-21 Ascend950 run passed five generation smoke checks: arithmetic,
-Chinese text, streaming output, a 2101-token prefill, and 192-token generation.
-However, **254 drafts proposed 1270 tokens and only 2 were accepted (0.1575%)**;
-per-position accepted counts were `[2, 0, 0, 0, 0]`. This establishes execution
-and counter activity, but does not establish useful acceleration or accuracy
-equivalence. The very low acceptance rate remains unresolved. The non-DSpark
-latency and accuracy results elsewhere in this document do not apply to it.
+The initial 2026-10-21 run accepted only 2 of 1270 proposed tokens (0.1575%).
+The cause was the original-KV index space: SparseFlashMla expects logical token
+positions within each request and applies `ori_block_table` itself. Passing
+physical KV slots applied the page mapping twice and read unrelated cache pages.
+The DSpark and vision index builders now select logical indices for this
+backend; the legacy shared-KV backend retains physical slots.
+
+A controlled comparison using the same prompt and no tracing accepted 0/290
+tokens before the fix and 35/120 afterward, with identical generated text.
+Captured attention outputs from all three draft layers then matched the CPU
+reference with cosine similarity at least 0.999994 and maximum absolute error
+0.010446. A native NPU regression checks two nonidentity page permutations
+against a dense reference and confirms that the old physical indices fail.
+
+A fresh service using the final source on physical device 4 passed all five
+generation smoke checks: arithmetic (`391`), Chinese text, streamed primes
+(`2, 3, 5, 7, 11`), a 2101-token prefill returning `7391`, and 192-token
+generation. **120 drafts proposed 600 tokens and accepted 142 (23.67%)**;
+per-position accepted counts were `[74, 40, 19, 7, 2]`. All three draft layers
+reported 128 experts in HBM and no kt offload. The targeted suite passed 280
+unit tests plus the native NPU regression. The final service used no attention
+tracing, worker extension, or development RPC endpoint.
+
+These are functional and attention-correctness checks, not a representative
+quality evaluation or acceleration benchmark. Acceptance depends on the
+workload. The non-DSpark latency and accuracy results elsewhere in this document
+do not apply to this configuration. Multimodal end-to-end generation remains
+unverified despite coverage of the shared vision index builder.
 
 On a shared host, release only the Engram staging files and mounts owned by
 your run. The smoke check reused existing Engram tables through a read-only

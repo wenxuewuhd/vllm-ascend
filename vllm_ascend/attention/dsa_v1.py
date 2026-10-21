@@ -764,11 +764,17 @@ def build_dspark_swa_indices(
     indices_output: torch.Tensor | None = None,
     buffer: torch.Tensor | None = None,
     lengths_output: torch.Tensor | None = None,
+    logical_indices: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build DSpark non-causal visible slot ids for a paged SWA cache.
+    """Build DSpark non-causal visibility indices for a paged SWA cache.
 
     Each token in a draft block sees the trailing context window plus the
     whole current draft block. Invalid/padded rows get lens=0 and -1 slots.
+
+    SparseFlashMla expects request-relative token positions and applies the
+    block table itself. Set ``logical_indices=True`` for that backend; the
+    default retains physical slot ids for the legacy shared-KV operator.
+    Mapping twice reads unrelated cache pages when block ids are not identity.
 
     When ``buffer`` is given, the per-token slots are copied into its leading
     rows and the returned tensor is a slice view of ``buffer``. This keeps the
@@ -796,13 +802,15 @@ def build_dspark_swa_indices(
     cols = torch.arange(index_width, device=start_pos.device)
     col_mask = cols[None, :] < visible_lens[:, None]
     pos = start_pos[:, None] + cols[None, :]
-    block_nums = pos // block_size
-    # Clamp to valid block-table columns so gather never goes OOB on the
-    # out-of-range columns (their results are discarded by col_mask anyway).
-    safe_nums = block_nums.clamp(min=0, max=int(block_table.shape[1]) - 1)
-    block_offsets = pos % block_size
-    block_ids = torch.gather(block_table, 1, safe_nums)
-    slot_ids = (block_ids * block_size + block_offsets).to(torch.int32)
+    if logical_indices:
+        slot_ids = pos.to(torch.int32)
+    else:
+        block_nums = pos // block_size
+        # Padded columns may exceed the table; their gathered values are masked.
+        safe_nums = block_nums.clamp(min=0, max=int(block_table.shape[1]) - 1)
+        block_offsets = pos % block_size
+        block_ids = torch.gather(block_table, 1, safe_nums)
+        slot_ids = (block_ids * block_size + block_offsets).to(torch.int32)
     slot_ids = slot_ids.where(col_mask, torch.full_like(slot_ids, -1))
 
     per_token_slots = torch.repeat_interleave(slot_ids, query_lens, dim=0, output_size=num_decode_tokens).unsqueeze(1)
@@ -889,6 +897,7 @@ def build_vision_bidirectional_swa_indices(
     seq_lens: torch.Tensor,
     mm_prefix_ranges: dict[int, list[tuple[int, int]]],
     num_tokens: int,
+    logical_indices: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build paged original-KV indices with bidirectional image spans.
 
@@ -897,6 +906,10 @@ def build_vision_bidirectional_swa_indices(
     union of that causal window and its complete image span. The fixed output
     width is ``window_size + max_image_tokens`` so it is graph- and
     operator-workspace friendly.
+
+    ``logical_indices`` follows the same backend contract as the DSpark
+    builder: SparseFlashMla performs the page lookup, while the legacy
+    shared-KV operator consumes physical slot ids.
     """
     if max_image_tokens <= 0:
         raise ValueError("max_image_tokens must be positive for vision SWA")
@@ -949,18 +962,14 @@ def build_vision_bidirectional_swa_indices(
     columns = torch.arange(index_width, device=block_table.device)
     visible = columns.unsqueeze(0) < visible_lens.unsqueeze(1)
     visible_positions = start_positions.unsqueeze(1) + columns.unsqueeze(0)
-    block_numbers = visible_positions // int(block_size)
-    safe_block_numbers = block_numbers.clamp(
-        min=0,
-        max=block_table.shape[1] - 1,
-    )
-    request_block_tables = block_table[req_ids]
-    block_ids = torch.gather(
-        request_block_tables,
-        1,
-        safe_block_numbers,
-    )
-    slot_ids = (block_ids * int(block_size) + visible_positions % int(block_size)).to(torch.int32)
+    if logical_indices:
+        slot_ids = visible_positions.to(torch.int32)
+    else:
+        block_numbers = visible_positions // int(block_size)
+        safe_block_numbers = block_numbers.clamp(min=0, max=block_table.shape[1] - 1)
+        request_block_tables = block_table[req_ids]
+        block_ids = torch.gather(request_block_tables, 1, safe_block_numbers)
+        slot_ids = (block_ids * int(block_size) + visible_positions % int(block_size)).to(torch.int32)
     slot_ids = slot_ids.where(visible, torch.full_like(slot_ids, -1))
     return slot_ids.unsqueeze(1), visible_lens.to(torch.int32)
 
@@ -1555,6 +1564,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 self.seq_lens[: self.num_decodes],
                 self.num_decode_tokens,
                 buffer=self.dspark_swa_indices_buffer,
+                logical_indices=get_dsa_attn_kv_plan(self.vllm_config).uses_sparse_flash_mla,
             )
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
         # Text-only requests and lightweight metadata fixtures do not carry
@@ -1586,6 +1596,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 seq_lens=seq_lens[:actual_reqs],
                 mm_prefix_ranges=mm_ranges,
                 num_tokens=self.num_actual_tokens,
+                logical_indices=get_dsa_attn_kv_plan(self.vllm_config).uses_sparse_flash_mla,
             )
         if not has_prefill and self.common_ratio_to_sas_metadata.get(layer_name) is None:
             cu_seqlens_ori_kv = DeviceOperator.get_dsa_decode_cu_seqlens_ori_kv(
@@ -1928,14 +1939,17 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     )
                 dspark_swa_indices = self.dspark_swa_indices_buffer[: self.num_actual_tokens]
                 dspark_topk_length = self.dspark_swa_topk_length_buffer[: self.num_actual_tokens]
+                logical_indices = get_dsa_attn_kv_plan(self.vllm_config).uses_sparse_flash_mla
                 build_dspark_swa = lambda: build_dspark_swa_indices(
                     *dspark_swa_args,
                     indices_output=dspark_swa_indices,
                     lengths_output=dspark_topk_length,
+                    logical_indices=logical_indices,
                 )
             else:
                 dspark_swa_indices, dspark_topk_length = build_dspark_swa_indices(
-                    *dspark_swa_args)
+                    *dspark_swa_args,
+                    logical_indices=get_dsa_attn_kv_plan(self.vllm_config).uses_sparse_flash_mla)
                 dspark_swa_indices = dspark_swa_indices[: self.num_actual_tokens]
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
 
