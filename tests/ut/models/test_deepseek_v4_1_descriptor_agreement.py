@@ -10,7 +10,6 @@ Also here: the descriptor check, whose value is mostly in what it admits it
 cannot see.
 """
 
-import ast
 import inspect
 
 import pytest
@@ -18,7 +17,6 @@ import torch
 
 from vllm_ascend.attention import sparse_flash_mla as adapter
 from vllm_ascend.models.deepseek_v4_1 import sparse_attn_args as args
-
 
 # ---------------------------------------------------------------- one source
 
@@ -178,20 +176,3 @@ def test_an_explicit_length_is_never_overwritten():
               "cmp_kv": torch.zeros(1), "seqused_cmp_kv": supplied}
     adapter._add_compressed_kv_lengths(kwargs)
     assert kwargs["seqused_cmp_kv"] is supplied
-
-
-# ------------------------------------------------------------- space contract
-
-def test_the_slot_space_of_the_index_tensor_is_stated_in_the_contract():
-    """The space lived in one local variable's name and died at the first
-    assignment. Any range check needs it, so it is written down where the
-    tensor crosses the boundary."""
-    doc = " ".join(args.select_ori_sparse_indices.__doc__.split())
-    assert "slot space" in doc
-    assert "block_id * storage_block_size" in doc
-
-    source = inspect.getsource(args.build_sparse_flash_mla_kwargs)
-    tree = ast.parse(source.strip())
-    assert "Slot space" in source, (
-        "the parameter no longer records which space it is in")
-    assert tree is not None

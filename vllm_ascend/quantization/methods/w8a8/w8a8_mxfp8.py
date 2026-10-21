@@ -134,10 +134,13 @@ def recover_e8m0_scale_bytes(
         # NUMBER instead -- the failure this whole comment is about -- lands off a power
         # of two for 247 of the 256 codes, so any real scale tile trips this.
         off_power_of_two = (bits & FP32_MANTISSA_MASK != 0) & (exponent != 0) & (exponent != FP32_EXPONENT_MASK)
-        if bool(off_power_of_two.any()):
+        # This is a load-time validity check. Reduce on CPU because the
+        # image's CANN ReduceAny kernel times out on 40,960 bool elements.
+        off_power_of_two_cpu = off_power_of_two.cpu()
+        if bool(off_power_of_two_cpu.any()):
             raise ValueError(
                 f"{param_name}: float32 block scales must be value-copied e8m0 codes, i.e. powers of "
-                f"two, but {int(off_power_of_two.sum())} of {off_power_of_two.numel()} elements are not. "
+                f"two, but {int(off_power_of_two_cpu.sum())} of {off_power_of_two.numel()} elements are not. "
                 "The checkpoint bytes were most likely copied as numbers rather than converted from "
                 "float8_e8m0fnu, which destroys every exponent. "
                 + _scale_dtype_provenance(dtype, declared_dtype, prefix)
@@ -152,7 +155,7 @@ def recover_e8m0_scale_bytes(
     )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def assert_e8m0_scale_load_preserves_bytes(param_dtype: torch.dtype, loader_gives_byte_view: bool) -> None:
     """Fail unless this (loader half, declared dtype) pair round-trips every e8m0 byte.
 
@@ -708,9 +711,15 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         )
         # Broadcast the [out/block, in/block] tile scales to [out, in/group_size], the layout
         # npu_quant_matmul consumes: (4, 128) for a 128 block, (1, 32) for a 32 block.
-        layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(
-            self.block_size // self.group_size, dim=1
-        ).repeat_interleave(self.block_size, dim=0)
+        # Expand the byte scales on CPU at load time; this image's large
+        # RepeatInterleave NPU kernel also times out for uint8 scale tiles.
+        scale_device = layer.weight_scale.device
+        layer.weight_scale.data = (
+            layer.weight_scale.data.cpu()
+            .repeat_interleave(self.block_size // self.group_size, dim=1)
+            .repeat_interleave(self.block_size, dim=0)
+            .to(scale_device)
+        )
         n_dim, k_dim = layer.weight_scale.data.shape
         layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
         layer.weight.data = layer.weight.data.transpose(0, 1)

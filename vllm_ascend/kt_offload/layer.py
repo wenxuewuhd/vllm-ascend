@@ -292,6 +292,16 @@ def create_layer_offload(ascend_config, init_fn, args: tuple, kwargs: dict) -> K
 
     layer_idx = _layer_index(layer_name)
     if layer_idx >= num_layers:
+        from vllm_ascend.kt_offload.config import uses_hbm_dspark_draft
+
+        if uses_hbm_dspark_draft(vllm_config):
+            draft_hf = vllm_config.speculative_config.draft_model_config.hf_config
+            num_draft_layers = (
+                getattr(draft_hf, "n_mtp_layers", None) or getattr(draft_hf, "num_nextn_predict_layers", None) or 3
+            )
+            if layer_idx < num_layers + num_draft_layers:
+                logger.info("kt_offload: %s keeps all %d draft experts in HBM", layer_name, num_experts)
+                return None
         raise ValueError(
             f"kt_offload: MoE layer {layer_name!r} is past the {num_layers} main layers (MTP/draft); "
             "offload of draft experts is not implemented."

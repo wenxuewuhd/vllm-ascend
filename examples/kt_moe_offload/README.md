@@ -389,6 +389,72 @@ so neither figure carries to a third setting.
 which adds about 3-4 minutes (measured: ~400 s to ready). A run that looks hung at "loading weights" is
 usually still doing that.
 
+### Experimental single-card DSpark
+
+DeepSeek-V4.1-Flash includes three DSpark draft layers in the target checkpoint's
+`mtp.*` tensors. Each draft layer keeps all 128 routed experts in HBM; its
+`kt_offload` is `None`. The target's 40 layers continue to use the configured
+100 resident expert slots and CPU offload. The draft tensors total about
+7.39 GiB, including about 6.72 GiB of expert weights.
+
+After completing the setup above, select an idle physical card and use the
+low-latency profile with these additional arguments:
+
+```bash
+export CARD=4  # choose an idle physical device on your host
+npu-smi info -t proc-mem -i "$CARD"
+
+export EXTRA_ARGS='--language-model-only --no-async-scheduling --compilation-config {"cudagraph_capture_sizes":[6],"max_cudagraph_capture_size":6} --speculative-config {"method":"dspark","num_speculative_tokens":5,"enforce_eager":true}'
+bash examples/kt_moe_offload/serve_lowlatency.sh
+```
+
+This configuration uses one request at a time, a maximum model length of 8192,
+bf16 KV, eager draft execution, and a six-token target verification graph.
+Async scheduling and multi-card DSpark have not been validated for this path.
+
+Check for three startup messages containing
+`DSpark draft expert placement: local=128 logical=128 kt_offload=None` and
+inspect actual request counters after generation:
+
+```bash
+curl --noproxy '*' -s "http://127.0.0.1:$PORT/metrics" \
+  | sed -n '/^vllm:spec_decode_.*_total/p'
+```
+
+The initial 2026-10-21 run accepted only 2 of 1270 proposed tokens (0.1575%).
+The cause was the original-KV index space: SparseFlashMla expects logical token
+positions within each request and applies `ori_block_table` itself. Passing
+physical KV slots applied the page mapping twice and read unrelated cache pages.
+The DSpark and vision index builders now select logical indices for this
+backend; the legacy shared-KV backend retains physical slots.
+
+A controlled comparison using the same prompt and no tracing accepted 0/290
+tokens before the fix and 35/120 afterward, with identical generated text.
+Captured attention outputs from all three draft layers then matched the CPU
+reference with cosine similarity at least 0.999994 and maximum absolute error
+0.010446. A native NPU regression checks two nonidentity page permutations
+against a dense reference and confirms that the old physical indices fail.
+
+A fresh service using the final source on physical device 4 passed all five
+generation smoke checks: arithmetic (`391`), Chinese text, streamed primes
+(`2, 3, 5, 7, 11`), a 2101-token prefill returning `7391`, and 192-token
+generation. **120 drafts proposed 600 tokens and accepted 142 (23.67%)**;
+per-position accepted counts were `[74, 40, 19, 7, 2]`. All three draft layers
+reported 128 experts in HBM and no kt offload. The targeted suite passed 280
+unit tests plus the native NPU regression. The final service used no attention
+tracing, worker extension, or development RPC endpoint.
+
+These are functional and attention-correctness checks, not a representative
+quality evaluation or acceleration benchmark. Acceptance depends on the
+workload. The non-DSpark latency and accuracy results elsewhere in this document
+do not apply to this configuration. Multimodal end-to-end generation remains
+unverified despite coverage of the shared vision index builder.
+
+On a shared host, release only the Engram staging files and mounts owned by
+your run. The smoke check reused existing Engram tables through a read-only
+mount; after stopping its service and container, the device and port were free
+and the original shared files were unchanged.
+
 ## 8. Check it is actually serving
 
 `Application startup complete` is printed before the model can answer. Ask it:

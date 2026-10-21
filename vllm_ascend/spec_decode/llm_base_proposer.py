@@ -80,6 +80,17 @@ _HIDDEN_STATE_DRAFTER_TYPES = (
 )
 
 
+def _is_hidden_state_drafter(model, method: str) -> bool:
+    if isinstance(model, _HIDDEN_STATE_DRAFTER_TYPES):
+        return True
+    if method != "dspark":
+        return False
+    # Import only after the V4.1 model has applied its platform adaptations.
+    from vllm_ascend.models.deepseek_v4_1.dspark import AscendDSparkDeepseekV41ForCausalLM
+
+    return isinstance(model, AscendDSparkDeepseekV41ForCausalLM)
+
+
 def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     tp_group = get_tp_group()
     B, V_local = logits.shape
@@ -904,7 +915,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             model = self.model
             if isinstance(model, BreakableACLGraphWrapper):
                 model = model.unwrap()
-            assert isinstance(model, _HIDDEN_STATE_DRAFTER_TYPES)
+            assert _is_hidden_state_drafter(model, self.method)
             target_hidden_states = model.combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 

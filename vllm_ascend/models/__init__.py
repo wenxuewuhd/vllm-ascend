@@ -55,6 +55,16 @@ def register_model():
         "DSparkDraftModel",
         "vllm_ascend.models.deepseek_v4.dspark:DSparkDeepseekV4ForCausalLM",
     )
+    # V4.1's DSpark drafter is a different network from V4.0's, not a
+    # version of it: 128 draft experts instead of the backbone's 384, no
+    # learned hc_head, and the Markov factors under different names. So it
+    # gets its own architecture string, which patch_speculative_config
+    # routes a V4.1 target to. Importing the module applies the
+    # deepseek_v4_1 package's platform patches before the drafter is built.
+    ModelRegistry.register_model(
+        "DSparkDeepseekV41DraftModel",
+        "vllm_ascend.models.deepseek_v4_1.dspark:AscendDSparkDeepseekV41ForCausalLM",
+    )
     ModelRegistry.register_model(
         "LlamaForCausalLMVwnEagle3", "vllm_ascend.models.llama_eagle3_vwn:Eagle3VwnLlamaForCausalLM"
     )

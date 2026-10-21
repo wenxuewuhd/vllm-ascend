@@ -89,13 +89,12 @@ def select_ori_sparse_indices(attends_compressed: bool, vision_swa_indices,
     answer. DSpark's indices override vision's, and only when no compressed
     stream is attended.
 
-    **The returned indices are in slot space**, not token space: each value
-    is ``block_id * storage_block_size + offset_within_block`` (the
-    ``slot_ids`` line at the end of both index builders in dsa_v1.py). The
-    two spaces are indistinguishable from the tensor, so any range check on
-    it must take its upper bound from this call's block table --
-    ``(block_table.max() + 1) * storage_block_size`` -- never from
-    ``seqused``.
+    This selector does not change index space. SparseFlashMla requires logical
+    token positions within each request and performs the page lookup through
+    ``ori_block_table`` itself. Its DSpark and vision producers must therefore
+    use ``logical_indices=True``. Passing physical slot ids here applies the
+    page mapping twice and silently reads unrelated KV, even though the tensor
+    shape, dtype and valid lengths are correct.
     """
     if not attends_compressed and dspark_swa_indices is not None:
         return dspark_swa_indices
@@ -163,8 +162,7 @@ def _device_scalar(reduce, when_capturing: int) -> int:
     were 512 kernels and **0.98 ms of a 28.8 ms decode step, 3.4%**, computing
     values nobody reads.
     """
-    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
-        _stream_is_capturing
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import _stream_is_capturing
 
     if _stream_is_capturing():
         return when_capturing
@@ -177,8 +175,7 @@ def _device_predicate(reduce) -> bool:
     Same reasoning as ``_device_scalar``, including that ``reduce`` is a
     callable so that capture launches nothing.
     """
-    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
-        _stream_is_capturing
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import _stream_is_capturing
 
     if _stream_is_capturing():
         return True
@@ -238,7 +235,7 @@ def _check_block_table_addresses_this_cache(kwargs: dict[str, Any]) -> None:
                 f"{table_key} is empty, so this check did not run. An empty "
                 "table is not a batch needing no blocks; it addresses nothing.")
         # -1 under capture always passes `highest >= num_blocks`.
-        highest = _device_scalar(lambda: table.max(), -1)
+        highest = _device_scalar(lambda table=table: table.max(), -1)
         if highest >= num_blocks:
             raise ValueError(
                 f"{table_key}'s highest block id is {highest} and {cache_key} "
@@ -254,7 +251,7 @@ def _check_block_table_addresses_this_cache(kwargs: dict[str, Any]) -> None:
                 f"not run against {cache_key}.")
         capacity = num_blocks * block_size
         # -1 under capture always passes `longest > capacity`.
-        longest = _device_scalar(lambda: used.max(), -1)
+        longest = _device_scalar(lambda used=used: used.max(), -1)
         if longest > capacity:
             raise ValueError(
                 f"{used_key}'s longest sequence is {longest} tokens and "
@@ -547,8 +544,7 @@ def build_sparse_flash_mla_kwargs(
     cmp_block_table: torch.Tensor | None = None,
     seqused_cmp_kv: torch.Tensor | None = None,
     cmp_residual_kv: torch.Tensor | None = None,
-    # Slot space: block_id * storage_block_size + offset. See
-    # select_ori_sparse_indices.
+    # Logical token positions within each request, before ori_block_table lookup.
     ori_sparse_indices: torch.Tensor | None = None,
     #: Valid entries per row of ori_sparse_indices. Required whenever indices
     #: are supplied; see ori_sparse_selection for why the default is unsafe.

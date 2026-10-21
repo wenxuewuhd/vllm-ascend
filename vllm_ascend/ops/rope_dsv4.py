@@ -9,6 +9,12 @@ from vllm.config import VllmConfig
 from vllm.platforms import current_platform
 
 
+def _repeat_interleaved_pairs(x: torch.Tensor) -> torch.Tensor:
+    # Preserve [a, a, b, b, ...] while avoiding the large RepeatInterleave
+    # kernel that times out with this image's CANN 9.2.0-beta.2 on Ascend950.
+    return torch.stack((x, x), dim=-1).flatten(-2)
+
+
 class RopeGlobalState:
     def __init__(self):
         self.full_rope_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -215,8 +221,8 @@ class ComplexExpRotaryEmbedding(nn.Module):
                 dtype=torch.float32,
             )
             freqs = torch.einsum("i,j -> ij", t, inv_freq)
-            cos = freqs.cos().repeat_interleave(2, dim=-1)
-            sin = freqs.sin().repeat_interleave(2, dim=-1)
+            cos = _repeat_interleaved_pairs(freqs.cos())
+            sin = _repeat_interleaved_pairs(freqs.sin())
             cos = cos.to(current_platform.device_type)
             sin = sin.to(current_platform.device_type)
 

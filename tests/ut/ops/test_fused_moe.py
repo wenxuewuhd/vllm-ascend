@@ -33,6 +33,66 @@ from vllm_ascend.ops.fused_moe.shared_experts import (
 from vllm_ascend.quantization.quant_type import QuantType
 
 
+@pytest.mark.parametrize("fail_in_forward", [False, True])
+def test_target_and_draft_keep_their_own_dispatcher_after_draft_load(monkeypatch, fail_in_forward):
+    current = {}
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="dspark", draft_model_config=SimpleNamespace(_architecture="DSparkDeepseekV41DraftModel")
+        )
+    )
+    monkeypatch.setattr(fused_moe_module, "get_current_vllm_config_or_none", lambda: config)
+    monkeypatch.setattr(fused_moe_module, "get_tp_group", lambda: None)
+    monkeypatch.setattr(fused_moe_module, "get_dp_group", lambda: None)
+
+    def setup(moe_config):
+        current[MoECommType.ALLGATHER] = SimpleNamespace(moe_config=moe_config)
+
+    monkeypatch.setattr(fused_moe_module, "setup_moe_comm_method", setup)
+    monkeypatch.setattr(fused_moe_module, "get_moe_comm_method", current.get)
+
+    def base_init(runner, name, moe_config, router, experts, *args):
+        nn.Module.__init__(runner)
+        runner.layer_name = name
+        runner.moe_config = moe_config
+        runner.routed_experts = experts
+
+    monkeypatch.setattr(fused_moe_module.MoERunner, "__init__", base_init)
+    monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: False))
+    observed = []
+
+    def make(name, local_experts, top_k):
+        moe_config = SimpleNamespace(hidden_dim=4, ep_size=1, num_local_experts=local_experts, experts_per_token=top_k)
+        experts = SimpleNamespace(quant_type=QuantType.NONE)
+        runner = AscendMoERunner(name, moe_config, None, experts)
+        runner._sequence_parallel_context = lambda: nullcontext()
+
+        def forward(**kwargs):
+            actual = context.moe_comm_method.moe_config
+            observed.append((actual.num_local_experts, actual.experts_per_token))
+            if fail_in_forward:
+                raise RuntimeError("synthetic forward failure")
+            return kwargs["hidden_states"]
+
+        experts.forward_impl = forward
+        return runner
+
+    target = make("model.layers.0.ffn.experts", 100, 6)
+    draft = make("model.layers.40.ffn.experts", 128, 3)
+    default = current[MoECommType.ALLGATHER]
+    context = SimpleNamespace(moe_comm_method=default)
+    monkeypatch.setattr(fused_moe_module, "_EXTRA_CTX", context)
+    states = torch.zeros(5, 4)
+    for runner in [target, draft, target]:
+        if fail_in_forward:
+            with pytest.raises(RuntimeError, match="synthetic"):
+                runner._forward_impl(states, states, None)
+        else:
+            assert runner._forward_impl(states, states, None) is states
+        assert context.moe_comm_method is default
+    assert observed == [(100, 6), (128, 3), (100, 6)]
+
+
 def _build_weight_layer():
     return SimpleNamespace(
         w13_weight=nn.Parameter(torch.randn(2, 3, 4)),
