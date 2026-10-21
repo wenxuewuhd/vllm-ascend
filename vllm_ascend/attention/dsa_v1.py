@@ -49,10 +49,7 @@ from vllm_ascend.ops.cv_linear import CVLinearWrapper
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
-from vllm_ascend.utils import (
-    get_potential_max_tokens,
-    npu_stream_switch,
-    oproj_tp_enable, is_deepseek_v4_family)
+from vllm_ascend.utils import get_potential_max_tokens, is_deepseek_v4_family, npu_stream_switch, oproj_tp_enable
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     DeviceMetadataTask,
@@ -766,6 +763,7 @@ def build_dspark_swa_indices(
     index_width: int | None = None,
     indices_output: torch.Tensor | None = None,
     buffer: torch.Tensor | None = None,
+    lengths_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build DSpark non-causal visible slot ids for a paged SWA cache.
 
@@ -831,6 +829,14 @@ def build_dspark_swa_indices(
         buffer[:num_rows].copy_(per_token_slots)
         per_token_slots = buffer[:num_rows]
 
+    if lengths_output is not None:
+        if lengths_output.shape != per_token_lens.shape:
+            raise ValueError(
+                "DSpark SWA lengths output shape does not match active metadata: "
+                f"output={tuple(lengths_output.shape)}, active={tuple(per_token_lens.shape)}"
+            )
+        lengths_output.copy_(per_token_lens)
+        per_token_lens = lengths_output
     return per_token_slots, per_token_lens
 
 
@@ -1003,6 +1009,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.decode_threshold = 1
         self.spec_slot_mapping = None
         self.dspark_swa_indices_buffer: torch.Tensor | None = None
+        self.dspark_swa_topk_length_buffer: torch.Tensor | None = None
         if get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION) and not is_a5_bf16_kv_enabled(
             vllm_config
         ):
@@ -1483,6 +1490,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             dtype=torch.int32,
             device=self.device,
         )
+        self.dspark_swa_topk_length_buffer = torch.empty(
+            max_num_tokens, dtype=torch.int32, device=self.device
+        )
 
     def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
         tasks = self._device_metadata_tasks
@@ -1611,8 +1621,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         seqused_cmp_kv = None
         if is_deepseek_v41_model(self.vllm_config):
             from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
-                is_plain_sliding_window, ori_mask_mode_for,
-                select_ori_sparse_indices)
+                is_plain_sliding_window,
+                ori_mask_mode_for,
+                select_ori_sparse_indices,
+            )
 
             attends_cmp = attends_compressed_stream(self.compressor_ratio,
                                                     self.vllm_config)
@@ -1905,7 +1917,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 self.num_actual_tokens,
             )
             if self._device_metadata_enabled and not has_prefill:
-                if self.dspark_swa_indices_buffer is None:
+                if self.dspark_swa_indices_buffer is None or self.dspark_swa_topk_length_buffer is None:
                     raise RuntimeError(
                         "DSpark device metadata buffers must be initialized before building draft attention metadata"
                     )
@@ -1915,9 +1927,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                         f"active={self.num_actual_tokens}, capacity={self.dspark_swa_indices_buffer.shape[0]}"
                     )
                 dspark_swa_indices = self.dspark_swa_indices_buffer[: self.num_actual_tokens]
+                dspark_topk_length = self.dspark_swa_topk_length_buffer[: self.num_actual_tokens]
                 build_dspark_swa = lambda: build_dspark_swa_indices(
                     *dspark_swa_args,
                     indices_output=dspark_swa_indices,
+                    lengths_output=dspark_topk_length,
                 )
             else:
                 dspark_swa_indices, dspark_topk_length = build_dspark_swa_indices(
@@ -1946,6 +1960,20 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
 
+        draft_mask_kwargs = dict(
+            ori_mask_mode=4,
+            cmp_mask_mode=3,
+            ori_win_left=ori_win_left,
+            ori_win_right=ori_win_right,
+        )
+        if is_deepseek_v41_model(self.vllm_config):
+            from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import ori_mask_mode_for
+
+            draft_mask_kwargs["ori_mask_mode"] = ori_mask_mode_for(dspark_swa_indices)
+            draft_mask_kwargs["cmp_mask_mode"] = 0
+            if dspark_swa_indices is not None:
+                draft_mask_kwargs.update(ori_win_left=-1, ori_win_right=-1)
+
         def build_attention_metadata() -> torch.Tensor:
             if build_dspark_swa is not None:
                 build_dspark_swa()
@@ -1963,10 +1991,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=num_reqs,
                 cmp_ratio=1,
-                ori_mask_mode=4,
-                cmp_mask_mode=3,
-                ori_win_left=ori_win_left,
-                ori_win_right=ori_win_right,
+                **draft_mask_kwargs,
                 layout_q="TND",
                 layout_kv=_dsa_layout_kv(self.vllm_config),
                 has_ori_kv=True,

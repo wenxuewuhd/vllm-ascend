@@ -389,6 +389,51 @@ so neither figure carries to a third setting.
 which adds about 3-4 minutes (measured: ~400 s to ready). A run that looks hung at "loading weights" is
 usually still doing that.
 
+### Experimental single-card DSpark
+
+DeepSeek-V4.1-Flash includes three DSpark draft layers in the target checkpoint's
+`mtp.*` tensors. Each draft layer keeps all 128 routed experts in HBM; its
+`kt_offload` is `None`. The target's 40 layers continue to use the configured
+100 resident expert slots and CPU offload. The draft tensors total about
+7.39 GiB, including about 6.72 GiB of expert weights.
+
+After completing the setup above, select an idle physical card and use the
+low-latency profile with these additional arguments:
+
+```bash
+export CARD=4  # choose an idle physical device on your host
+npu-smi info -t proc-mem -i "$CARD"
+
+export EXTRA_ARGS='--language-model-only --no-async-scheduling --compilation-config {"cudagraph_capture_sizes":[6],"max_cudagraph_capture_size":6} --speculative-config {"method":"dspark","num_speculative_tokens":5,"enforce_eager":true}'
+bash examples/kt_moe_offload/serve_lowlatency.sh
+```
+
+This configuration uses one request at a time, a maximum model length of 8192,
+bf16 KV, eager draft execution, and a six-token target verification graph.
+Async scheduling and multi-card DSpark have not been validated for this path.
+
+Check for three startup messages containing
+`DSpark draft expert placement: local=128 logical=128 kt_offload=None` and
+inspect actual request counters after generation:
+
+```bash
+curl --noproxy '*' -s "http://127.0.0.1:$PORT/metrics" \
+  | sed -n '/^vllm:spec_decode_.*_total/p'
+```
+
+The 2026-10-21 Ascend950 run passed five generation smoke checks: arithmetic,
+Chinese text, streaming output, a 2101-token prefill, and 192-token generation.
+However, **254 drafts proposed 1270 tokens and only 2 were accepted (0.1575%)**;
+per-position accepted counts were `[2, 0, 0, 0, 0]`. This establishes execution
+and counter activity, but does not establish useful acceleration or accuracy
+equivalence. The very low acceptance rate remains unresolved. The non-DSpark
+latency and accuracy results elsewhere in this document do not apply to it.
+
+On a shared host, release only the Engram staging files and mounts owned by
+your run. The smoke check reused existing Engram tables through a read-only
+mount; after stopping its service and container, the device and port were free
+and the original shared files were unchanged.
+
 ## 8. Check it is actually serving
 
 `Application startup complete` is printed before the model can answer. Ask it:

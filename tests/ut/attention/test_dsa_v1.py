@@ -35,6 +35,10 @@ from vllm_ascend.attention.context_parallel.dsa_cp import (
 from vllm_ascend.attention.context_parallel.dsa_cp import (
     AscendDSAMetadata as AscendDSACPMetadata,
 )
+from vllm_ascend.attention.dsa_attn_kv_plan import (
+    dsv4_indexer_qk_dtype,
+    dsv4_indexer_scale_dtype,
+)
 from vllm_ascend.attention.dsa_v1 import (
     DSA_METADATA_BUFFER_SIZE,
     AscendDSABackend,
@@ -45,10 +49,6 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSAReqMetadata,
     build_compressor_metadata_out,
     build_vision_bidirectional_swa_indices,
-)
-from vllm_ascend.attention.dsa_attn_kv_plan import (
-    dsv4_indexer_qk_dtype,
-    dsv4_indexer_scale_dtype,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.device.device_op import DeviceOperator
@@ -268,7 +268,8 @@ def test_num_compressor_metadata_rows(
     assert builder._num_compressor_metadata_rows(num_reqs) == expected_rows
 
 
-def test_draft_swa_and_sas_share_attention_task():
+@pytest.mark.parametrize("v41", [False, True])
+def test_draft_swa_and_sas_share_attention_task(v41):
     builder = _make_builder(1, num_speculative_tokens=3)
     builder.enable_dspark_device_metadata(max_num_tokens=16)
     assert builder.dspark_swa_indices_buffer is not None
@@ -288,6 +289,7 @@ def test_draft_swa_and_sas_share_attention_task():
         ),
         patch.object(DeviceOperator, "get_dsa_decode_cu_seqlens_cmp_kv", return_value=None),
         patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan),
+        patch("vllm_ascend.attention.dsa_v1.is_deepseek_v41_model", return_value=v41),
     ):
         metadata = _build_draft_req_metadata(
             builder,
@@ -298,12 +300,14 @@ def test_draft_swa_and_sas_share_attention_task():
         task = builder.take_device_metadata_tasks()
         metadata_op.assert_not_called()
         assert metadata.dspark_swa_indices.data_ptr() == builder.dspark_swa_indices_buffer.data_ptr()
+        assert metadata.ori_topk_length.data_ptr() == builder.dspark_swa_topk_length_buffer.data_ptr()
         assert task[0].stage == DeviceMetadataStage.ATTENTION
         assert task[0].group_id == id(metadata.sas_metadata)
 
         task[0].run()
 
         first_indices = metadata.dspark_swa_indices.clone()
+        assert torch.equal(metadata.ori_topk_length, torch.tensor([10, 10, 10, 14, 14, 14], dtype=torch.int32))
         next_metadata = _build_draft_req_metadata(
             builder,
             torch.tensor([12], dtype=torch.int32),
@@ -312,11 +316,18 @@ def test_draft_swa_and_sas_share_attention_task():
         )
         next_task = builder.take_device_metadata_tasks()
         assert next_metadata.dspark_swa_indices.data_ptr() == metadata.dspark_swa_indices.data_ptr()
+        assert next_metadata.ori_topk_length.data_ptr() == metadata.ori_topk_length.data_ptr()
         next_task[0].run()
+        assert torch.equal(next_metadata.ori_topk_length, torch.tensor([12, 12, 12], dtype=torch.int32))
 
     assert metadata_op.call_count == 2
     assert not torch.equal(next_metadata.dspark_swa_indices, first_indices[:3])
     assert torch.equal(metadata.sas_metadata, sas_result)
+    kwargs = metadata_op.call_args.kwargs
+    assert kwargs["ori_mask_mode"] == (0 if v41 else 4)
+    assert kwargs["cmp_mask_mode"] == (0 if v41 else 3)
+    if v41:
+        assert kwargs["ori_win_left"] == kwargs["ori_win_right"] == -1
 
 
 def test_draft_swa_metadata_rejects_rows_above_buffer_capacity():
