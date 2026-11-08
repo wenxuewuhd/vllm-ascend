@@ -7,7 +7,7 @@ serves a model that otherwise needs four.
 
 Follow the steps in order; each one depends on the previous. At a glance:
 
-```
+```text
 1  container image        check yours against the versions listed
 2  source trees           vllm (fork, pinned) + this repo
 3  build artifacts        vllm_ascend_C*.so, custom vendor, _version.py
@@ -126,7 +126,7 @@ an editable `vllm`/`vllm-ascend`, these shadow it.
 
 `vllm_ascend/` needs three gitignored products that a fresh clone does not have:
 
-```
+```text
 vllm_ascend/vllm_ascend_C*.so
 vllm_ascend/_cann_ops_custom/vendors/custom_transformer/
 vllm_ascend/_version.py
@@ -174,7 +174,7 @@ model.
 Three wheels, obtained from your Ascend vendor alongside the model -- they are
 not on PyPI and are not part of CANN. The versions this was validated with:
 
-```
+```text
 cannbotdsl-0.5.0-cp312-cp312-manylinux_2_28_x86_64.whl
 cann_ops_transformer-1.0.0-py3-none-any.whl
 cannbot_arena_net_ops-0.1.0-cp312-cp312-linux_x86_64.whl
@@ -241,7 +241,7 @@ against the byte counts in the checkpoint header.
 
 Four files must be present:
 
-```
+```text
 layers.1.engram.embed.weight.bin    98,305,579,008 B
 layers.1.engram.embed.scale.bin      3,072,049,344 B
 layers.14.engram.embed.weight.bin   98,308,270,592 B
@@ -389,6 +389,57 @@ so neither figure carries to a third setting.
 which adds about 3-4 minutes (measured: ~400 s to ready). A run that looks hung at "loading weights" is
 usually still doing that.
 
+### Experimental single-card DSpark
+
+DeepSeek-V4.1-Flash includes three DSpark draft layers in the target checkpoint's
+`mtp.*` tensors. Each draft layer keeps all 128 routed experts in HBM; its
+`kt_offload` is `None`. The target's 40 layers retain 100 resident expert slots
+and CPU offload. The draft weights add about 7.39 GiB of HBM; no separate
+checkpoint is required.
+
+After completing the setup above, select an idle physical card and use the
+low-latency profile with these additional arguments:
+
+```bash
+export CARD=4  # choose an idle physical device on your host
+npu-smi info -t proc-mem -i "$CARD"
+
+export K=5  # use 2 for K2; keep a target graph of size K+1
+export EXTRA_ARGS="--language-model-only --seed 0 --compilation-config {\"cudagraph_capture_sizes\":[1,2,3,6],\"max_cudagraph_capture_size\":6} --speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":$K,\"enforce_eager\":true}"
+bash examples/kt_moe_offload/serve_lowlatency.sh
+```
+
+This configuration uses one request at a time, a maximum model length of 8192,
+bf16 KV, eager draft execution, and target verification graphs of size three
+(K=2) and six (K=5). It leaves asynchronous scheduling at its default,
+historically enabled in the pinned runtime. Keep at most four capture sizes: `[1,2,3,4,6]` can
+lose size three during normalization and prevent K2 from starting.
+The stream-prefill threshold defaults to 512 tokens.
+
+With target offload enabled, check for three startup messages containing
+`kt_offload: ... keeps all 128 draft experts in HBM` and
+inspect actual request counters after generation:
+
+```bash
+curl --noproxy '*' -s "http://127.0.0.1:$PORT/metrics" \
+  | sed -n '/^vllm:spec_decode_.*_total/p'
+```
+
+SparseFlashMla requires logical token positions and applies the KV page table
+itself; the legacy shared-KV backend requires physical slots. The index fix
+and its shuffled-page negative control are described in the
+[validation notes](dspark_validation.md), alongside exact tested versions.
+The current simplified adapter has isolated CPU coverage; a fresh native NPU
+validation is pending. Earlier generation and attention results do not validate
+this adapter revision or establish model-quality or acceleration claims.
+Multi-card and multimodal end-to-end generation remain unverified.
+
+CPU expert weight reuse is an optional, separate
+[kt-kernel change](https://github.com/wenxuewuhd/ktransformers-AK/pull/1).
+Build that branch and set `KT_SITE` to its installation to use it; the existing
+kernel is sufficient for functional DSpark execution. On a shared host, release
+only Engram staging files and mounts owned by your run.
+
 ## 8. Check it is actually serving
 
 `Application startup complete` is printed before the model can answer. Ask it:
@@ -414,7 +465,7 @@ PORT=8000 CONCURRENCY=1 REQUESTS=5 PROMPT_TOKENS=4096 GEN_TOKENS=128 \
 
 On the low-latency profile, one card, 4096 in / 128 out at concurrency 1:
 
-```
+```text
 TTFT  mean 21.40 s    TPOT  mean 22.57 ms   (5 requests, TPOT spread 0.22 ms)
 ```
 

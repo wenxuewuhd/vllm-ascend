@@ -874,3 +874,44 @@ class TestInitializeAttnBackend(_DSparkProposerTestBase):
         assert set(proposer.draft_attn_groups[0].layer_names) == set(draft_layers)
         assert proposer.draft_attn_groups[0].kv_cache_group_id == 0
         assert proposer._layer_group_idx == [0] * 5
+
+
+@pytest.mark.parametrize("drafter_kind", ["v41", "interface", "missing_interface", "noncallable_interface"])
+def test_v41_propose_combines_hidden_states_before_input_preparation(drafter_kind):
+    from vllm_ascend.models.deepseek_v4_1.dspark import AscendDSparkDeepseekV41ForCausalLM
+
+    valid_drafter = drafter_kind in ("v41", "interface")
+    if drafter_kind == "v41":
+        model = AscendDSparkDeepseekV41ForCausalLM.__new__(AscendDSparkDeepseekV41ForCausalLM)
+        torch.nn.Module.__init__(model)
+    else:
+        model = torch.nn.Identity()
+    combined = torch.ones(2, 16)
+    combine = MagicMock(return_value=combined)
+    if valid_drafter:
+        model.combine_hidden_states = combine
+    elif drafter_kind == "noncallable_interface":
+        model.combine_hidden_states = None
+    prepare = MagicMock(side_effect=RuntimeError("input stage reached"))
+    proposer = SimpleNamespace(method="dspark", model=model, hidden_size=16, set_inputs_first_pass=prepare)
+    auxiliary = torch.zeros(2, 48)
+    expected_exception = RuntimeError if valid_drafter else AssertionError
+    with pytest.raises(expected_exception):
+        AscendSpecDecodeBaseProposer._propose(
+            proposer,
+            num_speculative_tokens=5,
+            target_token_ids=torch.tensor([0, 1]),
+            target_positions=torch.tensor([0, 1]),
+            target_hidden_states=auxiliary,
+            next_token_ids=torch.tensor([1, 2]),
+            token_indices_to_sample=torch.tensor([0, 1]),
+            common_attn_metadata=SimpleNamespace(batch_size=lambda: 2),
+            target_model_batch_desc=None,
+            sampling_metadata=None,
+        )
+    if valid_drafter:
+        combine.assert_called_once_with(auxiliary)
+        assert prepare.call_args.kwargs["target_hidden_states"] is combined
+    else:
+        combine.assert_not_called()
+        prepare.assert_not_called()

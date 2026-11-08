@@ -89,13 +89,9 @@ def select_ori_sparse_indices(attends_compressed: bool, vision_swa_indices,
     answer. DSpark's indices override vision's, and only when no compressed
     stream is attended.
 
-    **The returned indices are in slot space**, not token space: each value
-    is ``block_id * storage_block_size + offset_within_block`` (the
-    ``slot_ids`` line at the end of both index builders in dsa_v1.py). The
-    two spaces are indistinguishable from the tensor, so any range check on
-    it must take its upper bound from this call's block table --
-    ``(block_table.max() + 1) * storage_block_size`` -- never from
-    ``seqused``.
+    The selector preserves the producer's index space: SparseFlashMla takes
+    request-relative logical positions, while the legacy operator takes
+    physical slots. The corresponding builders select the backend's contract.
     """
     if not attends_compressed and dspark_swa_indices is not None:
         return dspark_swa_indices
@@ -547,8 +543,7 @@ def build_sparse_flash_mla_kwargs(
     cmp_block_table: torch.Tensor | None = None,
     seqused_cmp_kv: torch.Tensor | None = None,
     cmp_residual_kv: torch.Tensor | None = None,
-    # Slot space: block_id * storage_block_size + offset. See
-    # select_ori_sparse_indices.
+    # Request-relative logical positions for SparseFlashMla.
     ori_sparse_indices: torch.Tensor | None = None,
     #: Valid entries per row of ori_sparse_indices. Required whenever indices
     #: are supplied; see ori_sparse_selection for why the default is unsafe.

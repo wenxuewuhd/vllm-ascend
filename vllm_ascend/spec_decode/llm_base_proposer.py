@@ -904,7 +904,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             model = self.model
             if isinstance(model, BreakableACLGraphWrapper):
                 model = model.unwrap()
-            assert isinstance(model, _HIDDEN_STATE_DRAFTER_TYPES)
+            assert isinstance(model, _HIDDEN_STATE_DRAFTER_TYPES) or (
+                self.method == "dspark" and callable(getattr(model, "combine_hidden_states", None))
+            )
             target_hidden_states = model.combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 

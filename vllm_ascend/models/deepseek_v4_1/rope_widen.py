@@ -36,7 +36,9 @@ def widen_interleaved(half: torch.Tensor) -> torch.Tensor:
     Channel ``i`` belongs to pair ``i // 2``, which is what makes this
     ``repeat_interleave`` and not ``repeat``.
     """
-    return half.repeat_interleave(2, dim=-1)
+    # Keep the pair order using copy operations; CANN RepeatInterleave times out
+    # on this image for the 4096 x 32 FP32 prefill table.
+    return torch.stack((half, half), dim=-1).flatten(-2)
 
 
 def cos_sin_for_slice(cos_sin_cache: torch.Tensor, positions: torch.Tensor,

@@ -35,6 +35,10 @@ from vllm_ascend.attention.context_parallel.dsa_cp import (
 from vllm_ascend.attention.context_parallel.dsa_cp import (
     AscendDSAMetadata as AscendDSACPMetadata,
 )
+from vllm_ascend.attention.dsa_attn_kv_plan import (
+    dsv4_indexer_qk_dtype,
+    dsv4_indexer_scale_dtype,
+)
 from vllm_ascend.attention.dsa_v1 import (
     DSA_METADATA_BUFFER_SIZE,
     AscendDSABackend,
@@ -44,11 +48,8 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSAMetadataBuilder,
     AscendDSAReqMetadata,
     build_compressor_metadata_out,
+    build_dspark_swa_indices,
     build_vision_bidirectional_swa_indices,
-)
-from vllm_ascend.attention.dsa_attn_kv_plan import (
-    dsv4_indexer_qk_dtype,
-    dsv4_indexer_scale_dtype,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.device.device_op import DeviceOperator
@@ -110,9 +111,54 @@ def test_build_vision_bidirectional_swa_indices_rejects_oversized_span():
 def _mock_dsa_kv_plan(**method_returns) -> MagicMock:
     plan = MagicMock()
     plan.layout_kv = "PA_ND"
+    plan.uses_sparse_flash_mla = False
     for name, value in method_returns.items():
         getattr(plan, name).return_value = value
     return plan
+
+
+@pytest.mark.parametrize("logical_indices", [False, True])
+def test_dspark_index_space_with_permuted_pages_and_empty_request(logical_indices):
+    table = torch.tensor([[7, 3, 9], [5, 11, 2], [0, 0, 0]], dtype=torch.int32)
+    args = dict(
+        num_speculative_tokens=2,
+        window_size=4,
+        block_size=4,
+        query_start_loc=torch.tensor([0, 2, 4, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([10, 6, 0], dtype=torch.int32),
+        num_decode_tokens=4,
+        logical_indices=logical_indices,
+    )
+    indices, lengths = build_dspark_swa_indices(table, **args)
+    expected = [[4, 5, 6, 7, 8, 9], [0, 1, 2, 3, 4, 5]] if logical_indices else [
+        [12, 13, 14, 15, 36, 37], [20, 21, 22, 23, 44, 45]
+    ]
+    assert indices[:2, 0, :6].tolist() == [expected[0]] * 2
+    assert indices[2:, 0, :6].tolist() == [expected[1]] * 2
+    assert (indices[:, :, 6:] == -1).all()
+    assert lengths.tolist() == [6, 6, 6, 6]
+    remapped, remapped_lengths = build_dspark_swa_indices(table + 13, **args)
+    assert torch.equal(lengths, remapped_lengths)
+    assert torch.equal(indices, remapped) == logical_indices
+
+
+def test_vision_logical_indices_do_not_depend_on_physical_pages():
+    args = dict(
+        window_size=2, max_image_tokens=4, block_size=4,
+        query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
+        seq_lens=torch.tensor([8], dtype=torch.int32),
+        mm_prefix_ranges={0: [(2, 5)]}, num_tokens=8, logical_indices=True,
+    )
+    first, lengths = build_vision_bidirectional_swa_indices(torch.tensor([[10, 3]], dtype=torch.int32), **args)
+    second, other_lengths = build_vision_bidirectional_swa_indices(torch.tensor([[2, 14]], dtype=torch.int32), **args)
+    assert torch.equal(first, second)
+    assert torch.equal(lengths, other_lengths)
+    assert first[:, 0].tolist() == [
+        [0, -1, -1, -1, -1, -1], [0, 1, -1, -1, -1, -1],
+        [1, 2, 3, 4, 5, -1], [2, 3, 4, 5, -1, -1],
+        [2, 3, 4, 5, -1, -1], [2, 3, 4, 5, -1, -1],
+        [5, 6, -1, -1, -1, -1], [6, 7, -1, -1, -1, -1],
+    ]
 
 
 def _make_forward_context():
@@ -268,7 +314,8 @@ def test_num_compressor_metadata_rows(
     assert builder._num_compressor_metadata_rows(num_reqs) == expected_rows
 
 
-def test_draft_swa_and_sas_share_attention_task():
+@pytest.mark.parametrize("v41", [False, True])
+def test_draft_swa_and_sas_share_attention_task(v41):
     builder = _make_builder(1, num_speculative_tokens=3)
     builder.enable_dspark_device_metadata(max_num_tokens=16)
     assert builder.dspark_swa_indices_buffer is not None
@@ -279,6 +326,7 @@ def test_draft_swa_and_sas_share_attention_task():
         get_dsa_sparse_attn_metadata_op=metadata_op,
     )
     plan.layout_kv = "PA_BBND"
+    plan.uses_sparse_flash_mla = v41
 
     with (
         patch.object(
@@ -288,6 +336,7 @@ def test_draft_swa_and_sas_share_attention_task():
         ),
         patch.object(DeviceOperator, "get_dsa_decode_cu_seqlens_cmp_kv", return_value=None),
         patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan),
+        patch("vllm_ascend.attention.dsa_v1.is_deepseek_v41_model", return_value=v41),
     ):
         metadata = _build_draft_req_metadata(
             builder,
@@ -298,12 +347,16 @@ def test_draft_swa_and_sas_share_attention_task():
         task = builder.take_device_metadata_tasks()
         metadata_op.assert_not_called()
         assert metadata.dspark_swa_indices.data_ptr() == builder.dspark_swa_indices_buffer.data_ptr()
+        assert metadata.ori_topk_length.data_ptr() == builder.dspark_swa_topk_length_buffer.data_ptr()
         assert task[0].stage == DeviceMetadataStage.ATTENTION
         assert task[0].group_id == id(metadata.sas_metadata)
 
         task[0].run()
 
         first_indices = metadata.dspark_swa_indices.clone()
+        expected_start = 0 if v41 else 256
+        assert first_indices[0, 0, :10].tolist() == list(range(expected_start, expected_start + 10))
+        assert torch.equal(metadata.ori_topk_length, torch.tensor([10, 10, 10, 14, 14, 14], dtype=torch.int32))
         next_metadata = _build_draft_req_metadata(
             builder,
             torch.tensor([12], dtype=torch.int32),
@@ -312,11 +365,18 @@ def test_draft_swa_and_sas_share_attention_task():
         )
         next_task = builder.take_device_metadata_tasks()
         assert next_metadata.dspark_swa_indices.data_ptr() == metadata.dspark_swa_indices.data_ptr()
+        assert next_metadata.ori_topk_length.data_ptr() == metadata.ori_topk_length.data_ptr()
         next_task[0].run()
+        assert torch.equal(next_metadata.ori_topk_length, torch.tensor([12, 12, 12], dtype=torch.int32))
 
     assert metadata_op.call_count == 2
     assert not torch.equal(next_metadata.dspark_swa_indices, first_indices[:3])
     assert torch.equal(metadata.sas_metadata, sas_result)
+    kwargs = metadata_op.call_args.kwargs
+    assert kwargs["ori_mask_mode"] == (0 if v41 else 4)
+    assert kwargs["cmp_mask_mode"] == (0 if v41 else 3)
+    if v41:
+        assert kwargs["ori_win_left"] == kwargs["ori_win_right"] == -1
 
 
 def test_draft_swa_metadata_rejects_rows_above_buffer_capacity():

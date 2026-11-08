@@ -349,7 +349,8 @@ class KTOffloadConfig:
                     "(VLLM_ASCEND_DSV41_KT_SEAM_TIMING) measures segments *inside* that callback: with P1b "
                     "on it would report on a callback that never runs and its A/F columns would be joined "
                     "against HOSTFUNC_CALLBACK rows that do not exist. Refusing rather than printing a "
-                    "report about nothing: an instrument that reports on nothing reads exactly like one that found nothing."
+                    "report about nothing: an instrument that reports on nothing reads exactly like "
+                    "one that found nothing."
                 )
         # The shared-expert MLP moves in front of the kt merge. An explicit "1"
         # without the side stream is not refused -- the order is still correct
@@ -399,5 +400,18 @@ class KTOffloadConfig:
             )
         if pc.enable_eplb:
             raise ValueError("kt_offload_config is incompatible with EPLB (it owns the expert placement).")
-        if vllm_config.speculative_config is not None:
-            raise ValueError("kt_offload_config does not support speculative decoding (MTP experts stay unhandled).")
+        if vllm_config.speculative_config is not None and not uses_hbm_dspark_draft(vllm_config):
+            raise ValueError(
+                "kt_offload_config supports only DeepSeek-V4.1 DSpark with HBM draft experts; "
+                "offload of MTP/draft experts is not implemented."
+            )
+
+
+def uses_hbm_dspark_draft(vllm_config: Any) -> bool:
+    """Only the registered V4.1 DSpark draft keeps all experts on the NPU."""
+    spec = getattr(vllm_config, "speculative_config", None)
+    draft = getattr(spec, "draft_model_config", None)
+    return (
+        getattr(spec, "method", None) == "dspark"
+        and getattr(draft, "_architecture", None) == "DSparkDeepseekV41DraftModel"
+    )

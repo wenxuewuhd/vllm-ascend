@@ -407,3 +407,84 @@ def test_call_site_check_mutation_is_red():
         and n.value.func.attr == "route"
     ]
     assert bad == [2]
+
+
+def _hbm_dspark_config(method="dspark", architecture="DSparkDeepseekV41DraftModel"):
+    hf = SimpleNamespace(num_hidden_layers=40)
+    spec = SimpleNamespace(
+        method=method,
+        draft_model_config=SimpleNamespace(
+            _architecture=architecture,
+            hf_config=SimpleNamespace(num_nextn_predict_layers=3),
+        ),
+    )
+    config = _vllm_config(spec=spec)
+    config.model_config.hf_text_config = hf
+    return config
+
+
+def test_v41_dspark_with_hbm_experts_is_compatible_with_main_offload():
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100)
+    cfg._validate_preconditions(_hbm_dspark_config())
+
+
+@pytest.mark.parametrize(
+    "method,architecture",
+    [
+        ("mtp", "DSparkDeepseekV41DraftModel"),
+        ("dspark", "DSparkDraftModel"),
+        ("eagle3", "Qwen3DSparkModel"),
+    ],
+)
+def test_other_drafters_still_refused_by_offload(method, architecture):
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100)
+    with pytest.raises(ValueError, match="HBM draft experts"):
+        cfg._validate_preconditions(_hbm_dspark_config(method, architecture))
+
+
+@pytest.mark.parametrize("index", [40, 41, 42])
+def test_draft_experts_keep_full_hbm_allocation(monkeypatch, index):
+    import vllm.config
+
+    cfg = _hbm_dspark_config()
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: cfg)
+    ascend = SimpleNamespace(kt_offload_config=SimpleNamespace(enabled=True))
+    moe = SimpleNamespace(num_logical_experts=128, experts_per_token=3, num_local_experts=128)
+    args = (f"draft_model.model.layers.{index}.ffn.experts", None, moe, None, None)
+    monkeypatch.setattr(kl, "get_plan", lambda *args: pytest.fail("draft must not create a kt plan"))
+    assert kl.create_layer_offload(ascend, _fake_init, args, {}) is None
+    assert moe.num_local_experts == 128
+
+
+def test_unknown_draft_layer_is_not_silently_exempted(monkeypatch):
+    import vllm.config
+
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", _hbm_dspark_config)
+    ascend = SimpleNamespace(kt_offload_config=SimpleNamespace(enabled=True))
+    moe = SimpleNamespace(num_logical_experts=128, experts_per_token=3, num_local_experts=128)
+    args = ("draft_model.model.layers.43.ffn.experts", None, moe, None, None)
+    with pytest.raises(ValueError, match="past the 40 main layers"):
+        kl.create_layer_offload(ascend, _fake_init, args, {})
+
+
+def test_main_layer_still_uses_its_own_kt_plan(monkeypatch):
+    import vllm.config
+
+    cfg = _hbm_dspark_config()
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: cfg)
+    ascend = SimpleNamespace(
+        kt_offload_config=SimpleNamespace(enabled=True),
+        mix_placement=False,
+        eplb_config=SimpleNamespace(dynamic_eplb=False),
+    )
+    moe = SimpleNamespace(
+        num_logical_experts=384, num_experts=384, experts_per_token=6, num_local_experts=384, ep_size=1, tp_size=1
+    )
+    placement = object()
+    plan = SimpleNamespace(num_slots=100, layer=lambda index: placement if index == 39 else None)
+    monkeypatch.setattr(kl, "get_plan", lambda *args: plan)
+    marker = object()
+    monkeypatch.setattr(kl, "KTLayerOffload", lambda *args: marker)
+    args = ("model.layers.39.ffn.experts", None, moe, None, None)
+    assert kl.create_layer_offload(ascend, _fake_init, args, {}) is marker
+    assert moe.num_local_experts == 100
