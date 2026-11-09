@@ -171,7 +171,7 @@ def test_lookup_stages_the_rows_each_token_asked_for():
     assert layer.dequantised_rows == 5 * 24
     for t in range(5):
         for c in range(24):
-            r = LAYOUT.row_index(t, c)
+            r = LAYOUT.row_index(t, c, LAYOUT.n_hash_cols)
             assert layer._dev_weight[r, 0].item() == tables[0][ids[t, c], 0]
             assert layer._dev_scale[r, 0].item() == tables[1][ids[t, c], 0]
 
@@ -188,7 +188,7 @@ def test_flattening_indices_matches_upstreams_row_numbering():
     flat = ids.reshape(-1)
     for t in range(5):
         for c in range(24):
-            assert flat[LAYOUT.row_index(t, c)] == ids[t, c]
+            assert flat[LAYOUT.row_index(t, c, LAYOUT.n_hash_cols)] == ids[t, c]
 
 
 def test_an_empty_batch_does_nothing():
@@ -211,11 +211,71 @@ def test_lookup_without_staging_says_what_to_call():
         layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
 
 
-def test_lookup_refuses_a_sharded_configuration():
-    """The row numbering is only right while the hash columns are undivided."""
-    layer = _Lookup(_tables(), part=12, total=24, start=0)
+def test_lookup_gathers_only_this_ranks_columns():
+    """TP4's last rank: given all 24 columns it must stage exactly columns
+    18..23, token-major with stride 6. The ids are GLOBAL table rows and the
+    whole table is mapped on every rank, so no rebase is involved."""
+    import numpy as np
+
+    tables = _tables()
+    layer = _Lookup(tables, part=6, total=24, start=18)
     layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
-    with pytest.raises(ValueError, match="undivided hash columns"):
+
+    rng = np.random.default_rng(23)
+    ids = rng.integers(0, 512, size=(5, 24)).astype(np.int32)
+    layer.lookup(torch.from_numpy(ids), out=None)
+
+    assert layer.dequantised_rows == 5 * 6
+    for t in range(5):
+        for c in range(6):
+            r = LAYOUT.row_index(t, c, 6)
+            want = ids[t, 18 + c]
+            assert layer._dev_weight[r, 0].item() == tables[0][want, 0]
+            assert layer._dev_scale[r, 0].item() == tables[1][want, 0]
+
+
+def test_the_ranks_together_stage_exactly_what_tp1_stages():
+    """The differential property that matters: reassembling the four TP4 ranks
+    must reproduce the TP=1 gather exactly. A wrong head_start or a wrong
+    stride yields valid row numbers for the wrong columns, which nothing
+    downstream would notice -- this is what catches it."""
+    import numpy as np
+
+    tables = _tables()
+    rng = np.random.default_rng(29)
+    ids = rng.integers(0, 512, size=(5, 24)).astype(np.int32)
+
+    ref = _Lookup(tables)
+    ref.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+    ref.lookup(torch.from_numpy(ids), out=None)
+    reference = {}
+    for t in range(5):
+        for c in range(24):
+            reference[(t, c)] = ref._dev_weight[
+                LAYOUT.row_index(t, c, 24), 0].item()
+
+    seen = {}
+    for rank in range(4):
+        shard = _Lookup(tables, part=6, total=24, start=rank * 6)
+        shard.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+        shard.lookup(torch.from_numpy(ids), out=None)
+        assert shard.dequantised_rows == 5 * 6
+        for t in range(5):
+            for c in range(6):
+                seen[(t, rank * 6 + c)] = shard._dev_weight[
+                    LAYOUT.row_index(t, c, 6), 0].item()
+
+    assert seen == reference
+
+
+@pytest.mark.parametrize("part,total,start", [
+    (6, 24, 20),     # window runs off the end of the model's columns
+    (12, 8, 0),      # total disagrees with the layout
+])
+def test_lookup_refuses_a_malformed_column_shard(part, total, start):
+    layer = _Lookup(_tables(), part=part, total=total, start=start)
+    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+    with pytest.raises(ValueError):
         layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
 
 
