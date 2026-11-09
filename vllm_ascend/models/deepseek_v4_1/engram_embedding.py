@@ -3,13 +3,13 @@
 
 Upstream's ``ParallelEngramEmbedding.__init__`` allocates the whole table
 shard, either in pinned host memory (``cpu_offload=True``) or in HBM. At TP=1
-that is about 189 GiB per rank, which fits in neither, and the pinned-host
-registration path must not be used on this platform.
+that is about 189 GiB per rank, exceeding device memory. Full-table pinned-host
+registration must not be used on this platform.
 
 Instead:
 
 1. The table Parameters are created on the ``meta`` device (right shape and
-   dtype, no storage); the data is read from a staged file in ``/dev/shm``.
+   dtype, no storage); the data is read from a staged file in tmpfs or on SSD.
 2. Each forward gathers the needed rows on the host, copies them to HBM in one
    H2D, and a Triton kernel dequantises them. Under graph capture the host
    gather is recorded as a host-function node so it replays with the graph.
@@ -28,8 +28,8 @@ import contextlib
 import torch
 
 from vllm_ascend.models.deepseek_v4_1.engram_layout import EngramLayout
-from vllm_ascend.models.deepseek_v4_1.engram_staging import (DEFAULT_STAGE_DIR,
-                                                             staged_file_name)
+from vllm_ascend.models.deepseek_v4_1.engram_staging import (staged_file_name,
+                                                             staging_config)
 
 #: Upstream logs this from inside ``if cpu_offload:`` regardless of what the
 #: allocation did; with the allocation diverted the line is untrue.
@@ -80,22 +80,38 @@ def tables_not_allocated():
         torch.empty = real_empty
 
 
-def _read_only_table(path: str, rows: int, width: int):
-    """A read-only memory map of one staged table."""
+def _read_only_table(path: str, rows: int, width: int, *,
+                     manifest: dict | None = None, tensor_name: str | None = None):
+    """Map an opened regular file read-only; validate the same fd we map."""
     import mmap
     import os
+    import stat
 
     import numpy as np
 
-    size = os.path.getsize(path)
-    if size != rows * width:
-        raise ValueError(
-            f"{path}: expected {rows:,} x {width} = {rows * width:,} bytes, "
-            f"found {size:,}; the staged file does not match the config.")
-    handle = os.open(path, os.O_RDONLY)
+    handle = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
+        info = os.fstat(handle)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{path}: Engram table must be a regular file")
+        size = info.st_size
+        if size != rows * width or size == 0:
+            raise ValueError(
+                f"{path}: expected {rows:,} x {width} = {rows * width:,} bytes, "
+                f"found {size:,}; the staged file does not match the config."
+            )
+        if manifest is not None:
+            from vllm_ascend.models.deepseek_v4_1.engram_storage import validate_table
+
+            validate_table(manifest, tensor_name, info, rows, width)
         mapping = mmap.mmap(handle, size, flags=mmap.MAP_SHARED,
                             prot=mmap.PROT_READ)
+        try:
+            if manifest is not None and hasattr(mapping, "madvise"):
+                mapping.madvise(mmap.MADV_RANDOM)
+        except Exception:
+            mapping.close()
+            raise
     finally:
         os.close(handle)
     return np.frombuffer(mapping, dtype=np.uint8).reshape(rows, width), mapping
@@ -125,7 +141,7 @@ class AscendStagedEngramEmbedding:
         from vllm.logger import logger
         logger.info(
             "Engram table not allocated: %d rows x %d stays in the staged "
-            "read-only mapping, 0 bytes resident and 0 bytes pinned per rank. "
+            "read-only mapping, no full-table allocation and 0 bytes pinned per rank. "
             "Upstream's \"%s\" line is suppressed here because the allocation "
             "it describes does not happen.",
             getattr(self, "part_num_embeddings", -1),
@@ -155,7 +171,8 @@ class AscendStagedEngramEmbedding:
             layout, vllm_config.scheduler_config.max_num_batched_tokens,
             current_platform.device_type)
         self._allocate_pinned_for_capture()
-        self.bind_staged_tables(layout, self._own_layer_id(layout))
+        self.bind_staged_tables(layout, self._own_layer_id(layout),
+                                checkpoint_dir=vllm_config.model_config.model)
 
     def _own_layer_id(self, layout) -> int:
         """Which engram layer this instance is, from its own row count.
@@ -203,17 +220,48 @@ class AscendStagedEngramEmbedding:
     # -- the staged tables ---------------------------------------------------
 
     def bind_staged_tables(self, layout: EngramLayout, layer_id: int,
-                           stage_dir: str = DEFAULT_STAGE_DIR) -> None:
-        """Map this layer's staged weight and scale tables, read-only."""
+                           stage_dir: str | None = None, *,
+                           checkpoint_dir: str | None = None) -> None:
+        """Bind one immutable backing store before graph capture.
+
+        SSD manifests are checked without reading payload pages; full SHA256
+        verification belongs to the separate preparation/verification tool.
+        """
+        from vllm_ascend.models.deepseek_v4_1.engram_storage import (
+            load_manifest,
+            validate_filesystem,
+        )
+
+        if self._staged_tables is not None:
+            raise RuntimeError("Engram tables are already bound; graph mappings cannot be rebound")
+        backend, stage_dir = staging_config(stage_dir)
+        validate_filesystem(stage_dir, backend)
+        if backend == "ssd" and not checkpoint_dir:
+            raise ValueError("SSD Engram binding requires the current checkpoint directory")
+        manifest = load_manifest(stage_dir, checkpoint_dir) if backend == "ssd" else None
         rows = dict(zip(layout.layer_ids, layout.num_embeddings))[layer_id]
+        weight_name = f"layers.{layer_id}.engram.embed.weight"
+        scale_name = f"layers.{layer_id}.engram.embed.scale"
         weight, wmap = _read_only_table(
-            f"{stage_dir}/{staged_file_name(f'layers.{layer_id}.engram.embed.weight')}",
-            rows, layout.dim)
-        scale, smap = _read_only_table(
-            f"{stage_dir}/{staged_file_name(f'layers.{layer_id}.engram.embed.scale')}",
-            rows, layout.n_scales)
+            f"{stage_dir}/{staged_file_name(weight_name)}", rows, layout.dim,
+            manifest=manifest, tensor_name=weight_name)
+        try:
+            scale, smap = _read_only_table(
+                f"{stage_dir}/{staged_file_name(scale_name)}", rows, layout.n_scales,
+                manifest=manifest, tensor_name=scale_name)
+        except Exception:
+            weight = None  # Release the exported NumPy view before closing mmap.
+            wmap.close()
+            raise
         self._staged_tables = (weight, scale, wmap, smap)
         self._layer_id = layer_id
+        self._engram_storage_backend = backend
+        self._engram_stage_dir = stage_dir
+
+        from vllm.logger import logger
+        logger.info("Engram layer %d: backend=%s path=%s bytes=%d; read-only mmap, "
+                    "filesystem cache residency is demand-driven",
+                    layer_id, backend, stage_dir, rows * (layout.dim + layout.n_scales))
 
     def staged_tables(self):
         if self._staged_tables is None:

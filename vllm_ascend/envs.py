@@ -181,6 +181,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # per request by 4. Ascend's own V4.0 path already runs SWA at
     # DSV4_BLOCK_SIZES[128][0][1] = 128 on the same backend.
     "VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE": lambda: int(os.getenv("VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE") or 0),
+    # DeepSeek-V4.1 Engram storage: "ram" (default, legacy staged files)
+    # or "ssd" (ordinary file-backed mmap; requires a verified manifest).
+    # Non-sensitive; this selects backing storage, not the gather/compute path.
+    "VLLM_ASCEND_DSV41_ENGRAM_BACKEND": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_BACKEND", "ram"),
+    # Absolute table directory. Empty (default) uses /dev/shm/engram_stage
+    # for "ram"; "ssd" requires an explicit directory. Non-sensitive.
+    "VLLM_ASCEND_DSV41_ENGRAM_STAGE_DIR": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_STAGE_DIR", ""),
     # DeepSeek-V4.1 engram: "1" runs the n-gram hash, the id D2H, the host
     # gather and the H2D in the model runner before every forward, outside any
     # captured graph; the graph then only dequantises a persistent staging

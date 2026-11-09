@@ -2,7 +2,7 @@
 """Preconditions on the staged engram tables.
 
 The engram tables do not fit in device memory, so they are staged as raw files
-in ``/dev/shm`` and memory-mapped. A short file reads as zeros past its end,
+in tmpfs or SSD files and memory-mapped read-only. A short file reads as zeros past its end,
 and zeros are valid engram payload, so nothing downstream can detect it.
 
 The expected size therefore comes from the checkpoint (the safetensors
@@ -25,6 +25,28 @@ DEFAULT_STAGE_DIR = "/dev/shm/engram_stage"
 #: safetensors: 8-byte little-endian header length, then that many bytes of
 #: JSON, then the data section that ``data_offsets`` indexes into.
 _HEADER_LEN_BYTES = 8
+
+
+def staging_config(stage_dir: str | None = None) -> tuple[str, str]:
+    """Resolve the backend and directory at call time, before table binding.
+
+    Function defaults must not capture an imported path: launchers select the
+    same directory for verification and mapping through the central env module.
+    Existing explicit RAM paths remain supported.
+    """
+    from vllm_ascend import envs
+
+    backend = envs.VLLM_ASCEND_DSV41_ENGRAM_BACKEND
+    if backend not in ("ram", "ssd"):
+        raise ValueError(f"Engram backend must be 'ram' or 'ssd', got {backend!r}")
+    directory = os.fspath(stage_dir) if stage_dir is not None else envs.VLLM_ASCEND_DSV41_ENGRAM_STAGE_DIR
+    if not directory:
+        if backend == "ssd":
+            raise ValueError("SSD Engram requires an explicit absolute stage directory")
+        directory = DEFAULT_STAGE_DIR
+    if not os.path.isabs(directory):
+        raise ValueError(f"Engram stage directory must be absolute: {directory!r}")
+    return backend, directory
 
 
 def staged_file_name(tensor_name: str) -> str:
@@ -50,7 +72,7 @@ def expected_nbytes(checkpoint_dir: str, tensor_name: str) -> int:
 
 
 def verify_staged_tables(tensor_names: list[str], checkpoint_dir: str,
-                         stage_dir: str = DEFAULT_STAGE_DIR) -> dict[str, int]:
+                         stage_dir: str | None = None) -> dict[str, int]:
     """Refuse to start unless every staged table is exactly the right length.
 
     Returns the verified sizes.
@@ -60,6 +82,17 @@ def verify_staged_tables(tensor_names: list[str], checkpoint_dir: str,
             "verify_staged_tables() was given no tensor names. Checking "
             "nothing and checking everything both return without complaint, "
             "so this refuses instead.")
+
+    backend, stage_dir = staging_config(stage_dir)
+    manifest = None
+    if backend == "ssd":
+        from vllm_ascend.models.deepseek_v4_1.engram_storage import (
+            load_manifest,
+            validate_filesystem,
+        )
+
+        validate_filesystem(stage_dir, backend)
+        manifest = load_manifest(stage_dir, checkpoint_dir)
 
     if not os.path.isdir(stage_dir):
         raise RuntimeError(
@@ -82,6 +115,11 @@ def verify_staged_tables(tensor_names: list[str], checkpoint_dir: str,
                 f"{name}: expected {expected:,} bytes, found {actual:,} "
                 f"({short_by:+,} bytes)")
             continue
+        if manifest is not None:
+            from vllm_ascend.models.deepseek_v4_1.engram_storage import validate_table
+
+            spec = manifest["tables"][name]
+            validate_table(manifest, name, os.stat(path, follow_symlinks=False), *spec["shape"])
         verified[name] = actual
 
     if problems:
@@ -141,9 +179,10 @@ def content_fingerprint(path: str) -> tuple[int, int]:
 
 
 def fingerprint_staged_tables(tensor_names: list[str],
-                              stage_dir: str = DEFAULT_STAGE_DIR
+                              stage_dir: str | None = None
                               ) -> dict[str, tuple[int, int]]:
     """Fingerprint every staged table, for recording after staging."""
+    _, stage_dir = staging_config(stage_dir)
     return {
         name: content_fingerprint(os.path.join(stage_dir, staged_file_name(name)))
         for name in tensor_names
@@ -151,7 +190,7 @@ def fingerprint_staged_tables(tensor_names: list[str],
 
 
 def verify_staged_content(expected: dict[str, tuple[int, int]],
-                          stage_dir: str = DEFAULT_STAGE_DIR) -> None:
+                          stage_dir: str | None = None) -> None:
     """Refuse to start if any table's content has changed since it was staged.
 
     ``expected`` is what ``fingerprint_staged_tables`` returned when the tables
@@ -163,6 +202,7 @@ def verify_staged_content(expected: dict[str, tuple[int, int]],
             "verify_staged_content() was given no fingerprints. Checking "
             "nothing returns just as quietly as checking everything.")
 
+    _, stage_dir = staging_config(stage_dir)
     problems = []
     for name, (want_sum, want_xor) in expected.items():
         path = os.path.join(stage_dir, staged_file_name(name))

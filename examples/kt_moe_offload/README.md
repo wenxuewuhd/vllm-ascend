@@ -21,6 +21,9 @@ Follow the steps in order; each one depends on the previous. At a glance:
 Steps 3 to 6 are one-time per machine. Step 5 is redone after every host reboot
 or container rebuild, because /dev/shm is RAM.
 
+For persistent SSD-backed Engram tables instead of the RAM staging step, see
+[Engram SSD offload](engram_ssd.md).
+
 ## 0. What you need
 
 | | |
