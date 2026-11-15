@@ -341,10 +341,31 @@ class PlacementPlan:
         return dict(out)
 
     @property
+    def split_tensor_names(self) -> tuple[str, ...]:
+        """The tensors ``fraction`` actually divides, read off the segments.
+
+        🔴 Which tensors those are is a property of the SOURCE, not a constant:
+        the checkpoint splits w13 only (its w2 is a column slice of every row,
+        so a 4 KiB page carries both parts' bytes), while the NZ bank splits w2
+        too (TP divides down's k and in NZ the k-block index is outermost, so a
+        part is a contiguous, page-exclusive record). Reporting a hard-coded
+        "w13" made ``explain()`` claim w2 went whole to the streaming node while
+        the very number beside it -- 0.9412 = (w13 + w2)/total -- proved it had
+        been split.
+        """
+        return tuple(sorted({f"{s.proj}.{s.kind}" for s in self.segments if s.part is not None}))
+
+    @property
+    def whole_tensor_names(self) -> tuple[str, ...]:
+        """The tensors that go whole to ``streaming_node``; see above."""
+        return tuple(sorted({f"{s.proj}.{s.kind}" for s in self.segments if s.part is None}))
+
+    @property
     def split_share(self) -> float:
         """Fraction of the planned bytes that ``fraction`` actually governs.
 
-        ``fraction`` divides **w13 only**; ``w2`` and every ``.scale`` go whole
+        ``fraction`` divides the tensors ``split_tensor_names`` lists -- w13 for
+        the checkpoint, w13 **and w2** for the bank; whatever is left goes whole
         to ``streaming_node``. A node's share of *all* planned pages is
         therefore ``fraction[node] * split_share``, NOT ``fraction[node]``.
         """
@@ -356,16 +377,18 @@ class PlacementPlan:
         """The four percentages this module reports, each with its denominator.
 
         They are over four different populations: ``fraction[p]`` is a share
-        **of w13**, the plan's per-node percentages are over **all planned
-        pages** (``fraction[p] * split_share``). Comparing them directly reads
-        as a placement failure that does not exist.
+        **of the split tensors**, the plan's per-node percentages are over **all
+        planned pages** (``fraction[p] * split_share``). Comparing them directly
+        reads as a placement failure that does not exist.
         """
         by, n = self.planned_pages_by_node(), self.planned_pages
         rows = [
             f"  fraction          = {[round(f, 4) for f in self.fraction]}  "
             f"({self.fraction_source}) -- share OF W13 ONLY, per TP part",
-            f"  split_share       = {self.split_share:.4f} -- w13's share of the planned bytes; "
-            f"the rest ({1 - self.split_share:.4f}) is w2+scale and goes whole to "
+            f"  split_share       = {self.split_share:.4f} -- the share of the planned bytes "
+            f"`fraction` divides ({', '.join(self.split_tensor_names) or 'nothing'}); the rest "
+            f"({1 - self.split_share:.4f}) is "
+            f"{', '.join(self.whole_tensor_names) or 'nothing'} and goes whole to "
             f"node{self.streaming_node}",
             "  plan, of ALL planned pages = "
             + str({k: f"{100 * v / max(1, n):.2f}%" for k, v in sorted(by.items())}),

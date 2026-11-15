@@ -58,6 +58,15 @@ _KNOBS: dict[str, tuple[str, str]] = {
     # 0 = T0 (today), 1 = T1, 2 = NTA.
     "nz_prefetch_hint": ("set_nz_prefetch_hint", "int"),
     "nz_prefetch_legacy_stride": ("set_nz_prefetch_legacy_stride", "bool"),
+    # 4 (today), 8, 16 or 32 output rows accumulated per block. NZ only. Under
+    # NZ a block of R rows reads R*16 CONTIGUOUS bytes per k-group before the
+    # N*16 B jump, so R is how long each burst is; the arithmetic of each row is
+    # untouched, so it cannot change the output.
+    "nz_row_block": ("set_nz_row_block", "int"),
+    # One prefetch per 64 B line instead of one per row (four rows share a line
+    # under NZ). Default off, because every arm measured before 2026-11-15 had
+    # it off and that arm has to stay reproducible.
+    "nz_prefetch_dedup": ("set_nz_prefetch_dedup", "bool"),
 }
 
 _thread: threading.Thread | None = None

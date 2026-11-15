@@ -1114,6 +1114,42 @@ def test_split_share_is_w13s_share_of_the_planned_bytes():
     assert plan.split_share == pytest.approx(0.6275, abs=1e-3)
 
 
+class FakeBankSource(FakeSource):
+    """A source that splits w2 as well, which the NZ bank does."""
+
+    split_tensors = (("w1", "weight"), ("w3", "weight"), ("w2", "weight"))
+
+
+def test_explain_names_the_tensors_it_actually_split():
+    """🔴 The report must not hard-code "w13".
+
+    Measured 2026-11-15 on the `now` arm: the server printed `split_share =
+    0.9412` -- which is (w13 + w2)/total, i.e. w2 HAD been split per part -- and
+    on the same line claimed "the rest is w2+scale and goes whole to node1".
+    The number and the sentence contradicted each other, and only the number was
+    right. A reader who trusted the sentence would have gone hunting for a w2
+    locality bug that does not exist.
+    """
+    src = FakeBankSource(num_layers=1, num_experts=4)
+    plan = plan_placement(src, [0], range(4), tp=2, fraction=[1.0, 1.0], streaming_node=1)
+    assert "w2.weight" in plan.split_tensor_names
+    assert plan.whole_tensor_names == ("w1.scale", "w2.scale", "w3.scale")
+    total = 2 * W13_BYTES + W2_BYTES + 3 * SCALE_BYTES
+    assert plan.split_share == pytest.approx((2 * W13_BYTES + W2_BYTES) / total, abs=1e-6)
+    rest = plan.explain().split("the rest (")[1]
+    assert "w2.weight" not in rest.split("goes whole")[0]
+    assert "w2.scale" in rest
+
+
+def test_explain_still_says_w13_only_for_the_checkpoint():
+    """The counterexample: the checkpoint cannot split w2, and must still say so."""
+    plan = plan_placement(FakeSource(num_layers=1, num_experts=4), [0], range(4),
+                          tp=2, fraction=[0.5, 0.5], streaming_node=1)
+    assert plan.split_tensor_names == ("w1.weight", "w3.weight")
+    assert "w2.weight" in plan.whole_tensor_names
+    assert "w2.weight" in plan.explain().split("the rest (")[1]
+
+
 @pytest.mark.parametrize("f0, expect_all_pages", [(0.2229, 13.99), (0.3552, 22.29)])
 def test_fraction_times_split_share_is_the_all_pages_share(f0, expect_all_pages):
     """``fraction[0]`` is a share OF W13 and ``fraction[0] * split_share`` is the

@@ -263,3 +263,23 @@ def test_stream_resident_from_hbm_stays_off_by_default_because_it_has_preconditi
     assert KTOffloadConfig(**base).stream_resident_from_hbm is False
     with pytest.raises(ValueError, match="needs bank_dir"):
         KTOffloadConfig(**base, stream_prefill=True, stream_resident_from_hbm=True)
+
+
+def test_kt_reads_bank_refuses_scope_w13():
+    """🔴 The combination that would compute wrong numbers rather than fail.
+
+    With zerocopy_scope='w13' kt stages w2 itself, and fp4-moe.hpp does it with
+    an ND column-slice walk over down_projs[0][expert] -- index 0 rather than
+    the TP part, and ND strides. The bank's w2 is FRACTAL_NZ with per-part
+    pointers, so that walk reads the wrong bytes and reports nothing. The
+    combination had simply never been run until someone went looking for an arm
+    that isolates w2's share of the TPOT regression.
+    """
+    from vllm_ascend.kt_offload.config import KTOffloadConfig
+
+    base = dict(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
+                overlap_side_stream=False, stream_prefill=True,
+                bank_dir="/dev/shm/dsv41_nz_bank", zerocopy_w13=True, kt_reads_bank=True)
+    KTOffloadConfig(**base, zerocopy_scope="all")
+    with pytest.raises(ValueError, match="needs zerocopy_scope='all'"):
+        KTOffloadConfig(**base, zerocopy_scope="w13")

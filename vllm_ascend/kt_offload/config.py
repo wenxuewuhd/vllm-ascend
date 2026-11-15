@@ -348,6 +348,19 @@ class KTOffloadConfig:
             raise ValueError(
                 "kt_offload_config.kt_reads_bank needs zerocopy_w13: the bank is consumed IN PLACE, "
                 "and the copy path would memcpy NZ bytes into a row-major BufferB.")
+        if self.kt_reads_bank and self.zerocopy_scope != "all":
+            # 🔴 Silent wrong answer, not a slowdown. Under KT_ZEROCOPY_SCOPE=w13
+            # kt STAGES w2 itself, and fp4-moe.hpp does that with an ND
+            # column-slice walk over `config.down_projs[0][expert]` -- index 0,
+            # not the TP part, and ND strides. The bank's w2 is FRACTAL_NZ and
+            # its pointers are per part, so that walk would read the wrong bytes
+            # and report nothing. (Found 2026-11-15 while looking for an arm
+            # that isolates w2's contribution to the TPOT regression; the
+            # combination had never been run.)
+            raise ValueError(
+                "kt_offload_config.kt_reads_bank needs zerocopy_scope='all': with 'w13' kt stages "
+                "w2 itself through an ND column walk, which cannot read the bank's NZ w2 -- it "
+                "would compute wrong numbers rather than fail.")
         if self.zerocopy_scope not in ("w13", "all"):
             raise ValueError("kt_offload_config.zerocopy_scope must be 'w13' or 'all' "
                              "(the two scopes kt's KT_ZEROCOPY_SCOPE parser accepts).")
