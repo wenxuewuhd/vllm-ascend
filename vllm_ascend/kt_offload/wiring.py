@@ -44,6 +44,7 @@ is the exact failure the whole path is built to refuse (``config.py``
 from __future__ import annotations
 
 from dataclasses import dataclass
+import torch
 from typing import Any
 
 from vllm.logger import logger
@@ -63,6 +64,10 @@ from vllm_ascend.kt_offload.numa_placement import (
 )
 from vllm_ascend.kt_offload.stream_io import StreamSlotProvider
 from vllm_ascend.kt_offload.weight_source import WeightSource
+
+
+#: Diagnostic allocations kept alive for the process lifetime (debug_hold_hbm_bytes).
+_DEBUG_HBM_HOLDS: list = []
 
 
 @dataclass(frozen=True)
@@ -196,7 +201,26 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
             f"{cfg.stream_prefill_chunk_experts}), and the post-load cast of a slot that is only partly "
             "filled has no on-card reading. Pick a divisor of the expert count.")
 
-    source = WeightSource(weight_path, num_experts=num_experts)
+    # Stage 2: the bank replaces the checkpoint as the source of streamed
+    # chunks. Chosen HERE because the provider's device side must agree with it:
+    # the bank's bytes are already FRACTAL_NZ, so the cast must not run.
+    bank_dir = str(getattr(cfg, "bank_dir", "") or "")
+    if bank_dir:
+        from vllm_ascend.kt_offload.bank_source import BankSource
+        # 🔴 EXPLICIT thread count. BankSource's own default is
+        # MIN_LOADER_THREADS (4) while the checkpoint arm below gets
+        # weight_source.DEFAULT_COPY_THREADS (8), so leaving it out quietly
+        # halved the streaming read leg's threads when the bank replaced the
+        # checkpoint -- and that leg is ~94% of the staging loop's wall clock.
+        # 16 is what measure/bench_gather_numa.py measured (12 paired rounds,
+        # one whole layer per pass): 4 thr = 50.7 GiB/s, 8 = 65.9, 16 = 69.6
+        # with this index split and 76.9 with a node-matched one. The 8 was
+        # measured on the CHECKPOINT's scattered-segment gather, which is a
+        # different access pattern from the bank's 224 bulk strided runs.
+        # VLLM_ASCEND_DSV41_KT_LOADER_THREADS overrides this per server start.
+        source = BankSource(bank_dir, num_experts=num_experts, copy_threads=16)
+    else:
+        source = WeightSource(weight_path, num_experts=num_experts)
     provider = StreamSlotProvider(
         source,
         quant_method,
@@ -205,9 +229,51 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
         chunk_experts=int(cfg.stream_prefill_chunk_experts),
         device=device,
     )
-    # We built the WeightSource, so the provider's close() owns it too (it only
+    # We built the source, so the provider's close() owns it too (it only
     # infers ownership when it was handed a path).
     provider.owns_source = True
+    if bank_dir:
+        # Must come before anything reads a slot: it builds the NZ-tagged
+        # destination once, through the production format_nd, and from then on
+        # the per-chunk cast is skipped.
+        provider.enable_nz_device()
+
+    # Diagnostics (both default off), set up before anything is installed so
+    # that an OFF arm can be made to carry the same allocation as an ON arm.
+    from vllm_ascend.kt_offload import stream_chain as _sc
+    _sc.set_chunk_timing(bool(getattr(cfg, "debug_time_chunks", False)))
+    _dummy_hbm = None
+    _hold = int(getattr(cfg, "debug_hold_hbm_bytes", 0) or 0)
+    if _hold > 0:
+        # Reproduce "one large block held for the process lifetime" WITHOUT any
+        # stage-1 code path. Removing the fold's 1.75 GiB did not move the
+        # regression, so headroom is refuted -- but the 6.75 GiB layer buffer was
+        # present in every ON arm of both campaigns, and fragmentation is not
+        # headroom. This separates "holding it" from "using it".
+        _dummy_hbm = torch.empty(_hold, dtype=torch.uint8, device=device)
+        logger.info("kt_offload: DIAGNOSTIC holding %d B (%.3f GiB) of HBM for the process lifetime",
+                    _hold, _hold / float(1 << 30))
+
+    # Stage 1 (default off): accumulate every chunk's cast output into ONE
+    # whole-layer NZ buffer instead of dropping it. The wrap MUST happen here
+    # rather than inside install_stream_provider: from here on, exactly one
+    # object is "the provider", and _assert_installed, the fold and
+    # StreamingWiring all have to be handed that same object. Wrapping inside
+    # the installer left the caller holding the unwrapped provider, so the
+    # layers held the wrapper, the fold was built against the inner object, and
+    # _assert_installed's identity check refused the start-up with "layer 0 did
+    # not take the streaming provider". LayerSlotProvider is a transparent
+    # proxy (__getattr__ -> inner) for set_layer / served_nd / layer / device /
+    # close, so everything downstream keeps working unchanged.
+    if bool(getattr(cfg, "stream_layer_buffer", False)):
+        from vllm_ascend.kt_offload import stream_layer
+        provider = stream_layer.install_layer_buffer(
+            provider,
+            sync_scope=str(getattr(cfg, "stream_layer_sync_scope", "device")),
+            num_experts=num_experts,
+            probe_bytes=int(getattr(cfg, "stream_layer_probe_bytes",
+                                    stream_layer.DEFAULT_PROBE_BYTES)),
+        )
 
     fold = None
     try:
@@ -228,6 +294,26 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
         sorted(offloads), provider.chunk_experts, provider.bytes_per_expert,
         provider.coverage.pinned_bytes / float(1 << 30), weight_path,
         "installed" if fold is not None else "off (dynamic_resident=false)")
+    if _dummy_hbm is not None:
+        # StreamingWiring is frozen, and a local would be freed on return -- the
+        # diagnostic would then silently measure nothing. Hold a module-level
+        # reference for the process lifetime, which is exactly what is being
+        # reproduced.
+        _DEBUG_HBM_HOLDS.append(_dummy_hbm)
+    # 🔴 Last step, and only with kt_reads_bank: by now kt has loaded (it read
+    # the checkpoint for the SCALES, which it converts and cannot alias, and
+    # that faulted in all ~269 GiB of expert bytes) and the streaming provider
+    # is bound to the bank. So nothing reads the checkpoint's expert tensors
+    # again, and holding their page cache is pure duplication -- which is the
+    # whole point of stage 3. Measured 2026-11-15: without this the resident
+    # checkpoint page cache stayed at 267.3 GiB even though placement had
+    # already moved to the bank.
+    #
+    # Safe only in this configuration; the function says why.
+    if getattr(cfg, "kt_reads_bank", False):
+        from vllm_ascend.kt_offload.bank_kt_source import drop_checkpoint_expert_cache
+
+        drop_checkpoint_expert_cache(weight_path)
     return StreamingWiring(provider=provider, fold=fold, layers=tuple(sorted(offloads)))
 
 
@@ -287,17 +373,36 @@ def setup_placement(vllm_config, *, ascend_config=None, layers=None, experts=Non
         streaming_source = "configured"
 
     weight_path = cfg.weight_path or vllm_config.model_config.model
-    # WeightSource's own default expert count: KTOffloadConfig has no such field
-    # (num_resident_experts is a different number).
-    source = WeightSource(weight_path)
+    # 🔴 With kt_reads_bank the pages that must be placed are the BANK's, not the
+    # checkpoint's: kt reads the bank, streaming prefill reads the bank, and
+    # nothing reads the checkpoint's expert tensors during serving. Placing the
+    # checkpoint anyway is what kept its 268.95 GiB faulted in and migrated --
+    # measured 2026-11-15 as `planned=70502400` with a total working set that
+    # did not move at all (550.0 vs 549.5 GiB).
+    kt_bank = None
+    if getattr(cfg, "kt_reads_bank", False):
+        from vllm_ascend.kt_offload.bank_kt_source import BankPlacementSource, KtBankSource
+
+        hidden = int(vllm_config.model_config.hf_text_config.hidden_size)
+        inter = int(vllm_config.model_config.hf_text_config.moe_intermediate_size)
+        kt_bank = KtBankSource(cfg.bank_dir, tp_count=tp, hidden=hidden, intermediate=inter)
+        source = BankPlacementSource(kt_bank)
+    else:
+        # WeightSource's own default expert count: KTOffloadConfig has no such
+        # field (num_resident_experts is a different number).
+        source = WeightSource(weight_path)
     layer_ids = list(layers) if layers is not None else list(
         range(int(vllm_config.model_config.hf_text_config.num_hidden_layers)))
-    expert_ids = list(experts) if experts is not None else list(range(source.num_experts))
+    n_experts = kt_bank.num_experts if kt_bank is not None else source.num_experts
+    expert_ids = list(experts) if experts is not None else list(range(n_experts))
 
     logger.info(
         "kt_offload: placing %d layer(s) x %d experts of %s -- fraction=%s (%s), "
         "part_nodes=%s, streaming_node=%d (%s)",
-        len(layer_ids), len(expert_ids), weight_path, [round(f, 4) for f in fraction],
+        len(layer_ids), len(expert_ids),
+        (f"the NZ BANK {cfg.bank_dir} (w13 per part + w2 per part)" if kt_bank is not None
+         else f"the checkpoint {weight_path} (w13 per part, w2 streaming-only)"),
+        [round(f, 4) for f in fraction],
         source_kind, part_nodes, streaming_node, streaming_source)
     try:
         plan, report = place_weights(
@@ -306,7 +411,13 @@ def setup_placement(vllm_config, *, ascend_config=None, layers=None, experts=Non
             fraction_source=source_kind, reserve_gib=float(cfg.zerocopy_reserve_gib),
         )
     finally:
-        source.close()
+        # The bank source's own mmaps are not opened by placement (it only
+        # reports offsets), and the one kt holds pointers into is the registry's
+        # in layer.py -- closing this one must not touch that.
+        if kt_bank is not None:
+            kt_bank.close()
+        else:
+            source.close()
 
     if plan.planned_pages == 0:
         raise RuntimeError(

@@ -228,6 +228,30 @@ def make_provider(ckpt_dir, rec: Recorder | None = None, *, chunk=CHUNK, layer=0
     return prov, rec
 
 
+def test_copy_threads_is_refused_when_it_would_be_ignored(syn_ckpt):
+    """A `copy_threads` the provider cannot honour must not be accepted silently.
+
+    Given a SOURCE OBJECT, the object's own thread count is what gathers, so the
+    provider's argument does nothing. That is how the bank arm ended up on
+    `MIN_LOADER_THREADS` (4) while this default said 8 -- on the leg the server's
+    staging report puts at ~94% of the staging loop. The number is now explicit
+    at the one place that builds the source (`wiring.setup_streaming`), and
+    passing it here instead is an error.
+    """
+    src = WeightSource(syn_ckpt, num_experts=SYN_EXPERTS, copy_threads=2)
+    rec = Recorder()
+    with pytest.raises(ValueError, match="contradicts the source"):
+        StreamSlotProvider(src, quant_method(), hidden_size=HIDDEN, intermediate_size=INTER,
+                           chunk_experts=CHUNK, device="cpu", seam=rec.seam(), copy_threads=4)
+    # Two things that are NOT contradictions: the default (no claim about a
+    # source this provider did not build), and the source's own number restated.
+    for ct in (stream_io.DEFAULT_SLOT_COPY_THREADS, 2):
+        prov = StreamSlotProvider(src, quant_method(), hidden_size=HIDDEN, intermediate_size=INTER,
+                                  chunk_experts=CHUNK, device="cpu", seam=rec.seam(),
+                                  copy_threads=ct)
+        assert prov.source is src and prov.source.copy_threads == 2
+
+
 def record_mismatches(rec: Recorder, ckpt_dir: str, layer: int, experts) -> list[str]:
     """Every per-expert record on the 'device', against the safe_open oracle."""
     bad = []

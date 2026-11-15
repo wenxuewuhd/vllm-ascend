@@ -12,6 +12,7 @@ import ast
 import inspect
 import json
 import pathlib
+import sys
 import textwrap
 import threading
 from types import SimpleNamespace
@@ -60,7 +61,12 @@ from vllm_ascend.kt_offload.resident_swap import (
     check_resident_state,
 )
 from vllm_ascend.kt_offload.stream_chain import SLOT_WEIGHT_ATTRS, run_streamed_layer
-from vllm_ascend.kt_offload.stream_io import DeviceSeam, StreamSlotProvider, default_post_load
+from vllm_ascend.kt_offload.stream_io import (
+    PARAM_FOR_GROUP,
+    DeviceSeam,
+    StreamSlotProvider,
+    default_post_load,
+)
 from vllm_ascend.kt_offload.stream_prefill import build_chunk_plan
 from vllm_ascend.kt_offload.weight_source import WeightSource
 
@@ -369,7 +375,7 @@ AUTO = object()
 class World:
     """Resident layers built from OLD, a real provider on the synthetic checkpoint, a fold."""
 
-    def __init__(self, ckpt_dir, plat, tmp_path, layers=(LAYER,), capture=False, **fold_kw):
+    def __init__(self, ckpt_dir, plat, tmp_path, layers=(LAYER,), capture=False, _nz=False, **fold_kw):
         self.ckpt, self.plat, self.tmp = ckpt_dir, plat, tmp_path
         # What the runner publishes: by default a prompt that fits in ONE prefill
         # forward, fresh (a new request) per ``stream()`` call unless given a window.
@@ -393,6 +399,13 @@ class World:
             WeightSource(ckpt_dir, num_experts=E, copy_threads=1), quant_method(),
             hidden_size=HIDDEN, intermediate_size=INTER, chunk_experts=CHUNK,
             device="cpu", seam=self.seam.seam(), copy_threads=1)
+        if _nz:
+            # The production order: the source becomes the bank, THEN the device
+            # side is told the bytes arriving are already in device layout. The
+            # fold is built after, so it sees ``nz_device`` True and stages in NZ.
+            self.provider.source = BankLikeSource(self.provider.source, self.provider.shapes)
+            self.provider.enable_nz_device()
+        self.nz = bool(_nz)
         self.fold = ResidentFold(self.placement, self.targets, provider=self.provider,
                                  step_source=lambda: 1,
                                  capture_predicate=(lambda: True) if capture else (lambda: False), **fold_kw)
@@ -1461,13 +1474,20 @@ _INPLACE_OK = {
     ("index_copy_", "_stage_rows"),          # the ND staging write; ND on both sides, never a resident parameter
     ("copy_memory_", "fold_weight_write"),   # the one device channel into a resident parameter
     ("add_", "_accumulate"),                 # the host float64 heat row, not a device tensor
+    ("memcpy_async", "fold_stage_write_nz"), # the raw ACL channel into the NZ staging (bank mode)
 }
 #: Bases whose subscript assignment is a plain Python container store, not a tensor write.
 _SUBSCRIPT_OK = {"self._staging", "self._heat", "self._decided_at", "self.coverage.skipped", "a.filled"}
 #: The single dynamic attribute access allowed: the provider capability probe, a read.
 _GETATTR_OK = {("__init__", "getattr(provider, need, None)")}
 #: Writes whose name does not end in ``_`` (the ``_`` rule covers every other one).
-_NON_UNDERSCORE_WRITES = {"narrow_copy"}
+#: The ACL family is here because a raw memcpy is a write the ``_`` rule cannot
+#: see at all: it is a plain function call on an address, it does not touch a
+#: tensor method, and before it was listed the NZ staging write was invisible to
+#: this whole scan. ``memcpy`` / ``memset`` and their async forms are all listed
+#: even though only one is used, so reaching for another one is also caught.
+_NON_UNDERSCORE_WRITES = {"narrow_copy", "memcpy", "memcpy_async", "memcpy_v2",
+                          "memset", "memset_async", "host_register", "host_register_v2"}
 
 
 def _assign_violations(node, target) -> list[str]:
@@ -1546,6 +1566,25 @@ def write_channel_violations(src: str) -> list[str]:
         if got != want or node.keywords:
             bad.append(f"line {node.lineno}: copy_memory_ must take the whole parameters (dst.data, src.data), "
                        f"got {ast.unparse(node)}")
+    # ``import acl`` is the door to the raw channel; it must be behind the one
+    # function that is allowed to use it, or a second raw write could be added
+    # anywhere in the module and every rule above would still be green.
+    for node in ast.walk(tree):
+        names = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                 else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
+        if any(n.split(".")[0] == "acl" for n in names):
+            if owner.get(id(node)) != "fold_stage_write_nz":
+                bad.append(f"line {node.lineno}: acl is imported in "
+                           f"{owner.get(id(node))!r}; only fold_stage_write_nz may reach the raw channel")
+    fw = funcs.get("fold_stage_write_nz")
+    if fw is None:
+        bad.append("fold_stage_write_nz is gone")
+    else:
+        checks = [ast.unparse(st.value.func) for st in fw.body
+                  if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)]
+        if checks[:2] != ["_assert_owns_storage", "_assert_owns_storage"]:
+            bad.append("fold_stage_write_nz must check whole-storage ownership of BOTH ends before writing; "
+                       f"its leading calls are {checks[:3]}")
     fw = funcs.get("fold_weight_write")
     if fw is None:
         bad.append("fold_weight_write is gone")
@@ -1841,3 +1880,455 @@ def test_a_prefill_that_folded_and_never_committed_is_loud_too(ckpt, plat, tmp_p
     assert w.fold.coverage.prefills_without_commit == 1
     assert len(said) == 1 and "not one commit" in said[0], said
     assert "request A" in said[0]
+
+
+# ---------------------------------------------------------------------------
+# NZ (bank) mode: the staging is internal-format and filled by ADDRESS
+#
+# What is modelled and what is not. The raw channel is modelled by doing the
+# real thing: ``acl.rt.memcpy_async`` here is ``ctypes.memmove`` over the actual
+# addresses of real CPU storages, so every offset, length and bound this code
+# computes is executed exactly as the card would execute it, and a wrong offset
+# lands wrong bytes rather than being approximated away. What CANNOT be modelled
+# is the ASYNCHRONY -- the host-side task queue that lets a raw copy overtake a
+# torch op is why ``_nz_barrier_wait`` exists, and nothing here can make a
+# synchronous memmove race. So the barrier's effect is asserted only as "the wait
+# happens, once per folded layer, and the knob can remove it"; that it is
+# sufficient is an on-card question, with ``fold_nz_barrier='none'`` as the
+# positive control.
+# ---------------------------------------------------------------------------
+
+import ctypes  # noqa: E402  (the NZ section's own dependency)
+
+from vllm_ascend.kt_offload.fold_swap import (  # noqa: E402
+    fold_stage_write_nz,
+    merge_runs,
+)
+from vllm_ascend.kt_offload.stream_io import ND_SCALE_ATTRS, NZ_WEIGHT_ATTRS  # noqa: E402
+from vllm_ascend.kt_offload.weight_source import GROUPS  # noqa: E402
+
+#: ``aclrtMemcpyKind``: 1 = HOST_TO_DEVICE (the provider's H2D into the NZ slot),
+#: 3 = DEVICE_TO_DEVICE (the fold's staging write). Spelled out rather than
+#: imported, so changing the constant in the module is a change here too.
+ACL_H2D, ACL_D2D = 1, 3
+FAKE_STREAM = 0x5747
+
+
+class AclFake:
+    """``acl.rt`` as this code uses it: a real memmove, and the checks the API does NOT do.
+
+    ``destMax`` is the only bound ``aclrtMemcpyAsync`` enforces and there is no
+    ``srcMax`` at all (acl_rt.h:2309), so this refuses ``count > destMax`` and
+    otherwise copies whatever it is pointed at -- which is what makes a missing
+    source-side check in the caller show up as wrong bytes here instead of an
+    error.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[int, int, int, int, int, int]] = []
+
+    @property
+    def rt(self):
+        return self
+
+    def memcpy_async(self, dst, destMax, src, count, kind, stream):  # noqa: N803 (the ACL spelling)
+        self.calls.append((int(dst), int(destMax), int(src), int(count), int(kind), int(stream)))
+        if int(count) > int(destMax):
+            return 107005
+        if int(kind) not in (ACL_H2D, ACL_D2D):
+            raise AssertionError(f"unexpected aclrtMemcpyKind {kind}; this model has one address space, "
+                                 "but the KIND is still part of what the caller must get right")
+        ctypes.memmove(int(dst), int(src), int(count))
+        return 0
+
+    def d2d(self) -> list[tuple[int, int, int, int, int, int]]:
+        """Only the fold's copies: the provider's H2D goes through the same fake."""
+        return [c for c in self.calls if c[4] == ACL_D2D]
+
+
+@pytest.fixture
+def acl_fake(monkeypatch):
+    a = AclFake()
+    monkeypatch.setitem(sys.modules, "acl", a)
+    return a
+
+
+@pytest.fixture
+def npu_rt(monkeypatch):
+    """``torch.npu`` as the NZ path reads it: a stream handle and the two barriers."""
+    waits = {"device": 0, "stream": 0}
+    stream = SimpleNamespace(npu_stream=FAKE_STREAM,
+                             record_event=lambda *a, **k: None,
+                             wait_event=lambda *a, **k: None,
+                             synchronize=lambda: waits.__setitem__("stream", waits["stream"] + 1))
+    monkeypatch.setattr(torch.npu, "current_stream", lambda *a, **k: stream, raising=False)
+    # ``_upload_nz`` records an event so the pinned source can be refilled; off
+    # card there is no device to create one on, and the test seam's ``wait`` is a
+    # no-op anyway (one address space, synchronous copies).
+    monkeypatch.setattr(torch.npu, "Event",
+                        lambda *a, **k: SimpleNamespace(record=lambda *_: None,
+                                                        synchronize=lambda *_: None,
+                                                        query=lambda *_: True), raising=False)
+    monkeypatch.setattr(torch.npu, "synchronize",
+                        lambda *a, **k: waits.__setitem__("device", waits["device"] + 1), raising=False)
+    monkeypatch.setattr(torch.npu, "empty_cache", lambda *a, **k: None, raising=False)
+    return waits
+
+
+def nz_bytes_of(t: torch.Tensor) -> torch.Tensor:
+    """The bytes ``Platform.npu_format_cast`` would produce for ``t``. The test's bank."""
+    with torch._C.DisableTorchFunction():
+        y = t.flip(-1).roll(1, dims=-2).contiguous()
+        return torch.empty(0, dtype=torch.uint8).set_(y.untyped_storage()).clone()
+
+
+class BankLikeSource:
+    """A stand-in for ``bank_source.BankSource`` on the fake platform.
+
+    The production bank holds ``npu_format_cast``'s output bytes; this holds the
+    bytes THIS platform's cast would produce, which is the same contract against
+    a different permutation. It wraps the real ``WeightSource`` -- the gather,
+    the layout and the group order are the production ones -- and permutes each
+    parameter's slice of the staging in place afterwards.
+    """
+
+    def __init__(self, inner, shapes):
+        self.inner, self.shapes = inner, shapes
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def gather(self, layer, experts, staging):
+        res = self.inner.gather(layer, experts, staging)
+        views = res.layout.views(staging)
+        n = len(experts)
+        for group, _ in GROUPS:
+            param = PARAM_FOR_GROUP[group]
+            if param not in NZ_WEIGHT_ATTRS:
+                # The SCALES are stored unpermuted, in the bank as here: they
+                # never go through the cast (``format_nd`` gives the slot a
+                # 4-D VIEW of the ND bytes), so a bank that permuted them would
+                # be serving bytes the operator never sees in that order.
+                continue
+            shape, dtype = self.shapes[param]
+            # ``reshape(-1)`` must be a VIEW here or the permuted bytes would be
+            # written to a copy and the staging would stay ND -- which would make
+            # every NZ arm below silently identical to the ND one.
+            flat = views[group].reshape(-1)
+            assert flat.data_ptr() == views[group].data_ptr() and flat.is_contiguous()
+            nd = flat.view(dtype).reshape((n, *tuple(shape[1:])))
+            flat.copy_(nz_bytes_of(nd))
+        return res
+
+
+def nz_world(ckpt_dir, plat, tmp_path, **kw):
+    """A ``World`` whose provider serves NZ bytes and whose fold stages them in NZ."""
+    w = World(ckpt_dir, plat, tmp_path, _nz=True, **kw)
+    return w
+
+
+# -- merge_runs: pure, and the thing that decides which bytes go where -------
+
+
+@pytest.mark.parametrize("pairs, want", [
+    ([], []),
+    ([(3, 1)], [(3, 1, 1)]),
+    # both sides advance together -> one copy
+    ([(0, 0), (1, 1), (2, 2)], [(0, 0, 3)]),
+    # a gap on the destination breaks the run
+    ([(0, 0), (2, 1)], [(0, 0, 1), (2, 1, 1)]),
+    # a gap on the SOURCE breaks it too: consecutive rows fed from
+    # non-consecutive slots are not one contiguous block
+    ([(0, 0), (1, 2)], [(0, 0, 1), (1, 2, 1)]),
+    # arrival order must not matter: the plan is sorted by destination
+    ([(5, 2), (4, 1), (3, 0)], [(3, 0, 3)]),
+    ([(9, 2), (10, 3), (5, 0), (6, 1)], [(5, 0, 2), (9, 2, 2)]),
+])
+def test_merge_runs_splits_exactly_where_a_block_stops_being_contiguous(pairs, want):
+    assert merge_runs(pairs) == want
+
+
+def test_merge_runs_covers_every_pair_it_was_given():
+    pairs = [(0, 0), (1, 1), (4, 2), (7, 3), (8, 4), (9, 5)]
+    runs = merge_runs(pairs)
+    flat = [(d + i, s + i) for d, s, n in runs for i in range(n)]
+    assert sorted(flat) == sorted(pairs), "a run table that drops or invents a row stages the wrong expert"
+
+
+def test_merge_runs_refuses_two_sources_for_one_row():
+    with pytest.raises(FoldError, match="appears twice"):
+        merge_runs([(3, 0), (3, 1)])
+
+
+# -- fold_stage_write_nz: the offsets, and the bound the API does not check --
+
+
+def nz_pair(slots, per_slot, plat, fill_src=True):
+    """A destination and a source NZ buffer, slot ``i`` of the source filled with ``i``."""
+    dst = plat.on_device(torch.zeros(slots * per_slot, dtype=torch.uint8), nz=True)
+    src = plat.on_device(torch.zeros(slots * per_slot, dtype=torch.uint8), nz=True)
+    if fill_src:
+        with torch._C.DisableTorchFunction():
+            for i in range(slots):
+                src[i * per_slot:(i + 1) * per_slot] = i + 1
+    return dst, src
+
+
+def test_fold_stage_write_nz_lands_each_slot_at_its_own_offset(plat, acl_fake):
+    per_slot, slots = 16, 6
+    dst, src = nz_pair(slots, per_slot, plat)
+    # slot 4 -> row 0 on its own, then slots 1,2,3 -> rows 3,4,5 as ONE run
+    runs = merge_runs([(0, 4), (3, 1), (4, 2), (5, 3)])
+    assert runs == [(0, 4, 1), (3, 1, 3)]
+    moved = fold_stage_write_nz(dst, src, bytes_per_slot=per_slot, runs=runs, stream=FAKE_STREAM)
+    assert moved == 4 * per_slot
+    got = raw(dst).reshape(slots, per_slot)[:, 0].tolist()
+    assert got == [5, 0, 0, 2, 3, 4], "each row must hold the slot it was told to take, and no other row"
+    assert [c[4] for c in acl_fake.calls] == [ACL_D2D] * len(acl_fake.calls)
+    assert [c[5] for c in acl_fake.calls] == [FAKE_STREAM] * len(acl_fake.calls)
+    # destMax is the promise, and it must equal what is actually written
+    assert all(c[1] == c[3] for c in acl_fake.calls)
+    assert len(acl_fake.calls) == 2, f"the two runs should be two copies, got {len(acl_fake.calls)}"
+
+
+def test_fold_stage_write_nz_moves_the_same_bytes_whether_or_not_runs_merge(plat, acl_fake):
+    per_slot, slots = 8, 5
+    pairs = [(0, 0), (1, 1), (2, 2)]
+    merged_dst, src = nz_pair(slots, per_slot, plat)
+    one_by_one_dst, _ = nz_pair(slots, per_slot, plat)
+    a = fold_stage_write_nz(merged_dst, src, bytes_per_slot=per_slot, runs=merge_runs(pairs),
+                            stream=FAKE_STREAM)
+    b = fold_stage_write_nz(one_by_one_dst, src, bytes_per_slot=per_slot,
+                            runs=[(d, s, 1) for d, s in pairs], stream=FAKE_STREAM)
+    assert a == b
+    assert torch.equal(raw(merged_dst), raw(one_by_one_dst))
+
+
+def test_fold_stage_write_nz_refuses_a_run_past_the_end_of_the_source(plat, acl_fake):
+    per_slot, slots = 16, 4
+    dst, src = nz_pair(slots, per_slot, plat)
+    with pytest.raises(FoldError, match="no srcMax"):
+        fold_stage_write_nz(dst, src, bytes_per_slot=per_slot, runs=[(0, 3, 2)], stream=FAKE_STREAM)
+    assert acl_fake.calls == [], "the copy must be refused BEFORE it is issued; ACL would not catch it"
+
+
+def test_fold_stage_write_nz_refuses_a_run_past_the_end_of_the_destination(plat, acl_fake):
+    per_slot, slots = 16, 4
+    dst, src = nz_pair(slots, per_slot, plat)
+    with pytest.raises(FoldError, match="of a .* B destination"):
+        fold_stage_write_nz(dst, src, bytes_per_slot=per_slot, runs=[(3, 0, 2)], stream=FAKE_STREAM)
+    assert acl_fake.calls == []
+
+
+def test_fold_stage_write_nz_refuses_a_buffer_that_is_not_whole_slots(plat, acl_fake):
+    dst = plat.on_device(torch.zeros(40, dtype=torch.uint8), nz=True)
+    src = plat.on_device(torch.zeros(48, dtype=torch.uint8), nz=True)
+    with pytest.raises(FoldError, match="not a whole number of"):
+        fold_stage_write_nz(dst, src, bytes_per_slot=16, runs=[(0, 0, 1)], stream=FAKE_STREAM)
+
+
+def test_fold_stage_write_nz_refuses_a_view(plat, acl_fake):
+    per_slot, slots = 16, 4
+    dst, src = nz_pair(slots, per_slot, plat)
+    with pytest.raises(ValueError, match="whole storage"):
+        fold_stage_write_nz(dst[per_slot:], src, bytes_per_slot=per_slot, runs=[(0, 0, 1)], stream=FAKE_STREAM)
+
+
+def test_fold_stage_write_nz_reports_a_refused_copy_and_counts_no_bytes(plat, monkeypatch):
+    """A non-zero ACL return must raise, not be added to ``bytes_staged``."""
+    per_slot, slots = 16, 4
+    dst, src = nz_pair(slots, per_slot, plat)
+    calls = []
+    monkeypatch.setitem(sys.modules, "acl", SimpleNamespace(
+        rt=SimpleNamespace(memcpy_async=lambda *a: (calls.append(a), 507899)[1])))
+    with pytest.raises(FoldError, match="returned 507899"):
+        fold_stage_write_nz(dst, src, bytes_per_slot=per_slot, runs=[(0, 0, 1)], stream=FAKE_STREAM)
+    assert len(calls) == 1
+
+
+# -- end to end in NZ mode, against the SAME independent static build -------
+
+
+def test_the_permutation_this_arm_models_is_not_the_identity():
+    """Without this, the NZ arms below would be the ND arms under another name."""
+    t = torch.arange(2 * 4 * 6, dtype=torch.uint8).reshape(2, 4, 6)
+    with torch._C.DisableTorchFunction():
+        flat = torch.empty(0, dtype=torch.uint8).set_(t.contiguous().untyped_storage()).clone()
+    assert not torch.equal(nz_bytes_of(t), flat), "the modelled cast must move bytes"
+    # ...and it must move them WITHIN an expert: the raw channel copies whole
+    # slots, which is only correct if no byte crosses a slot boundary.
+    for e in range(2):
+        a = nz_bytes_of(t)[e * 24:(e + 1) * 24]
+        b = nz_bytes_of(t[e:e + 1])
+        assert torch.equal(a, b), "the modelled permutation mixes experts; the real one is per expert"
+
+
+def test_the_bank_path_lands_the_same_device_bytes_as_the_cast(ckpt, plat, tmp_path, acl_fake, npu_rt):
+    """The property the bank rests on, checked at the chunk boundary.
+
+    ND mode gathers checkpoint bytes and casts them on the device; NZ mode
+    gathers bytes that are ALREADY cast and copies them in raw. The device must
+    end up holding the same thing either way -- if it does not, every arm below
+    is comparing two different models, and on card it would be wrong numbers.
+    """
+    w_nd = World(ckpt, plat, tmp_path)
+    w_nz = nz_world(ckpt, plat, tmp_path)
+    assert w_nd.provider.nz_device is False and w_nz.provider.nz_device is True
+    ids = (0, 1, 2)
+    w_nd.provider.set_layer(LAYER)
+    w_nz.provider.set_layer(LAYER)
+    nd_slot = w_nd.provider.slot_for(0, ids)
+    nz_slot = w_nz.provider.slot_for(0, ids)
+    for name in SLOT_WEIGHT_ATTRS:
+        a, b = raw(nd_slot.tensors()[name]), raw(nz_slot.tensors()[name])
+        assert a.numel() == b.numel(), name
+        assert torch.equal(a, b), f"{name}: the bank path and the cast path disagree on the device bytes"
+    assert [c[4] for c in acl_fake.calls] == [ACL_H2D] * len(acl_fake.calls), \
+        "only the provider's H2D should have run; the fold has not been asked for anything yet"
+
+
+def test_folded_resident_in_nz_mode_equals_the_static_explicit_build(ckpt, plat, tmp_path,
+                                                                     acl_fake, npu_rt):
+    """The whole bank+fold path, judged by the same oracle as the ND path.
+
+    The expectation is checkpoint bytes read with ``safe_open`` into a production
+    ``explicit`` placement and cast by the platform -- it knows nothing about the
+    fold, the bank or the raw channel. So this fails for a wrong slot offset, a
+    row taken from the wrong chunk slot, a run merged across a discontinuity, a
+    scale left behind in the ND half, or a layer committed from a stale staging.
+    """
+    w = nz_world(ckpt, plat, tmp_path)
+    assert w.verdict(), "the start state must differ from the expectation, or this proves nothing"
+    out, rep = w.stream()
+    assert rep is not None and rep.swap.ok, rep
+    assert w.verdict() == [], w.verdict()
+    assert w.fold.coverage.layers_committed == 1
+    assert acl_fake.d2d(), "nothing went through the raw channel: this ran the ND path"
+
+
+def test_nz_mode_casts_once_at_set_up_and_never_per_layer(ckpt, plat, tmp_path, acl_fake, npu_rt):
+    """The cast is what NZ mode exists to remove; a per-layer cast would be the bug back."""
+    w = nz_world(ckpt, plat, tmp_path, layers=(0, 1))
+    at_setup = len(plat.casts)
+    assert at_setup > 0, "set-up must cast: the NZ tag has to come from the real hook"
+    for layer in (0, 1):
+        _, rep = w.stream(layer=layer, hot=HOT[layer])
+        assert rep is not None and rep.swap.ok
+    assert len(plat.casts) == at_setup, (
+        f"{len(plat.casts) - at_setup} cast(s) ran while folding two layers; in NZ mode the staging IS the "
+        "cast output and finish() must not cast again")
+
+
+def test_nd_mode_still_casts_once_per_folded_layer(ckpt, plat, tmp_path):
+    """The control for the test above: without the bank the per-layer cast is still there."""
+    w = World(ckpt, plat, tmp_path, layers=(0, 1))
+    at_setup = len(plat.casts)
+    for layer in (0, 1):
+        _, rep = w.stream(layer=layer, hot=HOT[layer])
+        assert rep is not None and rep.swap.ok
+    # one per chunk served (4 chunks x 2 layers) plus one per folded layer
+    assert len(plat.casts) > at_setup
+
+
+def test_nz_mode_frees_the_nd_weight_staging(ckpt, plat, tmp_path, acl_fake, npu_rt):
+    """The HBM the mode is supposed to give back: the ND half of the staging, and
+    the provider's ND landing buffers, are both gone -- while the ND SCALE buffers
+    MUST remain, because the slot's scale views alias them."""
+    w = nz_world(ckpt, plat, tmp_path)
+    for name in NZ_WEIGHT_ATTRS:
+        assert w.plat.is_nz(w.fold._staging[name]), f"{name} staging must be the NZ allocation"
+        assert name not in w.provider._device, f"the provider still holds an ND landing buffer for {name}"
+    for name in ND_SCALE_ATTRS:
+        assert not w.plat.is_nz(w.fold._staging[name])
+        assert name in w.provider._device, f"the ND scale buffer for {name} must stay: the slot views it"
+
+
+def test_nz_mode_reconciles_the_bytes_it_staged(ckpt, plat, tmp_path, acl_fake, npu_rt):
+    w = nz_world(ckpt, plat, tmp_path)
+    _, rep = w.stream()
+    assert rep.bytes_staged == SLOTS * w.fold._expert_bytes
+    # and the raw channel moved exactly the weight half of that
+    weight_bytes = sum(v for v in w.fold._nz_bytes.values()) * SLOTS
+    assert sum(c[3] for c in acl_fake.d2d()) == weight_bytes
+
+
+def test_nz_mode_refuses_a_chunk_served_on_another_stream(ckpt, plat, tmp_path, acl_fake, npu_rt,
+                                                          monkeypatch):
+    """A raw copy on a different stream is ordered against the H2D by nothing."""
+    w = nz_world(ckpt, plat, tmp_path)
+
+    def wrap(hook):
+        def inner(chunk, ids):
+            monkeypatch.setattr(torch.npu, "current_stream",
+                                lambda *a, **k: SimpleNamespace(npu_stream=FAKE_STREAM + 1,
+                                                                synchronize=lambda: None), raising=False)
+            return hook(chunk, ids)
+        return inner
+
+    with pytest.raises(FoldError, match="ordered against the H2D by nothing"):
+        w.stream(hook_wrap=wrap)
+
+
+def test_nz_mode_barrier_waits_once_per_folded_layer(ckpt, plat, tmp_path, acl_fake, npu_rt):
+    """One wait per layer that stages, and none before the first -- there is no
+    earlier commit for the first layer's writes to overtake."""
+    w = nz_world(ckpt, plat, tmp_path, layers=(0, 1))
+    assert npu_rt["device"] == 0
+    w.stream(layer=0, hot=HOT[0])
+    assert (npu_rt["device"], w.fold._barrier_waits) == (0, 0), "nothing to order the first layer against"
+    w.stream(layer=1, hot=HOT[1])
+    assert (npu_rt["device"], w.fold._barrier_waits) == (1, 1)
+    assert npu_rt["stream"] == 0, "the default barrier is the device one"
+
+
+@pytest.mark.parametrize("barrier, want", [("device", (1, 0)), ("stream", (0, 1)), ("none", (0, 0))])
+def test_the_nz_barrier_knob_selects_a_real_barrier(ckpt, plat, tmp_path, acl_fake, npu_rt,
+                                                    barrier, want):
+    """``none`` exists to drive the failure on card; it must really remove the wait."""
+    w = nz_world(ckpt, plat, tmp_path, layers=(0, 1), nz_barrier=barrier)
+    w.stream(layer=0, hot=HOT[0])
+    w.stream(layer=1, hot=HOT[1])
+    assert (npu_rt["device"], npu_rt["stream"]) == want
+    assert w.fold._barrier_waits == (0 if barrier == "none" else 1)
+
+
+def test_the_fold_refuses_an_unknown_barrier(ckpt, plat, tmp_path, acl_fake, npu_rt):
+    with pytest.raises(FoldError, match="nz_barrier"):
+        nz_world(ckpt, plat, tmp_path, nz_barrier="sometimes")
+
+
+def test_served_nz_and_served_nd_each_refuse_the_other_mode(ckpt, plat, tmp_path, acl_fake, npu_rt):
+    """Neither accessor may quietly hand back the other layout's buffers."""
+    from vllm_ascend.kt_offload.stream_io import StreamIOError
+
+    nd, nz = World(ckpt, plat, tmp_path), nz_world(ckpt, plat, tmp_path)
+    for w in (nd, nz):
+        w.provider.set_layer(LAYER)
+        w.provider.slot_for(0, (0, 1, 2))
+    with pytest.raises(StreamIOError, match="only meaningful in NZ device mode"):
+        nd.provider.served_nz(0, (0, 1, 2))
+    with pytest.raises(StreamIOError, match="no meaning in NZ device mode"):
+        nz.provider.served_nd(0, (0, 1, 2))
+    # and the staleness check is on both
+    with pytest.raises(StreamIOError, match="not the last one served"):
+        nz.provider.served_nz(1, (3, 4, 5))
+
+
+def test_nz_mode_refuses_a_staging_whose_slot_size_changed_in_the_cast(ckpt, plat, tmp_path,
+                                                                      acl_fake, npu_rt, monkeypatch):
+    """The no-padding invariant. If NZ ever grows a slot, every offset here is wrong."""
+    real = plat.npu_format_cast
+    calls = {"n": 0}
+
+    def padding_cast(x, fmt, **kw):
+        y = real(x, fmt, **kw)
+        calls["n"] += 1
+        if calls["n"] <= 1:          # let the provider's own slot through
+            return y
+        with torch._C.DisableTorchFunction():
+            grown = torch.zeros(y.shape[0], y.shape[1], y.shape[2] + 2, dtype=y.dtype)
+        return plat.on_device(grown, nz=True)
+
+    monkeypatch.setattr(torch_npu, "npu_format_cast", padding_cast, raising=False)
+    with pytest.raises(FoldError, match="pure permutation with no padding"):
+        nz_world(ckpt, plat, tmp_path)

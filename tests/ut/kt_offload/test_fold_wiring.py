@@ -103,10 +103,23 @@ class FakeProvider:
     def slot_for(self, chunk_index: int, expert_ids):
         raise AssertionError("the streaming chain is not exercised here (test_fold_swap.py does that)")
 
+    #: This fake serves ND chunks, so the fold must take the ND path. It is part
+    #: of the provider contract (``fold_swap`` reads it rather than guessing),
+    #: because guessing ND for a bank-backed provider staged 12,000 experts of
+    #: never-written bytes with every guard green.
+    nz_device = False
+
     def served_nd(self, chunk_index: int, expert_ids) -> dict[str, torch.Tensor]:
         ids = tuple(int(e) for e in expert_ids)
         self.served.append((self.layer, int(chunk_index), ids))
         return {n: torch.stack([expert_bytes(self.layer, e, n) for e in ids]) for n in SLOT_WEIGHT_ATTRS}
+
+    def served_nz(self, chunk_index: int, expert_ids):
+        raise AssertionError("this provider is in ND mode; the fold must not ask for NZ chunks")
+
+    @property
+    def nz_bytes_per_slot(self) -> dict[str, int]:
+        return {}
 
     def format_nd(self, staging: dict[str, torch.Tensor], n_rows: int) -> FakeSlot:
         out = {}

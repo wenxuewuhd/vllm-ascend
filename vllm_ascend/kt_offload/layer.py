@@ -46,6 +46,7 @@ from vllm.logger import logger
 from vllm_ascend.kt_offload import (
     async_wait,
     device_signal,
+    nz_geometry,
     report_affinity,
     seam_timing,
     shared_window,
@@ -141,11 +142,33 @@ def bind_routed_experts_args(init_fn, args: tuple, kwargs: dict) -> dict[str, An
 #: ``KT_ZEROCOPY_MLOCK=0`` is deliberate, not an inherited default: placement has
 #: exactly one owner -- ``numa_placement`` migrates and faults in these pages by
 #: file offset before kt reads them, and kt's pin/migrate would run over it.
+#: Bank sources kt holds raw pointers into. Never evicted -- see the comment at
+#: the only insertion site. Keyed by bank dir, so all 40 layers share one.
+_KT_BANK_SOURCES: dict[str, Any] = {}
+
 KT_ZEROCOPY_ENV: dict[str, str] = {
     "KT_ZEROCOPY_WEIGHTS": "1",
     "KT_ZEROCOPY_SCOPE": "w13",
     "KT_ZEROCOPY_MLOCK": "0",
 }
+
+
+def zerocopy_env_for(cfg) -> dict[str, str]:
+    """``KT_ZEROCOPY_ENV`` with the scope the config asks for.
+
+    ``KT_ZEROCOPY_SCOPE`` was hardcoded to ``"w13"``, so the ``"all"`` path --
+    kt consuming w2/down in place as well -- was never reachable from a config,
+    although kt's C++ implements it and the config validator already refuses a
+    disagreeing environment. ``"all"`` is what frees kt's private w2 copy
+    (84.4 GiB on this model); it costs locality, because the CHECKPOINT's w2 is
+    a column slice of every row, so a 4 KiB page carries both TP parts' bytes
+    and no per-page placement can beat 1/tp_count local (measured -28.3% by
+    whoever wrote that note in zerocopy_weights.hpp). Exposed so the trade can
+    be MEASURED instead of assumed.
+    """
+    env = dict(KT_ZEROCOPY_ENV)
+    env["KT_ZEROCOPY_SCOPE"] = str(getattr(cfg, "zerocopy_scope", "w13"))
+    return env
 
 #: ``KT_ZEROCOPY_WEIGHTS`` is off for "" and "0" (kt parses it that way on both
 #: sides); every other value is on.
@@ -178,7 +201,7 @@ def apply_zerocopy_env(cfg) -> dict[str, str]:
     an exported ``KT_ZEROCOPY_*`` and the config **raises** rather than silently
     overriding or silently obeying. With the switch off this sets **nothing**.
     """
-    want = KT_ZEROCOPY_ENV if getattr(cfg, "zerocopy_w13", False) else {}
+    want = zerocopy_env_for(cfg) if getattr(cfg, "zerocopy_w13", False) else {}
     conflicts = [
         msg for name in KT_ZEROCOPY_ENV
         if (msg := _zerocopy_env_conflict(name, want.get(name))) is not None
@@ -441,6 +464,8 @@ class KTLayerOffload:
         # Set by the last streamed forward; a report with zero coverage is a
         # failure, so this is read by the tests and by the on-card runner.
         self.stream_coverage = None
+        #: one log line per layer for the resident-half binding, not one per forward
+        self._resident_half_logged = False
         # The folded swap-in (fold_swap.ResidentFold), injected like the slot
         # provider; consulted only when cfg.dynamic_resident is on, and then
         # required (fail closed).
@@ -483,6 +508,22 @@ class KTLayerOffload:
                 "without the clamp the NPU experts apply."
             )
         self.swiglu_limit = float(limit)
+
+        # Before the first real cast, and before kt loads its CPU half: is CANN's NZ byte
+        # geometry still the one nz_geometry.py assumes? Once per process (the geometry is
+        # a property of the CANN build, not of a layer). Deliberately NOT wrapped in
+        # try/except -- a mismatch must stop the engine coming up, because the route that
+        # depends on it would not raise, it would compute wrong numbers. See the module
+        # docstring. OFF unless a switch that shares NZ bytes with kt is on.
+        _nz_on = nz_geometry.check_enabled(self.cfg)
+        logger.info(
+            "kt_offload nz_geometry: self-check %s (stream_layer_buffer=%s, verify_nz_geometry=%s) "
+            "-- a route that shares NZ bytes with kt cannot disable its own guard",
+            "ENABLED" if _nz_on else "off",
+            bool(getattr(self.cfg, "stream_layer_buffer", False)),
+            bool(getattr(self.cfg, "verify_nz_geometry", False)))
+        if _nz_on:
+            nz_geometry.verify_nz_geometry_once(quant_method=layer.quant_method)
 
         quant_method = layer.quant_method
         original = quant_method.process_weights_after_loading
@@ -1063,6 +1104,40 @@ class KTLayerOffload:
 
         _install_capture_probe(KTMoEWrapper)
 
+        # Measurement scaffolding, off unless VLLM_ASCEND_DSV41_KT_KNOB_FILE is
+        # set: lets ONE server process hold both arms of a kernel-knob A/B,
+        # because a cross-process comparison on this host is worthless. Started
+        # here because this is the first point in the worker where kt is known
+        # to be importable, and it is a no-op after the first layer.
+        from vllm_ascend.kt_offload import kt_knob_ab
+
+        kt_knob_ab.start_if_configured()
+
+        # Stage 3: hand kt the SAME bank the NPU streams from, so the expert
+        # bytes exist once. The geometry is ours and is asserted against the
+        # manifest in bank_kt_source._check_geometry; kt only forwards these.
+        nz_bank_ptrs = None
+        if getattr(self.cfg, "kt_reads_bank", False):
+            from vllm_ascend.kt_offload.bank_kt_source import KtBankSource
+
+            # 🔴 Module-level, and never removed: kt keeps RAW POINTERS into
+            # these mappings for the life of the process. If the source were a
+            # per-layer attribute and the layer were ever dropped, the mmap
+            # would close and kt would read freed address space -- a crash if we
+            # are lucky and silent garbage if we are not. One source per bank
+            # dir, so the 40 layers share it and the manifest is read once.
+            key = str(self.cfg.bank_dir)
+            src = _KT_BANK_SOURCES.get(key)
+            if src is None:
+                src = KtBankSource(
+                    key,
+                    tp_count=int(self.cfg.threadpool_count),
+                    hidden=self.hidden_size,
+                    intermediate=self.intermediate_size,
+                )
+                _KT_BANK_SOURCES[key] = src
+            nz_bank_ptrs = src.kt_pointer_arrays(self.layer_idx)
+
         wrapper = KTMoEWrapper(
             layer_idx=self.layer_idx,
             num_experts=self.placement.num_experts,
@@ -1077,6 +1152,7 @@ class KTLayerOffload:
             method=self.cfg.method,
             numa_nodes=self.cfg.numa_nodes,
             swiglu_limit=self.swiglu_limit,
+            nz_bank_ptrs=nz_bank_ptrs,
         )
         # kt indexes experts by logical id; with EPLB off physical == logical.
         # device="cpu" is explicit: this runs while the model loads, where the
@@ -1145,7 +1221,7 @@ class KTLayerOffload:
             # other direction (a captured size that is big enough to stream).
             return None
 
-        from vllm_ascend.kt_offload import stream_chain, stream_io, stream_prefill
+        from vllm_ascend.kt_offload import stream_chain, stream_layer, stream_io, stream_prefill
 
         stream_prefill.assert_eager_only(
             num_tokens, self.capture_sizes, self.cfg.stream_prefill_min_tokens,
@@ -1168,6 +1244,7 @@ class KTLayerOffload:
             # streaming; the fold reads its chunks back out of that same object
             # and refuses if the two disagree.
             self._stream_provider.set_layer(self.layer_idx)
+            self._bind_resident_half(layer)
         run_kwargs = dict(
             # The scheme, not the wrapper: production's ``layer.quant_method``
             # is ``AscendFusedMoEMethod``, which HOLDS the scheme. The chain
@@ -1187,16 +1264,24 @@ class KTLayerOffload:
             expected_expert_ids=expected_ids,
             strict=True,
         )
+        # Stage 1: same kwargs, different accumulation. ``run_streamed_layer_buffered``
+        # mirrors the signature on purpose so this is a one-line choice; it is
+        # bitwise equal to the per-chunk form (measured on card, maxabsdiff 0).
+        if self.cfg.stream_layer_buffer:
+            run_kwargs["provider"] = self._stream_provider
+            runner = stream_layer.run_streamed_layer_buffered
+        else:
+            runner = stream_chain.run_streamed_layer
         fold = self._fold_for_this_forward()
         if fold is None:
-            result = stream_chain.run_streamed_layer(**run_kwargs)
+            result = runner(**run_kwargs)
         else:
             # The chosen experts are copied out of each chunk as it streams past
             # and committed once the layer's last chunk is done. A layer the fold
             # declines (no change, capture state unknown, ...) streams unhooked.
             result, report = fold.fold_streamed_layer(
                 self.layer_idx, topk_ids,
-                lambda hook: stream_chain.run_streamed_layer(
+                lambda hook: runner(
                     **run_kwargs, **({} if hook is None else {"after_chunk": hook})))
             self.fold_report = report
             if report is not None:
@@ -1205,6 +1290,48 @@ class KTLayerOffload:
                 self.placement = fold.committer.placement(self.layer_idx)
         self.stream_coverage = result.coverage
         return result.output
+
+    def _bind_resident_half(self, layer) -> None:
+        """Tell the streaming provider which experts it must NOT fetch from the host.
+
+        ``stream_resident_from_hbm``: a chunk's members that are already in HBM
+        are filled by a device-to-device copy from this layer's own parameters
+        instead of being gathered from the bank and copied over the host link --
+        26% of the streamed bytes at 100 resident of 384. The fill happens
+        inside the provider, so every consumer still sees a COMPLETE chunk and
+        the output is bit-identical: same partition, same tables, same fp32
+        accumulation order.
+
+        🔴 The snapshot is taken HERE, once, and it is the same
+        ``self.placement`` the fold starts this forward from: under
+        ``dynamic_resident`` the fold moves experts between HBM and the CPU at
+        the END of the layer, and a membership decision taken twice inside one
+        forward could leave a slot that nobody fills.
+        """
+        prov = self._stream_provider
+        setter = getattr(prov, "set_resident", None)
+        want = bool(getattr(self.cfg, "stream_resident_from_hbm", False))
+        if setter is None:
+            if want:
+                raise RuntimeError(
+                    "kt_offload: stream_resident_from_hbm is on but the streaming provider has no "
+                    "set_resident, so nothing can fill the slots the host would skip. Refusing "
+                    "rather than streaming everything, which would make every 'on' reading an "
+                    "'off' reading.")
+            return
+        if not want:
+            setter(None, None)                       # stream everything (the stage-3 path)
+            return
+        l2s = self.placement.logical_to_slot().tolist()
+        setter(layer, l2s)
+        if not self._resident_half_logged:
+            self._resident_half_logged = True
+            n_res = sum(1 for s in l2s if s >= 0)
+            logger.info(
+                "kt_offload L%d: stream_resident_from_hbm ON -- %d of %d experts per layer come "
+                "from HBM (D2D) instead of the host, i.e. %.1f%% of the streamed bytes are not "
+                "streamed. Output is bit-identical by construction: same chunks, same order.",
+                self.layer_idx, n_res, len(l2s), 100.0 * n_res / max(1, len(l2s)))
 
     def _fold_for_this_forward(self):
         """The folded swap, if the switch is on. On without a fold installed raises."""
@@ -2085,6 +2212,10 @@ def install_stream_provider(provider, *, layers=None) -> dict[int, KTLayerOffloa
             raise RuntimeError(
                 f"kt_offload: the slot provider has no {need!r}; the same object serves the streamed chunks "
                 "and is read back by the fold, so it must be the streaming StreamSlotProvider")
+    # Stage 1's whole-layer buffer is NOT wrapped here. ``setup_streaming``
+    # wraps the provider before it installs anything, because the caller owns
+    # the "one provider object" contract that ``_assert_installed`` checks: a
+    # wrap applied here would be invisible to it and refuse start-up.
     for rt in offloads.values():
         rt._stream_provider = provider
         rt._stream_slot_provider = provider.slot_for
@@ -2136,6 +2267,14 @@ def install_resident_fold(provider, *, layers=None, step_source=None, **fold_kw)
         raise RuntimeError(
             f"kt_offload: the MoE layers disagree on stream_prefill_min_tokens ({sorted(thresholds)}); one "
             "fold serves every layer and its commit point is decided by that number")
+    # Same rule as the threshold above: one number, off the layers' own cfg, read
+    # nowhere else. Only the bank (NZ) path uses it -- see fold_nz_barrier.
+    barriers = {str(rt.cfg.fold_nz_barrier) for rt in offloads.values()}
+    if len(barriers) != 1:
+        raise RuntimeError(
+            f"kt_offload: the MoE layers disagree on fold_nz_barrier ({sorted(barriers)}); one fold stages "
+            "every layer into one buffer, so one of them would be ordered and the others not")
+    fold_kw.setdefault("nz_barrier", barriers.pop())
     fold = ResidentFold(
         placements, targets, provider=provider,
         stream_min_tokens=thresholds.pop(),

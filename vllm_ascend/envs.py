@@ -184,6 +184,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     # DeepSeek-V4.1 Engram storage: "ram" (default, legacy staged files)
     # or "ssd" (ordinary file-backed mmap; requires a verified manifest).
     # Non-sensitive; this selects backing storage, not the gather/compute path.
+    # DeepSeek-V4.1 kt offload: how many threads gather streamed expert chunks
+    # out of the NZ bank into the pinned staging. Empty (default) keeps what the
+    # caller passed, which is bank_source.MIN_LOADER_THREADS = 4. The count is
+    # fixed when the source is built, so an A/B over it needs one server start
+    # per arm -- this is that lever. Non-sensitive.
+    "VLLM_ASCEND_DSV41_KT_LOADER_THREADS": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_LOADER_THREADS", ""),
+    # DeepSeek-V4.1 kt offload, MEASUREMENT ONLY: path of a file whose contents
+    # ("nz_prefetch_groups=8 nz_prefetch_legacy_stride=0") are applied to kt's
+    # MXFP4 kernel knobs by a watcher thread while the server runs, so both arms
+    # of an A/B live in one process (a cross-process timing comparison on this
+    # host has differed 15x). Default "" = no thread, no effect. Non-sensitive.
+    # See vllm_ascend/kt_offload/kt_knob_ab.py.
+    "VLLM_ASCEND_DSV41_KT_KNOB_FILE": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_KNOB_FILE", ""),
     "VLLM_ASCEND_DSV41_ENGRAM_BACKEND": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_BACKEND", "ram"),
     # Absolute table directory. Empty (default) uses /dev/shm/engram_stage
     # for "ram"; "ssd" requires an explicit directory. Non-sensitive.

@@ -213,3 +213,53 @@ def test_a_negative_fraction_is_refused():
 def test_negative_reserve_is_refused():
     with pytest.raises(ValueError, match="zerocopy_reserve_gib"):
         _frac_cfg(zerocopy_reserve_gib=-1.0)
+
+def test_stream_resident_from_hbm_needs_stream_prefill_and_the_bank():
+    """Each precondition is a different silent wrong answer if it is missing.
+
+    The switch skips streaming the experts already in HBM and fills those slots
+    of the chunk buffer by D2D instead -- 26% of the streamed bytes, with the
+    chunk partition and therefore the output bit-identical. Without the bank the
+    source cannot gather a subset of a chunk at all, so the skipped slots would
+    keep the previous chunk's bytes under live routes; without stream_prefill
+    there is no chunk at all.
+    """
+    from vllm_ascend.kt_offload.config import KTOffloadConfig
+
+    base = dict(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
+                overlap_side_stream=False, stream_prefill=True,
+                bank_dir="/dev/shm/dsv41_nz_bank", stream_resident_from_hbm=True)
+    KTOffloadConfig(**base)                      # the combination that is allowed
+
+    with pytest.raises(ValueError, match="needs stream_prefill"):
+        KTOffloadConfig(**{**base, "stream_prefill": False})
+    with pytest.raises(ValueError, match="needs bank_dir"):
+        KTOffloadConfig(**{**base, "bank_dir": ""})
+    # num_resident_experts=0 is refused before this switch is even looked at
+    # (resident_strategy='prefix' needs > 0). Asserted here so the combination
+    # is known to be refused by SOMETHING -- the backstop in
+    # stream_resident_from_hbm's own validation is unreachable from this
+    # strategy, and an unreachable check must not be mistaken for the one doing
+    # the work.
+    with pytest.raises(ValueError, match="needs num_resident_experts > 0"):
+        KTOffloadConfig(**{**base, "num_resident_experts": 0})
+
+
+def test_stream_resident_from_hbm_stays_off_by_default_because_it_has_preconditions():
+    """🔴 Measured as a win (-11.6% steady-state TTFT, 7/7 token-identical) and
+    STILL default off.
+
+    It needs bank_dir and stream_prefill, so defaulting it on makes every config
+    that does not have them fail validation -- 20 of the tests in this file did,
+    immediately, when that was tried on 2026-11-15. A switch with preconditions
+    is opted into by the deployment config (measure/s3_g.json), never by the
+    dataclass. Asserted here so the next person who reads the measurement and
+    reaches for the default finds the reason first.
+    """
+    from vllm_ascend.kt_offload.config import KTOffloadConfig
+
+    base = dict(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
+                overlap_side_stream=False)
+    assert KTOffloadConfig(**base).stream_resident_from_hbm is False
+    with pytest.raises(ValueError, match="needs bank_dir"):
+        KTOffloadConfig(**base, stream_prefill=True, stream_resident_from_hbm=True)

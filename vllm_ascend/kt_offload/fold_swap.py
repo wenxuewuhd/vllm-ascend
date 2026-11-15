@@ -77,6 +77,7 @@ from vllm_ascend.kt_offload.resident_driver import (
     pinned_resident_ids,
     plan_from_heat,
 )
+from vllm_ascend.kt_offload.stream_io import ND_SCALE_ATTRS, NZ_WEIGHT_ATTRS
 from vllm_ascend.kt_offload.resident_swap import (
     LayerSwapTargets,
     ResidentSwapCommitter,
@@ -117,6 +118,17 @@ def _assert_owns_storage(t: torch.Tensor, what: str) -> None:
             f"storage bytes={t.untyped_storage().nbytes()}): copy_memory_ ignores the view and copies "
             "storages end to end"
         )
+
+
+def _base_ptr(t: torch.Tensor) -> int:
+    """The STORAGE address, not the view's. The identity of a staging buffer.
+
+    ``data_ptr()`` would do for the ND staging (offset 0) but is one of the
+    metadata calls an internal-format tensor can refuse on this build, and the
+    NZ staging has to be identified by the same rule as the ND one or the
+    "did the staging move" guard means two different things in the two modes.
+    """
+    return t.untyped_storage().data_ptr()
 
 
 def fold_weight_write(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -172,6 +184,124 @@ def _stage_rows(staging: torch.Tensor, rows: torch.Tensor, src: torch.Tensor, co
     """
     staging.index_copy_(0, rows, src.index_select(0, cols))
     return int(rows.numel()) * _row_bytes(staging)
+
+
+#: ``aclrtMemcpyKind`` (acl_rt.h): HOST_TO_HOST 0, HOST_TO_DEVICE 1,
+#: DEVICE_TO_HOST 2, DEVICE_TO_DEVICE 3. The H2D leg of the bank path uses 1
+#: from ``stream_io._upload_nz``; this module uses 3 and nothing else.
+ACL_MEMCPY_DEVICE_TO_DEVICE = 3
+
+
+def merge_runs(pairs: Sequence[tuple[int, int]]) -> list[tuple[int, int, int]]:
+    """``(dst_row, src_slot)`` pairs -> ``(dst_row, src_slot, nrows)`` runs. Pure.
+
+    A run is a stretch where BOTH sides advance by one, so one memcpy of
+    ``nrows`` slots moves it: the per-expert blocks are equally sized and
+    contiguous, so consecutive rows on both sides are one contiguous block on
+    both sides. Pairs are sorted by destination first, which is what makes a run
+    findable at all -- a chunk's experts arrive in slot order, and their rows are
+    ascending but with gaps.
+
+    It is an optimisation of the CALL COUNT only: the bytes moved are the same
+    either way, and ``fold_stage_write_nz`` bounds-checks each run it is given.
+    Returned runs never overlap on the destination, because a repeated
+    destination row is refused here -- two sources for one row is the bug
+    ``after_chunk``'s ``filled`` check is about, caught again at the copy.
+    """
+    # The open run is a local, and finished runs are only ever appended: the
+    # write-channel scan refuses subscript assignment on anything it cannot
+    # prove is a plain container, and a run table is not worth an exemption.
+    out: list[tuple[int, int, int]] = []
+    cur: tuple[int, int, int] | None = None
+    seen: set[int] = set()
+    for dst, src in sorted(pairs):
+        if dst in seen:
+            raise FoldError(f"destination row {dst} appears twice in one chunk's copy plan: two sources "
+                            "would be written into one slot")
+        seen.add(dst)
+        if cur is not None and dst == cur[0] + cur[2] and src == cur[1] + cur[2]:
+            cur = (cur[0], cur[1], cur[2] + 1)
+            continue
+        if cur is not None:
+            out.append(cur)
+        cur = (dst, src, 1)
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
+def fold_stage_write_nz(dst: torch.Tensor, src: torch.Tensor, *, bytes_per_slot: int,
+                        runs: Sequence[tuple[int, int, int]], stream: int) -> int:
+    """The ONE write into an NZ staging buffer: a raw ACL device-to-device memcpy.
+
+    Why a raw memcpy at all. In NZ device mode (the bank path) the chunk's bytes
+    arrive straight into an internal-format tensor and the ND landing buffers do
+    not exist, so there is nothing for ``_stage_rows``' ``index_copy_`` to read:
+    torch cannot read a row out of an internal-format tensor, cannot write one
+    into it, and ``.cpu()`` on one would undo the permutation. What does work is
+    what ``stream_io._upload_nz`` already does in the other direction -- address
+    arithmetic over the storage -- because the NZ permutation is PER EXPERT, so
+    slot ``i`` is a contiguous block at ``i * bytes_per_slot``. This copies whole
+    slots between two such blocks and never looks inside one, so it is correct
+    for ND and NZ alike without knowing which it has.
+
+    Why it is sound HERE and would not be in ND mode. ``TASK_QUEUE_ENABLE=1``
+    puts torch_npu's ops in a host-side queue consumed by another thread, while
+    this call goes to the stream immediately -- so it can be submitted BEFORE a
+    torch op that precedes it in program order (measured: 12/100 wrong slots).
+    That makes a raw copy safe only when nothing torch enqueued earlier writes
+    its source or reads its destination:
+
+      * source -- in NZ mode the chunk's weight bytes are written by
+        ``_upload_nz``'s raw H2D, also issued directly, on the stream the caller
+        passes here, so the stream itself orders them. In ND mode the landing
+        buffers are written by a torch ``copy_``, which this could overtake.
+      * destination -- the NZ staging is written only through this function, and
+        read by the committer's ``copy_memory_``, which is enqueued AFTER: the
+        safe direction. Across layers it is not (the next layer's copy could
+        overtake the previous commit's read), which is what ``ResidentFold``'s
+        barrier is for.
+
+    ``destMax`` is what we promise to write; ``aclrtMemcpyAsync`` has NO
+    ``srcMax`` (acl_rt.h:2309), so the source end is bounds-checked here or not
+    at all. Returns the bytes the copies were given to move.
+    """
+    import acl  # device-only dependency, imported at the call site
+
+    if bytes_per_slot <= 0:
+        raise FoldError(f"bytes_per_slot={bytes_per_slot}: a slot cannot be empty")
+    _assert_owns_storage(dst, "fold_stage_write_nz: destination")
+    _assert_owns_storage(src, "fold_stage_write_nz: source")
+    dst_st, src_st = dst.untyped_storage(), src.untyped_storage()
+    dst_n, src_n = dst_st.nbytes(), src_st.nbytes()
+    for what, n in (("destination", dst_n), ("source", src_n)):
+        if n % bytes_per_slot:
+            raise FoldError(f"fold_stage_write_nz: the {what} is {n} B, not a whole number of "
+                            f"{bytes_per_slot} B slots; a per-slot offset into it is undefined")
+    dst_base, src_base = dst_st.data_ptr(), src_st.data_ptr()
+    counts: list[int] = []
+    for dst_row, src_row, nrows in runs:
+        if nrows <= 0 or dst_row < 0 or src_row < 0:
+            raise FoldError(f"fold_stage_write_nz: run (dst={dst_row}, src={src_row}, n={nrows}) is not a "
+                            "forward run of at least one slot")
+        count = nrows * bytes_per_slot
+        d_off, s_off = dst_row * bytes_per_slot, src_row * bytes_per_slot
+        if d_off + count > dst_n:
+            raise FoldError(f"fold_stage_write_nz: rows {dst_row}..{dst_row + nrows - 1} end at "
+                            f"{d_off + count} B of a {dst_n} B destination")
+        if s_off + count > src_n:
+            raise FoldError(f"fold_stage_write_nz: source rows {src_row}..{src_row + nrows - 1} end at "
+                            f"{s_off + count} B of a {src_n} B source -- and aclrtMemcpyAsync has no srcMax, "
+                            "so nothing downstream would catch it")
+        ret = acl.rt.memcpy_async(dst_base + d_off, count, src_base + s_off, count,
+                                  ACL_MEMCPY_DEVICE_TO_DEVICE, stream)
+        if ret != 0:
+            raise FoldError(f"fold_stage_write_nz: D2D memcpy_async returned {ret} for {count} B "
+                            f"(dst row {dst_row}, src row {src_row})")
+        # Appended only after the call returned 0: a copy that was refused is
+        # not bytes moved, and finish() reconciles against this number.
+        counts.append(count)
+    return sum(counts)
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +533,7 @@ class ResidentFold:
         on_write: Callable[[str, str], None] | None = None,
         live_objects: Callable[[int], Mapping[str, Any]] | None = None,
         window_source: Callable[[], prefill_window.PrefillWindow | None] = prefill_window.require,
+        nz_barrier: str = "device",
     ):
         self.provider = provider
         self.policy = policy or TopKHeatPolicy()
@@ -470,7 +601,11 @@ class ResidentFold:
         self.num_slots = num_slots.pop()
         self.layers = tuple(layers)
 
-        for need in ("shapes", "seam", "device", "served_nd", "format_nd"):
+        # ``nz_device`` is in the list although it is a bool: a provider without
+        # it cannot be asked which layout its chunks are in, and guessing ND
+        # would stage unwritten bytes with every guard green (the bug the
+        # bank+fold config refusal was standing in for).
+        for need in ("shapes", "seam", "device", "served_nd", "served_nz", "format_nd", "nz_device"):
             if getattr(provider, need, None) is None:
                 raise FoldError(f"the slot provider has no {need!r}; the fold copies chunks out of it and casts "
                                 "through it")
@@ -485,13 +620,98 @@ class ResidentFold:
                 raise FoldError(f"staging {name} came back {buf.dtype}{tuple(buf.shape)}, asked for {dtype}{want}")
             self._staging[name] = buf
         # The addresses the scale views of every cast slot are taken against.
-        self._staging_addrs0 = {n: t.data_ptr() for n, t in self._staging.items()}
-        ptrs = [t.untyped_storage().data_ptr() for t in self._staging.values()]
+        self._staging_addrs0 = {n: _base_ptr(t) for n, t in self._staging.items()}
+        ptrs = list(self._staging_addrs0.values())
         if len(set(ptrs)) != len(ptrs):
             raise FoldError("staging buffers share storage")
         # Bytes one expert occupies across all four staging buffers: the unit
         # ``finish`` reconciles the copies against.
         self._expert_bytes = sum(_row_bytes(t) for t in self._staging.values())
+        # -- NZ (bank) mode ---------------------------------------------------
+        # The chunks arrive in FRACTAL_NZ and the ND landing buffers are gone,
+        # so the weight half of the staging has to be NZ too and is filled by
+        # address (``fold_stage_write_nz``). Decided once, from the provider, and
+        # never re-read: a provider that switched layout mid-run would be staging
+        # one layout into a buffer tagged as the other.
+        self._nz = bool(provider.nz_device)
+        self._nz_bytes: dict[str, int] = {}
+        self._nz_slot: Any | None = None
+        self._nz_barrier = str(nz_barrier)
+        if self._nz_barrier not in ("device", "stream", "none"):
+            raise FoldError(f"nz_barrier={nz_barrier!r}: one of 'device', 'stream', 'none'")
+        self._barrier_waits = 0
+        self._needs_barrier = False
+        if self._nz:
+            self._enable_nz_staging()
+
+    def _enable_nz_staging(self) -> None:
+        """Turn the weight half of the staging NZ, ONCE, and keep the cast slot forever.
+
+        The cast is run on the freshly allocated ND staging for one reason: to
+        obtain an NZ-tagged allocation of the right size through the production
+        hook, because the operator dispatches on that tag (a plain tensor holding
+        the same bytes is refused with 161002). Its CONTENT is irrelevant and the
+        ND staging is deliberately not zeroed first -- every row of the staging
+        is rewritten on every folded layer (``num_resident == num_slots`` is
+        enforced above and ``finish`` refuses a row that was not filled), so no
+        byte of this allocation ever reaches a resident parameter unwritten.
+
+        The slot is kept for the life of the fold instead of being re-cast per
+        layer, which is what makes the fold free of casts in this mode:
+
+          * its WEIGHTS are the NZ allocations, which are now the staging;
+          * its SCALES are 4-D views of the ND scale buffers (``format_nd``),
+            which stay and are still written in place by ``_stage_rows`` -- so
+            the same slot object describes every layer, and ``commit``'s
+            ``staging_generation`` guard is what keeps a stale one from being
+            committed.
+        """
+        slot = self.provider.format_nd(self._staging, self.num_slots)
+        tensors = slot.tensors()
+        pairs: list[tuple[str, int]] = []
+        for name in NZ_WEIGHT_ATTRS:
+            nbytes = tensors[name].untyped_storage().nbytes()
+            if nbytes % self.num_slots:
+                raise FoldError(f"staging {name}: the cast produced {nbytes} B for {self.num_slots} slots, "
+                                "not a whole number of slots; a per-slot offset into it is undefined")
+            per_slot = nbytes // self.num_slots
+            nd_row = _row_bytes(self._staging[name])
+            if per_slot != nd_row:
+                raise FoldError(
+                    f"staging {name}: one slot is {per_slot} B in NZ and {nd_row} B in ND. The fold's "
+                    "byte accounting, the chunk's per-slot offsets and the resident parameter's size are all "
+                    "one number; NZ was measured to be a pure permutation with no padding on this model, and "
+                    "this says it is not.")
+            pairs.append((name, per_slot))
+        nz_bytes = dict(pairs)
+        # The chunk side's per-slot size must be the same number, or a slot-sized
+        # block means one thing at the source and another at the destination.
+        chunk_bytes = self.provider.nz_bytes_per_slot
+        for name in NZ_WEIGHT_ATTRS:
+            if int(chunk_bytes.get(name, -1)) != nz_bytes[name]:
+                raise FoldError(f"{name}: a slot is {chunk_bytes.get(name)} B in the provider's chunk buffer "
+                                f"and {nz_bytes[name]} B in the fold's staging")
+        freed = sum(self._staging[n].numel() * self._staging[n].element_size() for n in NZ_WEIGHT_ATTRS)
+        for name in NZ_WEIGHT_ATTRS:
+            self._staging[name] = tensors[name]
+        # The ND weight buffers were allocated only to be cast; nothing writes
+        # them again. (The ND SCALE buffers MUST stay: the slot's scale views
+        # alias them and every layer writes through those views.)
+        import gc
+
+        gc.collect()
+        if hasattr(torch, "npu") and hasattr(torch.npu, "empty_cache"):
+            torch.npu.empty_cache()
+        self._nz_slot = slot
+        self._nz_bytes = nz_bytes
+        self._staging_addrs0 = {n: _base_ptr(t) for n, t in self._staging.items()}
+        if self._expert_bytes != sum(nz_bytes.values()) + sum(
+                _row_bytes(self._staging[n]) for n in ND_SCALE_ATTRS):
+            raise FoldError("the per-expert byte total changed when the staging became NZ; the reconciliation "
+                            "in finish() would be against the wrong unit")
+        logger.info("kt_offload fold: NZ staging -- weights filled by raw D2D at %s B/slot, scales still ND; "
+                    "no per-layer cast; freed %d B (%.3f GiB) of ND weight staging; barrier=%s",
+                    dict(nz_bytes), freed, freed / float(1 << 30), self._nz_barrier)
 
     # -- state ------------------------------------------------------------
     def layer_in_flight(self) -> bool:
@@ -678,7 +898,15 @@ class ResidentFold:
             window = self.window_source()
             self.coverage.decisions_seen += 1
             try:
-                return self._decide(layer, topk_ids, window)
+                plan = self._decide(layer, topk_ids, window)
+                if plan is not None and self._nz and self._needs_barrier:
+                    # Once per layer that will be staged, not once per chunk: the
+                    # staging writes of THIS layer are what has to come after the
+                    # PREVIOUS layer's commit read it, and nothing between those
+                    # two points touches the staging.
+                    self._nz_barrier_wait()
+                    self._needs_barrier = False
+                return plan
             except BaseException as exc:
                 # Every exit AFTER the counter must land in the denominator, or
                 # ``decisions_seen == folded + sum(skipped)`` is false for the
@@ -751,7 +979,7 @@ class ResidentFold:
             plan=plan,
             row_of={e: i for i, e in enumerate(plan.new_ids)},
             filled=[False] * len(plan.new_ids),
-            staging_addrs={n: t.data_ptr() for n, t in self._staging.items()},
+            staging_addrs={n: _base_ptr(t) for n, t in self._staging.items()},
         )
         return plan
 
@@ -766,7 +994,11 @@ class ResidentFold:
             raise FoldError(f"the provider is bound to layer {self.provider.layer}, the fold is on layer "
                             f"{a.layer}: the chunk's bytes belong to another layer")
         ids = tuple(int(e) for e in expert_ids)
-        nd = self.provider.served_nd(chunk_index, ids)
+        # Both accessors make the same staleness check (this layer, this chunk
+        # index, these ids) and both refuse the mode they are not for, so asking
+        # the wrong one cannot quietly hand back the other layout's buffers.
+        served = self.provider.served_nz(chunk_index, ids) if self._nz else \
+            self.provider.served_nd(chunk_index, ids)
         rows, cols = [], []
         for pos, e in enumerate(ids):
             row = a.row_of.get(e)
@@ -785,10 +1017,71 @@ class ResidentFold:
         c = torch.tensor(cols, dtype=torch.int64, device=dev)
         self._staging_generation += 1
         # The copies report how much they moved; the two lines below do not.
-        a.bytes_staged += sum(_stage_rows(self._staging[name], r, nd[name], c) for name in SLOT_WEIGHT_ATTRS)
+        if self._nz:
+            a.bytes_staged += self._stage_chunk_nz(served, rows, cols, r, c)
+        else:
+            a.bytes_staged += sum(_stage_rows(self._staging[name], r, served[name], c)
+                                  for name in SLOT_WEIGHT_ATTRS)
         for row, pos in zip(rows, cols):
             a.filled[row] = True
             a.staged.append(ids[pos])
+
+    def _stage_chunk_nz(self, served: Any, rows: Sequence[int], cols: Sequence[int],
+                        r: torch.Tensor, c: torch.Tensor) -> int:
+        """One chunk into the NZ staging: scales by ``index_copy_``, weights by address.
+
+        The split is not a style choice. The scales never went through the cast,
+        so both ends are ND and the ordinary torch write is both legal and
+        ordered by the host queue like everything else. The weights are
+        internal-format on both ends, where torch has no per-row write at all,
+        and the raw channel is sound here for the reasons
+        :func:`fold_stage_write_nz` sets out -- one of which is that the copy is
+        issued on the SAME stream as the H2D that produced its source, so this
+        refuses any other.
+        """
+        now = int(torch.npu.current_stream().npu_stream)
+        if now != int(served.stream):
+            raise FoldError(
+                f"the chunk's H2D went to ACL stream {served.stream} and this forward is on {now}: a raw "
+                "device-to-device copy issued on a different stream is ordered against the H2D by nothing, "
+                "so it could read the previous chunk's bytes")
+        if int(served.num_slots) <= 0:
+            raise FoldError("the served chunk declares no slots")
+        for pos in cols:
+            if not 0 <= int(pos) < int(served.num_slots):
+                raise FoldError(f"slot {pos} is outside the chunk's {served.num_slots} slots")
+        runs = merge_runs(list(zip((int(x) for x in rows), (int(x) for x in cols))))
+        scales = [_stage_rows(self._staging[name], r, served.nd_scales[name], c)
+                  for name in ND_SCALE_ATTRS]
+        weights = [fold_stage_write_nz(self._staging[name], served.nz_weights[name],
+                                       bytes_per_slot=self._nz_bytes[name], runs=runs,
+                                       stream=int(served.stream))
+                   for name in NZ_WEIGHT_ATTRS]
+        return sum(scales) + sum(weights)
+
+    def _nz_barrier_wait(self) -> None:
+        """Order the next layer's raw staging writes after the last commit's read of it.
+
+        The committer reads the staging through ``torch_npu.copy_memory_``, which
+        goes into the host-side task queue; the next layer's staging writes are
+        raw ACL copies, which go to the stream at once and can therefore be
+        submitted BEFORE it. Without a barrier the commit of layer L can read
+        rows layer L+1 has already overwritten -- the same overtaking that was
+        measured as 12/100 wrong slots on the H2D path, and it would be silent:
+        every byte count, every address and every coverage check still agrees.
+
+        A device synchronize is the default because it is the one barrier that
+        unambiguously flushes the queue as well as the stream. ``"stream"`` is
+        the cheaper candidate and ``"none"`` exists to drive the failure on card
+        as a positive control; neither is the default until one is measured.
+        """
+        if self._nz_barrier == "none":
+            return
+        if self._nz_barrier == "stream":
+            torch.npu.current_stream().synchronize()
+        else:
+            torch.npu.synchronize()
+        self._barrier_waits += 1
 
     def _staging_moved(self, expected: Mapping[str, int]) -> list[str]:
         """Staging buffers whose address is no longer the one recorded. One place, two callers.
@@ -796,7 +1089,7 @@ class ResidentFold:
         Both the per-chunk guard and the pre-commit guard ask this, so a test
         that takes "has the staging moved" away takes it away everywhere.
         """
-        return [n for n, t in self._staging.items() if t.data_ptr() != expected[n]]
+        return [n for n, t in self._staging.items() if _base_ptr(t) != expected[n]]
 
     def _check_staging(self, a: _Active) -> None:
         moved = self._staging_moved(a.staging_addrs)
@@ -827,7 +1120,22 @@ class ResidentFold:
                     "layer believes it filled and the copies that actually ran have come apart ("
                     "J2). 🔴 The reverse does NOT hold: equal byte counts say nothing about the CONTENT of "
                     "the staging -- only the bit-for-bit criterion does.")
-            slot = self.provider.format_nd(self._staging, len(a.plan.new_ids))
+            if self._nz:
+                if len(a.plan.new_ids) != self.num_slots:
+                    raise FoldError(
+                        f"layer {a.layer}: the plan has {len(a.plan.new_ids)} rows and the NZ staging holds "
+                        f"{self.num_slots} slots. The prebuilt slot describes the WHOLE staging, so a short "
+                        "plan would commit the tail slots as well -- whatever the previous layer left there.")
+                # The staging IS the cast output (built once, in
+                # ``_enable_nz_staging``): its weights are the NZ allocations the
+                # chunks were copied into and its scales are the views
+                # ``format_nd`` took of the ND scale buffers, which this layer
+                # has just written through. Casting again is impossible as well
+                # as pointless -- ``npu_format_cast`` refuses a tensor that is
+                # already in an internal format.
+                slot = self._nz_slot
+            else:
+                slot = self.provider.format_nd(self._staging, len(a.plan.new_ids))
         except FoldIncompleteError:
             # The label means what the exception means: a chosen expert never
             # came by. Keeps the denominator whole (seen == folded + skipped).
@@ -876,6 +1184,11 @@ class ResidentFold:
             rep = self.committer.commit(step, folded.layer, folded.plan.new_ids, folded.weights)
         finally:
             self._committing = None
+            # Set whatever the commit did: a write that raised half way through
+            # has still enqueued reads of the staging, and those are what the
+            # next layer's raw copies must not overtake.
+            if self._nz:
+                self._needs_barrier = True
         cov = self.coverage
         if rep.ok:
             if set(rep.promoted) != set(folded.plan.promote) or set(rep.demoted) != set(folded.plan.demote):

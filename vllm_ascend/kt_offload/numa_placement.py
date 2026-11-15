@@ -508,7 +508,7 @@ def plan_placement(
         # split tp ways. Deriving without it is what pinned the split at 1/tp.
         w13_bytes = sum(source.locate(layer, expert, proj, kind).nbytes
                         for layer in layers for expert in experts
-                        for proj, kind in SPLIT_TENSORS)
+                        for proj, kind in tuple(getattr(source, "split_tensors", SPLIT_TENSORS)))
         frac = tuple(derive_fraction(reserve_gib, tp, nodes=nodes,
                                      need_bytes_per_part=w13_bytes // tp))
         source_kind = "derived"
@@ -525,16 +525,41 @@ def plan_placement(
         [round(x, 4) for x in frac], source_kind, list(nodes), streaming_node,
     )
 
+    # A source may own the question "which tensors split per TP part, and where
+    # is part p's byte range", because the answer is a property of its LAYOUT,
+    # not of this module. The checkpoint's answer is the default below; the NZ
+    # bank's is different in two ways, and both matter:
+    #   * its w13 parts are separate SECTIONS, so part p is not
+    #     `[p*nbytes/tp, ...)` of one span -- it is a different file offset;
+    #   * its w2 CAN be split, because TP divides down's k and in NZ the k-block
+    #     index is the outermost axis, so part p is a contiguous page-aligned
+    #     prefix. In the checkpoint w2 is a column slice of every row and cannot
+    #     be split at all, which is what the STREAMING_ONLY_TENSORS note below
+    #     is about. Do not read the bank's behaviour as contradicting it.
+    split_tensors = tuple(getattr(source, "split_tensors", SPLIT_TENSORS))
+    stream_only = tuple(t for t in (SPLIT_TENSORS + STREAMING_ONLY_TENSORS)
+                        if t not in split_tensors)
+    split_ranges = getattr(source, "split_ranges", None)
+
     segs: list[PlacementSegment] = []
     for layer in layers:
         for expert in experts:
-            for proj, kind in SPLIT_TENSORS:
-                span = source.locate(layer, expert, proj, kind)
-                for part, (s, n) in enumerate(_split_ranges(span.start, span.nbytes, tp)):
+            for proj, kind in split_tensors:
+                if split_ranges is not None:
+                    parts = split_ranges(layer, expert, proj, kind, tp)
+                else:
+                    span = source.locate(layer, expert, proj, kind)
+                    parts = [(span.path, st, nb)
+                             for st, nb in _split_ranges(span.start, span.nbytes, tp)]
+                if len(parts) != tp:
+                    raise ValueError(
+                        f"split_ranges({layer}, {expert}, {proj}, {kind}) returned {len(parts)} "
+                        f"range(s), expected one per TP part ({tp})")
+                for part, (path, s, n) in enumerate(parts):
                     for st, nb, node, reason in _place_part(part, s, n, frac, nodes):
-                        segs.append(PlacementSegment(span.path, st, nb, node, layer, expert,
+                        segs.append(PlacementSegment(path, st, nb, node, layer, expert,
                                                      proj, kind, part, reason))
-            for proj, kind in STREAMING_ONLY_TENSORS:
+            for proj, kind in stream_only:
                 span = source.locate(layer, expert, proj, kind)
                 segs.append(PlacementSegment(span.path, span.start, span.nbytes, streaming_node,
                                              layer, expert, proj, kind, None, "streaming-only"))

@@ -101,6 +101,151 @@ class KTOffloadConfig:
     # deliberately BELOW that crossover so the mechanism can be exercised; a
     # production setting belongs above it.
     stream_prefill_min_tokens: int = 512
+    # Stage 1: keep every chunk's cast bytes in ONE whole-layer NZ buffer instead
+    # of dropping them, and hand the GEMM that buffer with a group list in which
+    # only the current chunk's groups carry tokens. Measured on card: bitwise
+    # equal to the per-chunk form (maxabsdiff 0), +3.6% on the chunk's GEMM call
+    # (the 352 empty groups), which is ~0.13 ms per layer against 228 ms of host
+    # read. What it buys: the folded swap's 1.75 GiB whole-layer ND staging
+    # becomes unnecessary, the weight address stops moving, and the resident
+    # experts can be taken from HBM instead of the host. Needs stream_prefill.
+    # DEFAULT OFF: the default path is unchanged until this has run end to end.
+    # NOTE on HBM while both this and dynamic_resident are on: the fold still
+    # keeps its own 1.75 GiB whole-layer ND staging, so the card holds the layer
+    # buffer (~7.2 GiB) AND that staging AND the chunk buffers (~1.1 GiB) -- about
+    # 10 GiB of an 11.41 GiB budget. Making the fold read the layer buffer instead
+    # is the step that reclaims it, and it is NOT part of this switch.
+    stream_layer_buffer: bool = False
+    # Streaming prefill moves all 384 experts of all 40 layers on EVERY request
+    # -- 268.9 GiB, the whole bank -- including the ~num_resident_experts that
+    # are already in HBM. With this on, a chunk's resident members are neither
+    # gathered nor H2D'd: their layer-buffer slots are filled by a
+    # device-to-device copy out of the resident parameter, which holds the same
+    # bytes. 26% of the streamed bytes at num_resident_experts=100, on the leg
+    # the server's staging report puts at ~94% of the staging loop.
+    #
+    # 🔴 Done this way round PRECISELY so the output stays bit-identical: the
+    # fill goes into the provider's own chunk buffer, so every consumer still
+    # sees a COMPLETE chunk and the partition, the slot tables and the fp32
+    # accumulation order are untouched -- only the provenance of some slots'
+    # bytes changes. Streaming the offloaded set alone and computing the
+    # resident half separately would be less code and WOULD change the rounding
+    # (see measure/PLAN_G_stream_only_offloaded.md).
+    #
+    # 🔴 DEFAULT OFF, and it must stay off: this switch carries PRECONDITIONS
+    # (bank_dir, stream_prefill), so defaulting it on makes every config that
+    # does not meet them fail validation -- 20 of this repo's own config tests
+    # did, immediately, when it was tried. A switch with preconditions is opted
+    # into by the deployment config, not by the dataclass.
+    #
+    # The measured recommendation is to TURN IT ON wherever the preconditions
+    # hold (measure/s3_g.json does):
+    #   correctness  7/7 prompts token-identical to stage 3, both rounds
+    #   mechanism    "HOST MOVED 49.7 of 67.2 GiB (74.0%), 1000 slot(s) filled
+    #                from HBM instead" -- 198.9 GiB per request instead of 268.9
+    #   TTFT         steady state 13.79 -> 12.19 s at p=4096 (-11.6%), nine
+    #                requests per arm with NO overlap between the two ranges
+    #                (off 13.51-14.44, on 11.77-12.53)
+    #   TPOT         unchanged, as it must be: nothing in decode streams
+    # 🔴 Known and NOT explained: the first two requests of a server's life cost
+    # ~4 s more than without it. The staging counters refute both obvious
+    # causes -- the reports before and after the jump have the SAME fill shape
+    # (whole=0, mixed=120, ~3000 D2D calls, 17.5 GiB) and differ 4x in
+    # ms/chunk. It coincides with the fold re-learning the hot set. Set this to
+    # False to get the stage-3 path back.
+    stream_resident_from_hbm: bool = False
+    # DIAGNOSTIC, default off. Hold this many bytes of HBM for the process's
+    # lifetime, allocated at wiring time like the stage-1 layer buffer is.
+    # Purpose: the stage-1 TTFT regression survived removing the fold's 1.75 GiB
+    # (headroom went 693 -> 3614 MB, regression did not move), so "not enough
+    # headroom" is refuted -- but "holding one large long-lived block" is NOT,
+    # because the 6.75 GiB layer buffer was present in every ON arm of both
+    # campaigns. Setting this to 7219445760 on an OFF arm reproduces the
+    # allocation WITHOUT any stage-1 code path, which separates the two.
+    debug_hold_hbm_bytes: int = 0
+    # DIAGNOSTIC, default off. Time each run_chunk (the GEMMs) with NPU events.
+    # The events are read once per forward, not per chunk, so the measurement
+    # does not add the per-chunk synchronise it is meant to measure around.
+    debug_time_chunks: bool = False
+    # Scope of the flush before each raw NZ write. "device" is today's
+    # behaviour: torch.npu.synchronize(), which waits for ALL streams on the
+    # card. "stream" uses current_stream().synchronize() (npuStreamSynchronize),
+    # which waits only for the stream the cast was submitted on.
+    #
+    # Why this is the right axis: the hazard is HOST-SIDE submission order --
+    # with TASK_QUEUE_ENABLE != 0 torch_npu queues ops on a host thread, so a
+    # raw memcpy_async issued from Python can overtake the cast that produced
+    # its source (12/100 wrong, always the last slot). An event swap does NOT
+    # fix that: Event.record() goes through the SAME host queue, and a raw
+    # aclrtStreamWaitEvent would overtake it exactly as the memcpy does. A
+    # stream-scoped flush keeps the guarantee and is strictly narrower, which
+    # matters because production carries kt's side stream, engram's host-func
+    # and the swap commits on other streams.
+    #
+    # 🔴 "stream" MUST be validated for CORRECTNESS, not just speed: if it does
+    # not also flush the host queue, the failure is silent wrong numbers, which
+    # is exactly what the device-wide sync was introduced to prevent.
+    stream_layer_sync_scope: str = "device"
+    # Stage 2 (default off): serve the prefill staging out of a prebuilt NZ bank
+    # in /dev/shm instead of gathering from the checkpoint. Set to the bank
+    # directory, e.g. "/dev/shm/dsv41_nz_bank"; empty keeps the checkpoint path.
+    #
+    # What it changes: the bank already holds device-layout FRACTAL_NZ bytes, so
+    # the 192 scattered per-chunk segments that select + concatenate + reorder
+    # become contiguous runs, AND the per-chunk device cast disappears (the
+    # staging arrives already permuted). Measured host-read leg, paired and
+    # alternating: 220.6 -> 104.2 ms per layer, -52.4% against a 1.2% null floor.
+    #
+    # 🔴 On its own this RAISES host memory: the bank and the checkpoint page
+    # cache coexist. The -93.6 GiB only arrives once kt reads the same bank
+    # (stage 3), which lets the checkpoint mapping go.
+    bank_dir: str = ""
+    # How the fold orders a commit's read of its NZ staging against the NEXT
+    # layer's writes to it. Only the bank path has the problem: in NZ mode the
+    # staging is filled by raw ACL copies, which go to the stream immediately,
+    # while the commit reads it through torch_npu, which goes through the
+    # host-side task queue -- so the next layer's writes can be submitted first
+    # and the commit reads bytes that have already been replaced. Silently:
+    # every byte count, address and coverage check still agrees.
+    #
+    # "device" (default) is the one barrier that unambiguously flushes queue and
+    # stream both; "stream" is the cheaper candidate, not the default until it
+    # is measured; "none" removes it, to drive the failure on card as a positive
+    # control. One wait per folded layer, on the one forward per request that
+    # commits.
+    fold_nz_barrier: str = "device"
+    # Stage 3: let kt consume the SAME NZ bank the NPU streams from, in place,
+    # instead of reading the checkpoint. That is what removes the duplicate --
+    # ~269 GiB on this model, because the checkpoint's expert pages have to stay
+    # resident today purely for kt's zero-copy w13.
+    #
+    # Requires bank_dir and zerocopy_w13. MXFP4 only: no other kt backend knows
+    # the FRACTAL_NZ geometry, and handing one these pointers would have it read
+    # the bytes as row-major and compute wrong numbers silently (kt refuses).
+    #
+    # 🔴 It costs TPOT. The design measured the kernel-level cost at
+    # -5.1..-5.6% and planned to repay it with stage 4 (decode prefetch); the
+    # routing trace taken 2026-11-15 refutes stage 4 as designed (a demand LRU
+    # loses to a static frequency set at every cap >= 64, and the miss rate is
+    # 4x the transfer budget), so the cost is PERMANENT. The trade is one copy
+    # instead of two for roughly +5% TPOT.
+    kt_reads_bank: bool = False
+    # Start-up self-check of CANN's FRACTAL_NZ byte geometry (kt_offload/nz_geometry.py):
+    # cast a two-expert tensor at the REAL w13/w2 shapes and compare the NZ bytes against
+    # the formula this build assumes. Once per process, ~60 ms.
+    #
+    # OFF by default, and FORCED ON by stream_layer_buffer -- any route that has kt read
+    # the same NZ bytes the NPU reads depends on that geometry, which CANN does not
+    # document and we reverse-engineered. A CANN release that changed C0 or the fractal
+    # order would not raise there: it would compute wrong numbers, quietly. Setting this
+    # false does NOT disable the check while such a route is on -- a route must not be
+    # able to switch off its own guard.
+    #
+    # Read the effective value from nz_geometry.check_enabled(cfg), never from this field.
+    verify_nz_geometry: bool = False
+    # Bytes read back from the head and tail of each written slot range to prove
+    # the raw write landed; 0 disables. Only meaningful with stream_layer_buffer.
+    stream_layer_probe_bytes: int = 256
     # Re-pick which experts stay resident from the heat of the prefill that just
     # streamed past. Needs the CPU side to hold weights for EVERY expert it might
     # swap in -- a miss is a wrong answer, not an error. The swap is FOLDED into
@@ -118,6 +263,23 @@ class KTOffloadConfig:
     #: placement can make it local -- zero-copying it too regressed kt compute
     #: badly, while w13 alone is free.
     zerocopy_w13: bool = False
+    # Which expert tensors kt consumes IN PLACE from the checkpoint mapping.
+    #   "w13" (default) gate/up only. w13 is a contiguous row block per TP part,
+    #          so its pages place 100% node-local. w2/down is COPIED into kt's
+    #          own node-local memory: 84.4 GiB on this model.
+    #   "all"  w2/down in place too, which frees that 84.4 GiB -- at a locality
+    #          cost that is a property of the CHECKPOINT's layout, not of the
+    #          code: w2 is [hidden, full_inter/2] row-major and TP splits
+    #          `inter`, so each part owns a column slice of every row. With
+    #          full_inter/2 = 1024 B a row is a quarter of a page, so one page
+    #          carries BOTH parts' bytes and no per-page placement can beat
+    #          1/tp_count local. zerocopy_weights.hpp records -28.3% for it.
+    #
+    # 🔴 The penalty is the CHECKPOINT's, not w2's. A bank that stores w2 split
+    # per TP part makes each part's bytes contiguous and the penalty disappears
+    # -- which is what stage 3 is actually for. Until then this knob is the
+    # cheap way to MEASURE the 84.4 GiB instead of assuming it.
+    zerocopy_scope: str = "w13"
 
     #: Headroom to leave on each node when deriving where w13's pages go, GiB.
     #: The operator's JUDGEMENT; the split itself is derived from it.
@@ -170,6 +332,64 @@ class KTOffloadConfig:
                              "(0 would stream nothing and still cost a pass).")
         if self.stream_prefill_min_tokens <= 0:
             raise ValueError("kt_offload_config.stream_prefill_min_tokens must be > 0.")
+        # bank_dir + dynamic_resident WAS refused here: the fold copied its chosen
+        # experts out of the ND H2D landing buffers (stream_io.served_nd), which
+        # the bank path never writes, so it staged UNWRITTEN bytes into the
+        # resident set with no error -- just wrong experts from the next decode
+        # step on. The fold now reads NZ instead (fold_swap._stage_chunk_nz,
+        # fed by stream_io.served_nz, which refuses the mode it is not for), so
+        # the pair is allowed. What enforces it is no longer a config check: the
+        # fold asks the provider for its layout (``nz_device``) and both
+        # accessors refuse the other mode, which a config check could not do for
+        # a provider that is handed round.
+        if self.kt_reads_bank and not self.bank_dir:
+            raise ValueError("kt_offload_config.kt_reads_bank needs bank_dir: it points kt at the bank.")
+        if self.kt_reads_bank and not self.zerocopy_w13:
+            raise ValueError(
+                "kt_offload_config.kt_reads_bank needs zerocopy_w13: the bank is consumed IN PLACE, "
+                "and the copy path would memcpy NZ bytes into a row-major BufferB.")
+        if self.zerocopy_scope not in ("w13", "all"):
+            raise ValueError("kt_offload_config.zerocopy_scope must be 'w13' or 'all' "
+                             "(the two scopes kt's KT_ZEROCOPY_SCOPE parser accepts).")
+        if self.zerocopy_scope != "w13" and not self.zerocopy_w13:
+            raise ValueError("kt_offload_config.zerocopy_scope only means anything with "
+                             "zerocopy_w13=true; with zero-copy off kt copies everything.")
+        if self.fold_nz_barrier not in ("device", "stream", "none"):
+            raise ValueError("kt_offload_config.fold_nz_barrier must be 'device', 'stream' or 'none'.")
+        if self.fold_nz_barrier == "none" and not self.bank_dir:
+            raise ValueError("kt_offload_config.fold_nz_barrier='none' only means anything with bank_dir; "
+                             "it removes the ordering between a commit's read of the fold staging and the "
+                             "next layer's raw writes to it, and exists to drive that failure on card.")
+        if self.bank_dir and not self.stream_prefill:
+            raise ValueError("kt_offload_config.bank_dir needs stream_prefill: the bank only "
+                             "replaces the source of the streamed chunks.")
+        if self.stream_layer_sync_scope not in ("device", "stream"):
+            raise ValueError("kt_offload_config.stream_layer_sync_scope must be 'device' or 'stream'.")
+        if self.debug_hold_hbm_bytes < 0:
+            raise ValueError("kt_offload_config.debug_hold_hbm_bytes must be >= 0.")
+        if self.stream_layer_buffer and not self.stream_prefill:
+            raise ValueError("kt_offload_config.stream_layer_buffer needs stream_prefill: it only "
+                             "changes where the streamed chunks accumulate.")
+        if self.stream_resident_from_hbm:
+            # Each precondition is a different silent-wrong-answer if missing.
+            # NOTE it does NOT need stream_layer_buffer: the fill happens in the
+            # provider's own chunk buffer, so both the per-chunk form (what
+            # production runs) and the whole-layer form see a complete chunk.
+            if not self.stream_prefill:
+                raise ValueError(
+                    "kt_offload_config.stream_resident_from_hbm needs stream_prefill: it only "
+                    "changes where a streamed chunk's bytes come from.")
+            if not self.bank_dir:
+                raise ValueError(
+                    "kt_offload_config.stream_resident_from_hbm needs bank_dir: skipping slots "
+                    "requires a source that can gather a subset of a chunk, and only the NZ bank "
+                    "can (the checkpoint gather writes whole group blocks).")
+            if self.num_resident_experts <= 0:
+                raise ValueError(
+                    "kt_offload_config.stream_resident_from_hbm with num_resident_experts=0 would "
+                    "skip nothing; it is on by mistake.")
+        if self.stream_layer_probe_bytes < 0:
+            raise ValueError("kt_offload_config.stream_layer_probe_bytes must be >= 0.")
         if self.zerocopy_reserve_gib < 0:
             raise ValueError("kt_offload_config.zerocopy_reserve_gib must be >= 0.")
         if self.zerocopy_streaming_node is not None and self.zerocopy_streaming_node < 0:

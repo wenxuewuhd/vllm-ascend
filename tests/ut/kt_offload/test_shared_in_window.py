@@ -562,7 +562,7 @@ def _runner(rt, log, *, has_shared, ignore_defer=False):
         return real_merge(x)
 
     rt.merge = logged_merge
-    return SimpleNamespace(
+    ns = SimpleNamespace(
         _sequence_parallel_context=contextlib.nullcontext,
         ascend_shared_experts=_Shared(log) if has_shared else None,
         is_internal_router=False,
@@ -571,6 +571,16 @@ def _runner(rt, log, *, has_shared, ignore_defer=False):
         routed_output_transform=None,
         _can_overlap_sp_shared_with=lambda t: False,
     )
+    # ``_forward_impl``'s `with` acquires this too. It was added to production
+    # after this fixture was written, so every test in this file died at
+    # "'SimpleNamespace' object has no attribute '_layer_moe_context'" -- ten
+    # tests of the shared-expert merge ORDER silently not running.
+    # Bound from the PRODUCTION class rather than replaced with a nullcontext:
+    # it reads ``self._layer_moe_comm_method`` (absent here, so a plain yield),
+    # and binding it means this file notices if the context starts doing
+    # something instead of passing because it was stubbed out.
+    ns._layer_moe_context = fm.AscendMoERunner._layer_moe_context.__get__(ns)
+    return ns
 
 
 def _production_forward_impl(mutate=None):
