@@ -129,11 +129,31 @@ one**, 0 of 40 paired rounds slower, p=1.8e-12.
   addresses in the same order**. The data refutes the story as well: if a
   longer contiguous run per group were the win, `go8` (128 B) would be far
   worse than `go256` (4 KiB), and they measure 0.7514 against 0.7548. The row
-  block R barely matters in the new loop. What differs is the **code
-  generation** — no force-unroll so the accumulators live in an L1 array, a
-  group's scales read contiguously instead of strided across a per-row scratch,
-  and one prefetch per 64 B line instead of one per row. Which of the three
-  carries the 24.9% is one more paired sweep, not an argument.
+  block R barely matters in the new loop.
+
+  **The 24.9% was then split by measurement** (2026-11-17, same bench, 20
+  paired rounds each), and all three of the first candidates are dead:
+
+  | candidate | arm | result |
+  |---|---|---|
+  | one prefetch per 64 B line vs per row | rb8 ± dedup | 0.8785 vs 0.8810 — **nothing** |
+  | the force-unroll pragma | go8 vs go8_unroll | 0.7832 vs 0.7785 — **nothing** |
+  | the scale handling | — | the new loop does **more** scalar work here (R byte-loads per group against a vectorised per-row expansion), so it is a cost it pays, not the gain |
+
+  What the split IS:
+  * **~14% survives with NO prefetch anywhere.** At `--distances 0` on both
+    loops the rebuilt one is still **13.79% faster** (0/20, p=1.9e-06). This
+    part is **unexplained**.
+  * **~8% is prefetch COVERAGE**, a mechanism nobody had noticed: the shipped
+    loop calls `prefetch_group(g)` once per **four** groups (`for (; g + 3 <
+    group_count; g += 4)`), so groups g+1..g+3 were never prefetched at all.
+    The rebuilt loop prefetches every group. Confirmed from the other side —
+    turning prefetching off costs **3.9%** in the old loop and **11.6%** in the
+    new one.
+
+  A distance re-sweep on the rebuilt loop leaves the shipped constants best:
+  d16 is the optimum (d0 +11.6%, d8 +2.1%, d24 +2.0%, d32 +4.0%, d48 +4.8%, all
+  17–19/20 rounds), and short 2/8/16 are all inconclusive against short 4.
 
   **2. What was done about it.** Two kernel changes, both NZ-only, both
   zero-memory, both leaving each row's accumulation order untouched so the
