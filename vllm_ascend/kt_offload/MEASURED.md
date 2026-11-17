@@ -97,10 +97,40 @@ one**, 0 of 40 paired rounds slower, p=1.8e-12.
 
 ## Not done, and known
 
-* **Accuracy has never been run.** GSM8K reference 97.27. 🔴 Its prompts are
-  ~100 tokens, below the 512-token streaming threshold, so at the production
-  threshold it exercises neither the bank nor the fold;
-  `measure/gsm8k_bank_stream.json` lowers it to 64.
+* ✅ **Accuracy RUN 2026-11-17, all 1319 GSM8K questions: 97.04 against the
+  published 97.27.** That is **+0.23 points = 3 questions = 0.49 standard
+  errors** (1 SE = 0.47 pts at n=1319), i.e. no detectable difference; resolving
+  a real 0.23-point gap would need n ≈ 21,700. The stronger statement for the
+  same code remains the bit-identity: **7/7 prompts token-identical on card in
+  four independent captures**.
+
+  🔴 **What this arm covers, and how it was chosen.** The kernel work of
+  2026-11-15..17 is entirely in the **m=1 decode** path; prefill runs the
+  untouched mat-mat kernel. So accuracy does not need streaming prefill — it
+  needs `kt_reads_bank` and decode, which runs at a batch. The arm
+  (`measure/gsm8k_tput.json`) therefore keeps `kt_reads_bank` +
+  `zerocopy_scope=all` and raises `stream_prefill_min_tokens` to 100000 so
+  nothing streams, which lets it run at `max_num_seqs=4` and finish 1319
+  questions in 83 minutes. The server's own line confirms the arm did what it
+  was meant to: `[kt prefetch] ...RB8_GOUTERON...: gate/up layout=NZ`, and
+  `bank-as-kt-source` appears in the log. `requests that committed all 40
+  layers: 0` is the DESIGNED state here (no streaming, no fold), not a failure.
+  🔴 The first arm tried, `gsm8k_bank_stream.json`, sets only `bank_dir` — the
+  NPU streams from the bank while **kt keeps reading the checkpoint in ND** — so
+  it would have scored a clean 97 having executed none of the changed code.
+  **Streaming prefill and the folded hot set are still unvalidated by any
+  dataset score**; they need their own single-request arms.
+
+  Costs, from the same run and worth keeping: `max_num_seqs=8` **OOM'd** the
+  card during the init profiling batch (1.10 GiB short), so the batch is 4 and
+  `max_model_len` 5120 (ais_bench's gsm8k config needs ≥ 5120). And generation
+  throughput at batch 4 is **34–50 tokens/s in total** across the 4 sequences,
+  i.e. ~100 ms per token per sequence against ~30 ms at batch 1 — **batching
+  barely raises total throughput**, which is the signature of a per-token expert
+  read that does not amortise: each token routes to its own top-k, so four
+  tokens touch up to 32 different experts. (The flatness is measured; the
+  attribution to the CPU MoE's weight traffic is inference — it is the only
+  component with that property, but no per-stage timing was taken.)
 * 🔴 **TPOT: the mechanism is settled, the end-to-end size is not measurable
   here.** Three things are established, and the fourth is a measurement limit.
 
