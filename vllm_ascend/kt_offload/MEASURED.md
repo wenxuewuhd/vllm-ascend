@@ -16,7 +16,7 @@ are marked as such.
 | **Host working set** | 558.8 GiB | **288.8 GiB** (−270.0) | `dropped the checkpoint's clean page cache over 48 shard(s): 267.3 -> 0.0 GiB`, `numa_placement: planned=70502400 resident_at_census=70502400` |
 | **HBM** | — | **−2.175 GiB**, plus −12.3 GiB of KV budget | sampler peak |
 | **TTFT @p=4096** | 15.50 s | **12.19 s (−21%)** | two independent steps, below |
-| **TPOT** | 23.5–26.2 ms | **+16% (27.5–30.8 ms)** 🔴 | `measure/chain_tpot.sh`, 3 rounds vs the NO-BANK baseline — the cost of the scheme, localised below |
+| **TPOT** | — | 🔴 **NOT MEASURABLE on this host** | four instruments, each with a null pair: floors ±12.8…14.3% against an effect of ~4%. Every TPOT number this project ever quoted is retracted. The cost's MECHANISM and its KERNEL-level size are known — see below |
 | **Correctness** | — | **7/7 prompts token-identical**, at every step | `measure/eqdiff.py` against the stage-3 capture |
 
 The TTFT figure is two changes:
@@ -101,36 +101,59 @@ one**, 0 of 40 paired rounds slower, p=1.8e-12.
   ~100 tokens, below the 512-token streaming threshold, so at the production
   threshold it exercises neither the bank nor the fold;
   `measure/gsm8k_bank_stream.json` lowers it to 64.
-* 🔴 **TPOT costs +16% against a no-bank baseline, and it is the NZ traversal
-  in kt's decode GEMV.** Measured 2026-11-15 and localised in three steps:
+* 🔴 **TPOT: the mechanism is settled, the end-to-end size is not measurable
+  here.** Three things are established, and the fourth is a measurement limit.
 
-  1. **Which half of the stack** (`measure/chain_tpot.sh`, 3 rounds, arms
-     alternating, first three requests of each server discarded). A bank that
-     only feeds the NPU's streaming prefill is **free** — `s2/base` =
-     0.844 / 0.946 / 0.972, never slower in three rounds. kt *also* reading it
-     costs **+1.2 / +22.6 / +23.3%**, and the `now` arm's lowest round median
-     (27.52 ms) is above the `s2` arm's highest (27.21).
-  2. **Which part of that step** (`measure/kt_layout_bench.py`: the real bank,
-     the production kernel, two MOE instances in ONE process, arms
-     alternating, outputs gated bit-identical). The same weights read as ND
-     instead of NZ are **36% faster** (24/24 rounds, p=1.2e-07; 38.7% in a
-     single-node repeat against a ±5.03% null floor).
-  3. **Which mechanism.** Not placement: the server reports
-     `on_target=100.00%` over all 70,502,400 pages, and `split_share=0.9412`
-     = (w13+w2)/total, i.e. w2 *is* split per part and both halves are local.
-     Not cache-line waste: the kernel already blocks rows by four and
-     `accumulate_group` reads rows ni..ni+3 at the same group, which under NZ
-     is one whole 64 B line. **Not the TLB**: a byte-identical NZ copy on
-     2 MiB pages (`ShmemPmdMapped` 100%) measured **1.0009**, 12/24 rounds
-     slower. What is left is the traversal itself — one 64 B line per
-     18,432 B stride, against ND's sequential stream — which no page size can
-     fix and a wider row block in the kernel can.
+  **1. What the cost is.** Measured at the kernel — the real bank, the
+  production kernel, two MOE instances in ONE process, arms alternating, every
+  arm's output gated **bit-identical** before any timing
+  (`measure/kt_layout_bench.py`, `measure/kt_pfd_bench.py`, null floor
+  **±1.72%**):
 
-  🔴 The earlier "+2.8…5.0%, cause: the NZ walk costs the kernel ~5%" was wrong
-  in both halves, and the reason it survived is worth keeping: every control
-  that said "TPOT is unchanged" was **bank-vs-bank**, so the bank's cost
-  cancelled on both sides. An internal control cannot see a cost its two arms
-  share.
+  | | ratio | rounds | p |
+  |---|---|---|---|
+  | the same weights read as **ND** instead of NZ | **36–47% faster** | 24/24 | 1.2e-07 |
+  | the NZ copy on **2 MiB pages** (so: not the TLB) | 1.0009 | 12/24 | — |
+  | **row block 4 → 8** (`KT_NZ_ROW_BLOCK`, shipped) | rb4 is **+13.51%** | 24/24 | 1.2e-07 |
+
+  It is the FRACTAL_NZ **traversal** — one 64 B line per 18,432 B stride against
+  ND's sequential stream. Not placement (`on_target=100.00%` over all
+  70,502,400 pages), not cache-line waste (the kernel already blocks rows by
+  four, so a block's four rows at one group are one whole line), not the TLB.
+
+  **2. What was done about it.** `kt_prefetch::row_block()` makes the m=1 NZ walk
+  accumulate 8 rows per block, so one k-group is 128 **contiguous** bytes before
+  the jump. Each row's groups are accumulated in the same order into the same
+  accumulator, so the output cannot change — and does not: **7/7 prompts
+  token-identical on card, three independent captures** (`rb8_eq`, `rb_ab`,
+  `rb_alt`), plus a per-arm bit-identity gate in the bench itself.
+
+  **3. 🔴 What it is worth end to end is UNKNOWN, and that is a property of this
+  host, not an oversight.** Four instruments, each with a null pair (the same
+  configuration measured twice, in the same position structure as the
+  comparison):
+
+  | instrument | design | TPOT floor | TTFT floor |
+  |---|---|---|---|
+  | `chain_tpot.sh` | a server per arm, 128 gen-tokens | ±13.06% | — |
+  | `chain_rb_ab.sh` | ONE server, knob per block, 128 tokens | ±12.17% | ±5.23% |
+  | `chain_rb_ab.sh` | ONE server, knob per block, 1024 tokens | ±14.33% | ±3.97% |
+  | `chain_rb_alt.sh` | ONE server, knob per **request** (~40 s apart), 1024 tokens | ±12.79% (robust ±5.85%) | **±2.85%** |
+
+  Against a ±5.85% robust floor the signal is **−1.30%, 4/10 rounds, p=0.75** —
+  INCONCLUSIVE. TTFT, the negative control, behaves exactly as it must (+0.64%,
+  inside its own ±2.29%), and its floor is **4.5× tighter in the same run**, so
+  TPOT is the noisy quantity here, not the harness. `measure/chain_tpot_floor.sh`
+  pinned the one thing that does help — two **back-to-back** runs of one config
+  at 1024 tokens agree to ±1.29% — which means what is left is wall-clock drift
+  between a pair's halves on a box whose load swings 24 → 200.
+
+  **So the trade, stated honestly: −270 GiB of host memory and −21% TTFT, for a
+  decode cost whose mechanism is the NZ traversal, whose kernel-level size is
+  36–47% of kt's decode GEMV, of which the shipped row block returns 13.5%, and
+  whose end-to-end size has never been resolved on this host.** Anyone quoting a
+  TPOT percentage for this work is quoting noise.
+
 * **`stream_resident_from_hbm` costs ~4 s once**, over the first two requests of
   a server's life, and that is **not explained**. The staging counters refute
   both obvious causes: the reports before and after the jump have the same fill
