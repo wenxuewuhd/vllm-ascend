@@ -112,21 +112,47 @@ one**, 0 of 40 paired rounds slower, p=1.8e-12.
 
   | | ratio | rounds | p |
   |---|---|---|---|
-  | the same weights read as **ND** instead of NZ | **36–47% faster** | 24/24 | 1.2e-07 |
+  | the same weights read as **ND** instead of NZ (before the two fixes) | **36–47% faster** | 24/24 | 1.2e-07 |
   | the NZ copy on **2 MiB pages** (so: not the TLB) | 1.0009 | 12/24 | — |
   | **row block 4 → 8** (`KT_NZ_ROW_BLOCK`, shipped) | rb4 is **+13.51%** | 24/24 | 1.2e-07 |
+  | **a rebuilt m=1 inner loop** (`KT_NZ_G_OUTER`, shipped, default ON) | **−24.86%** | 0/20 | 1.9e-06 |
+  | **→ ND vs NZ after both** | **ND only 8.64% faster** | 0/20 | 1.9e-06 |
 
-  It is the FRACTAL_NZ **traversal** — one 64 B line per 18,432 B stride against
-  ND's sequential stream. Not placement (`on_target=100.00%` over all
-  70,502,400 pages), not cache-line waste (the kernel already blocks rows by
-  four, so a block's four rows at one group are one whole line), not the TLB.
+  Where the cost is NOT: placement (`on_target=100.00%` over all 70,502,400
+  pages), cache-line waste (a block's four rows at one group are one whole
+  line), the TLB (2 MiB pages measured 1.0009).
 
-  **2. What was done about it.** `kt_prefetch::row_block()` makes the m=1 NZ walk
-  accumulate 8 rows per block, so one k-group is 128 **contiguous** bytes before
-  the jump. Each row's groups are accumulated in the same order into the same
-  accumulator, so the output cannot change — and does not: **7/7 prompts
-  token-identical on card, three independent captures** (`rb8_eq`, `rb_ab`,
-  `rb_alt`), plus a per-arm bit-identity gate in the bench itself.
+  🔴 **What it IS has not been established, and the first answer was wrong.**
+  The gap was attributed to the loop order — "the kernel walks NZ in ND's
+  order, rows outer and groups inner". It does not: `accumulate_group(g)` has
+  always had g outermost, so the old and new inner loops issue the **same
+  addresses in the same order**. The data refutes the story as well: if a
+  longer contiguous run per group were the win, `go8` (128 B) would be far
+  worse than `go256` (4 KiB), and they measure 0.7514 against 0.7548. The row
+  block R barely matters in the new loop. What differs is the **code
+  generation** — no force-unroll so the accumulators live in an L1 array, a
+  group's scales read contiguously instead of strided across a per-row scratch,
+  and one prefetch per 64 B line instead of one per row. Which of the three
+  carries the 24.9% is one more paired sweep, not an argument.
+
+  **2. What was done about it.** Two kernel changes, both NZ-only, both
+  zero-memory, both leaving each row's accumulation order untouched so the
+  output **cannot** change:
+  * `KT_NZ_ROW_BLOCK` (default 8): accumulate 8 rows per block instead of 4.
+  * `KT_NZ_G_OUTER` (default on): a rebuilt inner loop — see above for what it
+    actually changes and for what is still unexplained.
+
+  Together they take ND's advantage from 36–47% to **8.64%**, and ND still
+  carries w2's 1/tp locality handicap, so the true remainder is smaller.
+  Verified on card **four independent times, 7/7 prompts token-identical**
+  (`rb8_eq`, `rb_ab`, `rb_alt`, `go_eq`), plus a per-arm bit-identity gate
+  inside both benches that runs before any timing.
+
+  🔴 Two reproducible non-monotonicities remain **unexplained** and are kept
+  reachable by the knobs so the next person can reproduce them in one run:
+  `nz_row_block=16` is worse than both 8 and 32 (+19%, +15%, +25% across three
+  runs), and under the new loop `go32` (0.8665) is worse than go8, go64, go128
+  and go256 (0.75–0.79).
 
   **3. 🔴 What it is worth end to end is UNKNOWN, and that is a property of this
   host, not an oversight.** Four instruments, each with a null pair (the same
@@ -149,10 +175,10 @@ one**, 0 of 40 paired rounds slower, p=1.8e-12.
   between a pair's halves on a box whose load swings 24 → 200.
 
   **So the trade, stated honestly: −270 GiB of host memory and −21% TTFT, for a
-  decode cost whose mechanism is the NZ traversal, whose kernel-level size is
-  36–47% of kt's decode GEMV, of which the shipped row block returns 13.5%, and
+  decode cost that started at 36–47% of kt's decode GEMV and is now 8.64%, and
   whose end-to-end size has never been resolved on this host.** Anyone quoting a
-  TPOT percentage for this work is quoting noise.
+  TPOT percentage for this work is quoting noise — including the arithmetic
+  bound that used to be here.
 
 * **`stream_resident_from_hbm` costs ~4 s once**, over the first two requests of
   a server's life, and that is **not explained**. The staging counters refute
