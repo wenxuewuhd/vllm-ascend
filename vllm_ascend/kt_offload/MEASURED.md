@@ -15,7 +15,7 @@ are marked as such.
 |---|---|---|---|
 | **Host working set** | 558.8 GiB | **288.8 GiB** (−270.0) | `dropped the checkpoint's clean page cache over 48 shard(s): 267.3 -> 0.0 GiB`, `numa_placement: planned=70502400 resident_at_census=70502400` |
 | **HBM** | — | **−2.175 GiB**, plus −12.3 GiB of KV budget | sampler peak |
-| **TTFT @p=4096** | 15.50 s | **12.19 s (−21%)** | two independent steps, below |
+| **TTFT @p=4096** | 🔴 see below | **streaming should be OFF** | 2026-11-18: not streaming is **2.0–10.7× faster** at every length measured, and there is no crossover |
 | **TPOT** | — | 🔴 **NOT MEASURABLE on this host** | four instruments, each with a null pair: floors ±12.8…14.3% against an effect of ~4%. Every TPOT number this project ever quoted is retracted. The cost's MECHANISM and its KERNEL-level size are known — see below |
 | **Correctness** | — | **7/7 prompts token-identical**, at every step | `measure/eqdiff.py` against the stage-3 capture |
 
@@ -238,3 +238,75 @@ one**, 0 of 40 paired rounds slower, p=1.8e-12.
 * Not implemented: the node-matched gather partition (offline **76.9 vs 69.6
   GiB/s** at the same 16 threads), reading the scales from the bank (~16 GiB
   resident plus a 269 GiB load-time transient), and the w13 N-reorder.
+
+
+---
+
+## 🔴🔴 2026-11-18: streaming prefill should not run, and the bank is still worth it
+
+`measure/chain_cross.sh`, three requests per cell, no overlapping ranges:
+
+| prompt | `nostream` | `stream` | `streamg` (+G′) | stream/nostream | streamg/nostream |
+|---|---|---|---|---|---|
+| 1024 | **2.28 s** | 24.42 | 14.44 | **10.72×** | 6.34× |
+| 2048 | **3.99 s** | 23.87 | 14.77 | 5.98× | 3.70× |
+| 4096 | **7.62 s** | 24.71 | 15.47 | 3.24× | 2.03× |
+| 8192 | **15.35 s** | 49.88 | 29.30 | **3.25×** | 1.91× |
+
+**Why there is no crossover.** Streaming moves the whole bank once per PREFILL
+WINDOW (~4096 tokens), not once per request: flat at 24.4/23.9/24.7 from 1024 to
+4096, then doubling to 49.88 at 8192. So both sides are linear in prompt length
+and the ratio converges to ~3.25× (~1.9× with G′) instead of approaching 1. The
+expectation of a crossover came from treating streaming's cost as constant per
+request, which it is not.
+
+**The recommendation, and what it keeps.** Raise
+`stream_prefill_min_tokens` above the longest prompt the deployment sees.
+`bank_dir` requires `stream_prefill`, so streaming stays *enabled* and simply
+never fires — which means:
+
+* the bank stays, `kt_reads_bank` stays, and the **−270 GiB host working set
+  stays**;
+* TPOT is unaffected (29.9 vs 31.1 ms, inside this host's ±13% floor);
+* accuracy is already measured on exactly this configuration: **GSM8K 97.04**
+  (`measure/gsm8k_tput.json` is `mech_nostream.json`);
+* `max_num_seqs` is no longer pinned to 1 by the fold, so the throughput profile
+  becomes available.
+
+🔴 **The bank's value is that kt READS it, not that it is STREAMED.** And the
+two TTFT improvements this file used to headline — loader threads 4→16, and
+`stream_resident_from_hbm` — are streaming-vs-streaming. They are real (G′ is
+worth −37…−41% of streaming's TTFT here, more than the −20.5% first measured),
+but they improve a path that should not run. An internal control cannot see a
+cost its two arms share; this is the third time that has bitten this work, after
+the retracted TPOT numbers.
+
+**Not overclaimed:** measured to 8192 only (`MAXLEN=10240` is the HBM ceiling
+with 100 resident experts), one server per arm (irrelevant at 2–10× against a
+±3–5% TTFT floor), and the ~4096 window is inferred from the doubling at 8192
+rather than read from a counter.
+
+### What the mechanism counters say, for the record
+
+Deterministic, no noise floor (`measure/chain_mech.sh`, prompt 4096):
+
+| arm | chunks | GiB staged | HOST MOVED | D2D calls | TTFT | TPOT |
+|---|---|---|---|---|---|---|
+| `nostream` | 0 | 0.0 | — | — | 7.14 s | 29.9 ms |
+| `stream` | 2400 | 1344.0 | — | — | 19.63 s | 31.1 ms |
+| `streamg` | 2400 | 1344.0 | 994.0 of 1344.0 (74.0%) | 3,200 | 15.60 s | 31.0 ms |
+| `fold` | 2400 | 1344.0 | 994.0 of 1344.0 (74.0%) | **48,720** | 17.19 s | 26.0 ms |
+| `stream4` (batch 4) | 2400 | 1344.0 | — | — | 83.01 s | 82.9 ms |
+
+* **268.8 GiB per request** streamed whatever the prompt length (120 chunks ×
+  67.2 GiB × 4 reports), `acquire` 88–91% of the staging loop.
+* **G′ moves 26% fewer bytes** and that is exactly what the counter says.
+* **The fold moves the SAME bytes in 15× the D2D calls** (48,720 vs 3,200),
+  because `merge_runs` needs adjacent logical ids to be both resident and the
+  hot set is scattered. 🔴 Choosing slots differently cannot fix that — the
+  destination row advances only for adjacent ids.
+* **The fold's hot set converges**: `decisions 80 (skipped {'no_change': 40})`,
+  `experts staged 4000 (70.0 GiB copied)` — the whole resident set replaced on
+  the folding request, no change on the next.
+* **Streaming does run at a batch, and it is catastrophic**: four requests ×
+  269 GiB ≈ 1 TiB, TTFT 83 s.
