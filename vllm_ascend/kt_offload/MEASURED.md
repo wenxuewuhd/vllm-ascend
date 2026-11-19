@@ -310,3 +310,87 @@ Deterministic, no noise floor (`measure/chain_mech.sh`, prompt 4096):
   the folding request, no change on the next.
 * **Streaming does run at a batch, and it is catastrophic**: four requests ×
   269 GiB ≈ 1 TiB, TTFT 83 s.
+
+
+---
+
+## ✅ 2026-11-19: the chunk lookahead was never switched on, and switching it on is the largest TTFT change in this work
+
+`StreamSlotProvider.prefetch()` existed, was tested, and had **no production
+caller**: `grep -rn '\.prefetch(' vllm_ascend/` found only tests.
+`stream_chain.run_streamed_layer`'s loop was strictly
+`slot_for(k) → run_chunk(k) → slot_for(k+1)`, so `_acquire_buffer` always fell
+through to an inline synchronous `_fill` — the host gather sat on the critical
+path with the NPU idle, and the NPU computed with the host threads idle.
+
+`run_streamed_layer` now takes `prefetch_for` and starts chunk k+1's gather
+before computing chunk k. Depth 1, which is exactly what
+`DEFAULT_HOST_BUFFERS = 2` was built for, so **it costs no memory** (the pinned
+staging was already `1.121 GiB` either way).
+
+**The deterministic half, which no load can distort** — same bytes, same
+gathers, same `HOST MOVED 49.7 of 67.2 GiB (74.0%)`:
+
+| | acquire leg | share of the staging loop |
+|---|---|---|
+| serial (before) | **3.57 s** per bank pass | 88–91% |
+| lookahead (after) | **0.10–0.19 s** | 40–82% of a much smaller total |
+
+The 357–650 GiB/s the timer then reports is not the host going faster; it is the
+blocking time disappearing — `slot_for` arrives to find the buffer already
+filled, so the timer only catches the residual wait. That is the signature of
+the overlap.
+
+🔴 **One trap closed on the way in.** Under `set_resident`, `slot_for` builds the
+buffer key from the STREAMED positions only; a `prefetch` that asked for the
+whole chunk would build a DIFFERENT key, so every prefetch would miss, the
+gather it paid for would be the full chunk, and
+`stream_resident_from_hbm`'s 26% saving would be silently undone — while the
+logs still looked right. `prefetch` therefore derives the subset itself, by the
+same lines `slot_for` uses, and declines a fully resident chunk. Three tests
+pin it (`test_prefetch_derives_the_streamed_subset_not_the_whole_chunk` asserts
+the key carries `(0, 2)` and is **not** the whole-chunk key).
+
+`VLLM_ASCEND_DSV41_KT_PREFETCH=0` restores the serial loop in the same binary,
+and the server logs which path is live (`kt_offload stream: chunk lookahead
+ON/OFF`).
+
+### base vs everything, one chain, two arms — FIRST READ, host NOT quiet
+
+`measure/chain_ab.sh`, prompt 4096, 10 requests per cell, loadavg 38–54.
+`base` = `s2_off.json` (no bank, kt reads the checkpoint in ND, streaming at
+the production threshold, fold on) with `KT_NZ_ROW_BLOCK=4`, `KT_NZ_G_OUTER=0`,
+`VLLM_ASCEND_DSV41_KT_PREFETCH=0` — every change of this work off, in the same
+binary. `now` = the full stack at its shipped defaults. Both arms self-identify
+in the log (`layout=ND walk=row-outer` / `layout=NZ walk=GROUP-outer`).
+
+| gen | arm | TTFT p50 | TTFT min | TPOT p50 | TPOT min |
+|---|---|---|---|---|---|
+| 128 | base | 39.40 s | 36.61 | 32.66 ms | 29.92 |
+| 128 | **now** | **10.26 s** | **9.88** | **29.94 ms** | **27.24** |
+| 128 | *README expectation* | *22.20 s* | — | *26.01 ms* | — |
+| 512 | base | 40.13 s | 38.46 | 34.38 ms | 28.95 |
+| 512 | **now** | **9.34 s** | **8.86** | **28.89 ms** | **26.16** |
+
+TTFT **0.26× / 0.23×**; TPOT 0.917× (inside the ±12–14% cross-start floor) and
+0.840× (outside it).
+
+🔴 **Why this is a first read and not the number.** The host was at loadavg
+38–54, and it hurt the two arms very differently: `base`'s TTFT came out
+**1.8× worse than the documented expectation** (39.40 against 22.20) with its
+`acquire` leg at **20.6 GiB/s** against the usual 58–78, while `now` measured
+9.34 s against 9.32 s on a quieter run — i.e. **`now` is barely load-sensitive
+and `base` is nothing but**. That is itself the mechanism (the gather is off the
+critical path), but it means the RATIO is inflated. A quiet-window re-run of the
+same chain is queued behind `measure/when_quiet.sh`.
+
+🔴 **And one direction is opposite to the kernel measurement, unexplained.** The
+kernel bench says ND is 8.64% faster than NZ, so `base`'s TPOT should be
+slightly better. It is worse, by 8–16%. The leading candidate is that `base`'s
+kt reads w13 in place from the **checkpoint mmap**, whose pages are evictable
+page cache (it needs 267 GiB resident and the host had 312–368 GiB available),
+while the bank lives in **tmpfs and cannot be evicted** — so under memory
+pressure `base` may be paying major faults per decode step. That would make
+"cannot be reclaimed" a real advantage of the bank, separate from speed. It is
+**not established**: it needs fault counters, and the quiet re-run will say
+whether the gap survives without memory pressure.

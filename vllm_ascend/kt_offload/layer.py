@@ -1253,6 +1253,9 @@ class KTLayerOffload:
             quant_method=stream_io.moe_scheme(layer.quant_method, *stream_chain.SCHEME_ATTRS),
             plan=plan,
             slot_for=self._stream_slot_provider,
+            # Depth-1 lookahead. None when the provider has no prefetch (stage-1
+            # shims), in which case the loop stays serial as before.
+            prefetch_for=getattr(self, "_stream_prefetch", None),
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
@@ -2219,6 +2222,17 @@ def install_stream_provider(provider, *, layers=None) -> dict[int, KTLayerOffloa
     for rt in offloads.values():
         rt._stream_provider = provider
         rt._stream_slot_provider = provider.slot_for
+        # 🔴 The provider's prefetch had no production caller before 2026-11-18.
+        # Wired here, next to slot_for, so the two cannot drift apart.
+        # 🔴 An OFF switch, so the serial behaviour stays reachable in the same
+        # binary and the lookahead can be A/B'd instead of argued about.
+        # VLLM_ASCEND_DSV41_KT_PREFETCH=0 restores the pre-2026-11-18 path.
+        import os as _os  # noqa: PLC0415 - local to keep the import graph flat
+        rt._stream_prefetch = (None if _os.environ.get("VLLM_ASCEND_DSV41_KT_PREFETCH") == "0"
+                               else getattr(provider, "prefetch", None))
+        logger.info("kt_offload stream: chunk lookahead %s (depth 1, %s)",
+                    "ON" if rt._stream_prefetch is not None else "OFF",
+                    "provider.prefetch" if hasattr(provider, "prefetch") else "no provider support")
     return offloads
 
 

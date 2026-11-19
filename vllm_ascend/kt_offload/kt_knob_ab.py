@@ -67,6 +67,13 @@ _KNOBS: dict[str, tuple[str, str]] = {
     # under NZ). Default off, because every arm measured before 2026-11-15 had
     # it off and that arm has to stay reproducible.
     "nz_prefetch_dedup": ("set_nz_prefetch_dedup", "bool"),
+    # The rebuilt m=1 inner loop (2026-11-17): -24.9% of the decode GEMV, and
+    # default ON in the kernel. Pass 0 to reproduce the pre-2026-11-15 walk, so
+    # one server can hold the WHOLE kernel delta as two arms -- which is the
+    # only version of that comparison this host's timing floor can resolve.
+    "nz_g_outer": ("set_nz_g_outer", "bool"),
+    # Measurement only: puts the force-unroll pragma back on the rebuilt loop.
+    "nz_g_unroll": ("set_nz_g_unroll", "bool"),
 }
 
 _thread: threading.Thread | None = None

@@ -624,11 +624,21 @@ def run_streamed_layer(*, quant_method, plan: ChunkPlan,
                        expert_tokens_num_type: int = EXPERT_TOKEN_NUMS_TYPE_COUNT,
                        expected_expert_ids: Sequence[int] | None = None,
                        strict: bool = True,
-                       after_chunk: Callable[[int, tuple[int, ...]], None] | None = None) -> StreamChainResult:
+                       after_chunk: Callable[[int, tuple[int, ...]], None] | None = None,
+                       prefetch_for: Callable[[int, tuple[int, ...]], bool] | None = None,
+                       ) -> StreamChainResult:
     """Run every chunk of ``plan`` and sum the contributions.
 
     ``slot_for(chunk_index, expert_ids)`` hands back the buffers for that chunk;
     the weight I/O (host gather, H2D, format) lives behind it on purpose. The sum
+
+    ``prefetch_for(chunk_index, expert_ids)``, when given, is asked to START the
+    NEXT chunk's host gather before this chunk is computed. It must be
+    non-blocking and may decline (returning False) when no buffer is free or the
+    chunk needs no host bytes; the loop ignores the answer, because
+    ``slot_for`` is correct either way -- it finds the buffer ready or fills it
+    itself. Leaving it None is the pre-2026-11-18 behaviour: strictly serial,
+    with the host idle during compute and the NPU idle during the gather.
     is accumulated in ``accum_dtype`` (fp32 by default) and cast back at the end.
 
     ``after_chunk(chunk_index, expert_ids)`` runs once per chunk, after that
@@ -671,6 +681,22 @@ def run_streamed_layer(*, quant_method, plan: ChunkPlan,
         tables = chunk_tables(plan, k, device=topk_ids.device, id_dtype=topk_ids.dtype,
                               weight_dtype=topk_weights.dtype)
         slot = slot_for(k, tables.expert_ids)
+        # 🔴 START THE NEXT CHUNK'S HOST GATHER BEFORE COMPUTING THIS ONE.
+        # Without this the loop is strictly serial -- slot_for(k) blocks on the
+        # gather, run_chunk(k) then has the NPU to itself while the host threads
+        # idle, and `StreamSlotProvider.prefetch` (which exists and is tested)
+        # had NO production caller at all. Measured 2026-11-18 on the shipped
+        # path: staging is 4.02 s of a 15.47 s TTFT per bank pass, 88-91% of it
+        # the host gather, and it lands on TTFT at a coefficient of 1.12, i.e.
+        # none of it is hidden. Per chunk the gather is 8.4 ms against 23.9 ms
+        # of compute, so at depth 1 the whole gather fits inside the compute.
+        # Two pinned buffers already exist (DEFAULT_HOST_BUFFERS = 2, logged as
+        # "1.121 GiB of pinned staging"), so this costs no memory -- the
+        # ping-pong was built for exactly this and never switched on.
+        if prefetch_for is not None and k + 1 < plan.num_chunks:
+            # plan.chunks[k+1] is the ids directly; building k+1's tables here
+            # would allocate device tensors a chunk early for nothing.
+            prefetch_for(k + 1, plan.chunks[k + 1])
         run = run_chunk(quant_method=quant_method, slot=slot, tables=tables, hidden_states=hidden_states,
                         topk_ids=topk_ids, topk_weights=topk_weights, moe_config=moe_config, top_k=top_k,
                         resident_layer=resident_layer, expert_tokens_num_type=expert_tokens_num_type)

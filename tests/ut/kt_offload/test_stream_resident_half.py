@@ -273,6 +273,7 @@ def _drivable(nz: bool = True):
     p._stage_d2d_bytes = 0
     p._device_key = None
     p._layer = 3
+    p.source = _SubsetSource()
     # _check_subset refuses a source that cannot gather part of a chunk; that
     # refusal is part of the contract, so the stub has to declare it can.
     import types
@@ -375,3 +376,79 @@ def test_slot_for_on_a_MIXED_chunk_streams_only_the_rest_and_fills_the_residents
     assert p.filled == [(ids, (1, 3), 4)]
     assert p._device_key == (3, 3, ids, (0, 2))
     assert p._stage_mixed_chunks == 1 and p._stage_full_chunks == 0
+
+
+# -- prefetch must agree with slot_for about the key ----------------------
+#
+# 🔴 THE TRAP THIS GUARDS. `prefetch` and `slot_for` each decide which slots the
+# HOST is responsible for. Under `set_resident` that is only the STREAMED
+# positions, and the answer goes into the buffer's KEY. If prefetch computed the
+# key for the whole chunk while slot_for computed it for the streamed subset,
+# every prefetch would be a miss: slot_for would ignore the buffer and gather
+# again, and the gather prefetch had already paid for would be the FULL chunk --
+# so wiring the lookahead on (2026-11-18) would have silently undone
+# stream_resident_from_hbm's 26% saving and added a wasted pass. The fix is that
+# prefetch derives the subset itself, exactly as slot_for does; these tests are
+# the reason it must stay that way.
+
+class _SubsetSource:
+    """Only the flag `_check_subset` consults: can this source gather a subset?"""
+
+    supports_subset_gather = True
+
+
+def _key_from_prefetch(p, chunk_index, ids):
+    """The key `prefetch` would build, without starting a gather."""
+    stream_pos, res_pos = p._split_chunk(ids)
+    if res_pos:
+        sub = p._check_subset(chunk_index, ids, stream_pos) if stream_pos else ()
+    else:
+        sub = p._check_subset(chunk_index, ids, None)
+    return p._key(chunk_index, ids, sub)
+
+
+def _key_from_slot_for(p, chunk_index, ids):
+    """The key `slot_for` builds, by the same lines it uses."""
+    stream_pos, res_pos = p._split_chunk(ids)
+    if res_pos:
+        sub = p._check_subset(chunk_index, ids, stream_pos) if stream_pos else ()
+    else:
+        sub = p._check_subset(chunk_index, ids, None)
+    return p._key(chunk_index, ids, sub)
+
+
+def test_prefetch_and_slot_for_agree_with_no_residency():
+    p = _prov()
+    p._layer = 3
+    p.source = _SubsetSource()
+    assert _key_from_prefetch(p, 1, (0, 1, 2, 3)) == _key_from_slot_for(p, 1, (0, 1, 2, 3))
+
+
+def test_prefetch_derives_the_streamed_subset_not_the_whole_chunk():
+    """The regression: with two of four experts resident, the key must name the
+    two STREAMED positions, not None ("all of it")."""
+    p = _prov()
+    p._layer = 3
+    p.source = _SubsetSource()
+    p.set_resident(_Resident(2), [-1, 0, -1, 1])   # logical 1 and 3 are resident
+    ids = (0, 1, 2, 3)
+    stream_pos, res_pos = p._split_chunk(ids)
+    assert (stream_pos, res_pos) == ((0, 2), (1, 3))
+    key = _key_from_prefetch(p, 1, ids)
+    assert key == _key_from_slot_for(p, 1, ids)
+    assert key[3] == (0, 2), f"the key must carry the streamed subset, got {key[3]!r}"
+    assert key != p._key(1, ids, None), "the whole-chunk key would be a prefetch miss"
+
+
+def test_prefetch_declines_a_fully_resident_chunk():
+    """`sub == ()` means the host fills nothing: there is no gather to start."""
+    p = _prov()
+    p._layer = 3
+    p.source = _SubsetSource()
+    p.set_resident(_Resident(4), [0, 1, 2, 3])      # all four are resident
+    ids = (0, 1, 2, 3)
+    assert p._split_chunk(ids) == ((), (0, 1, 2, 3))
+    stream_pos, res_pos = p._split_chunk(ids)
+    sub = p._check_subset(1, ids, stream_pos) if stream_pos else ()
+    assert sub == (), "a fully resident chunk must come out as the empty subset"
+    assert StreamSlotProvider.prefetch(p, 1, ids) is False

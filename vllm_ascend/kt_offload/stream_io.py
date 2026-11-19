@@ -880,7 +880,30 @@ class StreamSlotProvider:
         ids = tuple(int(e) for e in expert_ids)
         if not ids:
             raise ZeroCoverageError(f"chunk {chunk_index}: nothing to prefetch")
-        key = self._key(chunk_index, ids, self._check_subset(chunk_index, ids, only_slots))
+        # 🔴 THE KEY MUST BE THE ONE `slot_for` WILL COMPUTE, so the subset is
+        # derived here exactly as it is there (lines above in `slot_for`) rather
+        # than taken from the caller. Under `set_resident` the host is
+        # responsible only for the STREAMED positions, so a prefetch that asked
+        # for the whole chunk would build a DIFFERENT key: `slot_for` would then
+        # ignore the prefetched buffer and gather again, and the gather it did
+        # would be the full chunk -- undoing stream_resident_from_hbm's 26% and
+        # paying for a wasted pass on top. The caller must not have to know
+        # about residency; this is the only place that can get it right.
+        stream_pos, res_pos = self._split_chunk(ids)
+        if res_pos and only_slots is not None:
+            raise StreamIOError(
+                f"chunk {chunk_index}: only_slots was given AND {len(res_pos)} of its experts are "
+                "bound as resident; prefetch cannot answer 'which slots does the host fill' twice "
+                "either")
+        if res_pos:
+            sub = self._check_subset(chunk_index, ids, stream_pos) if stream_pos else ()
+        else:
+            sub = self._check_subset(chunk_index, ids, only_slots)
+        if sub == ():
+            # Fully resident: the host fills nothing, so there is nothing to
+            # start in the background. `slot_for` will serve it from HBM.
+            return False
+        key = self._key(chunk_index, ids, sub)
         with self._lock:
             if any(h.key == key or h.pending == key for h in self._host):
                 return False
