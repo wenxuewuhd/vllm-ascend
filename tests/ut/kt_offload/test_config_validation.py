@@ -6,6 +6,7 @@ interpret rather than an error.
 
 import pytest
 
+
 # dynamic_resident needs kt to actually hold every expert's CPU weights; a kt
 # build without KT_FULLSET_LOAD ignores the export, silently, and reads "no gain"
 def _dyn_cfg(**kw):
@@ -103,6 +104,12 @@ def _with_kt_ext(monkeypatch, tmp_path, blob: bytes | None):
     pkg = types.ModuleType("kt_kernel")
     pkg.__file__ = str(pkg_dir / "__init__.py")
     monkeypatch.setitem(sys.modules, "kt_kernel", pkg)
+    # The string probe describes the AMX backend. AVX2 has its own refusal,
+    # even when an extension happens to contain AMX switch strings as well.
+    utils = types.ModuleType("kt_kernel.utils")
+    backend = type("AMXFP4_KGroup_MOE", (), {})
+    utils.amx = types.SimpleNamespace(_select_mxfp4_backend=lambda: backend)
+    monkeypatch.setitem(sys.modules, "kt_kernel.utils", utils)
 
 
 # Padding around the names so a match cannot come from the test's own framing.

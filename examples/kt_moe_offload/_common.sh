@@ -1,4 +1,4 @@
-# Shared environment for both launch scripts. Sourced, not executed.
+# Shared environment for the launch scripts. Sourced, not executed.
 # Every line here prevents a specific failure; the comment says which. None is
 # a tuning knob -- the two scripts differ only in the serve arguments below.
 
@@ -68,7 +68,8 @@ export TMPDIR="${TMPDIR:-/dev/shm}"
 # expert has no CPU buffer to be demoted into: the policy has zero free slots
 # and the swap-in becomes a silent no-op -- a run that reads exactly like
 # "the heat said no change". Both profiles set it because every measurement
-# quoted in these scripts was taken with it set.
+# quoted in these scripts was taken with it set. AVX2 requires the native
+# full-set-load patch; serve_avx2.sh keeps streaming/dynamic but uses copies.
 export KT_FULLSET_LOAD=1
 
 # 🔴 Graph mode, not eager. Decode is ~3.5x slower with --enforce-eager

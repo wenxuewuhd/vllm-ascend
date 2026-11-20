@@ -210,6 +210,15 @@ class KTOffloadConfig:
                 "kt_offload_config.zerocopy_w13: kt_kernel is not importable "
                 f"({type(exc).__name__}: {exc}), so whether this build supports zero-copy "
                 "weights cannot be established.") from exc
+        from kt_kernel.utils import amx
+
+        backend = amx._select_mxfp4_backend() if self.method == "MXFP4" else None
+        if backend is not None and backend is getattr(amx, "AVX2MXFP4_MOE", None):
+            raise ValueError(
+                "kt_offload_config.zerocopy_w13: AVX2MXFP4_MOE owns packed weights and FP32 scales; "
+                "the AMX/AVX512 checkpoint zero-copy layout is unsupported. Set zerocopy_w13=false "
+                "or use examples/kt_moe_offload/serve_avx2.sh. Streaming and dynamic residency can "
+                "use the copy path with the AVX2 full-set-load patch.")
         import glob
         import os
         pkg = os.path.dirname(getattr(kt_kernel, "__file__", "") or "")
@@ -275,6 +284,14 @@ class KTOffloadConfig:
                 "subset (amx.py:_cpu_expert_subset_enabled) a resident expert has no CPU BufferB, so "
                 "it cannot be demoted, the policy has zero free slots and the fold is a silent no-op "
                 ".")
+        select = getattr(amx, "_select_mxfp4_backend", None)
+        backend = select() if select is not None and self.method == "MXFP4" else None
+        if backend is not None and backend is getattr(amx, "AVX2MXFP4_MOE", None):
+            capabilities = getattr(amx, "mxfp4_backend_capabilities", None)
+            if capabilities is None or not capabilities()["fullset_load"]:
+                raise ValueError(
+                    "kt_offload_config.dynamic_resident: AVX2 requires native full-set-load support. "
+                    "Apply the AVX2 residency patch and rebuild kt-kernel before enabling demotion.")
 
     def _refuse_batched_dynamic_resident(self, vllm_config: Any) -> None:
         """``dynamic_resident`` runs at ``max_num_seqs == 1``, and nowhere else.
