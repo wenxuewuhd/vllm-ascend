@@ -44,9 +44,9 @@ is the exact failure the whole path is built to refuse (``config.py``
 from __future__ import annotations
 
 from dataclasses import dataclass
-import torch
 from typing import Any
 
+import torch
 from vllm.logger import logger
 
 from vllm_ascend.kt_offload.layer import (
@@ -64,7 +64,6 @@ from vllm_ascend.kt_offload.numa_placement import (
 )
 from vllm_ascend.kt_offload.stream_io import StreamSlotProvider
 from vllm_ascend.kt_offload.weight_source import WeightSource
-
 
 #: Diagnostic allocations kept alive for the process lifetime (debug_hold_hbm_bytes).
 _DEBUG_HBM_HOLDS: list = []
@@ -90,7 +89,8 @@ def _agreed(offloads: dict[int, KTLayerOffload], what: str, get) -> Any:
     if len(distinct) != 1:
         raise RuntimeError(
             f"kt_offload: the MoE layers disagree on {what}: {seen}. One streaming provider serves every "
-            "layer, so there is no way to honour a per-layer value.")
+            "layer, so there is no way to honour a per-layer value."
+        )
     return distinct.pop()
 
 
@@ -115,7 +115,8 @@ def _refuse_streamable_capture_size(offloads: dict[int, KTLayerOffload], min_tok
                 f"stream_prefill_min_tokens={min_tokens}, so an eager forward of that many tokens would try "
                 "to stream a size that is also captured (stream_prefill.assert_eager_only refuses it mid-"
                 "serve). Raise stream_prefill_min_tokens above the largest captured size, or drop that size "
-                "from the capture list.")
+                "from the capture list."
+            )
 
 
 def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> StreamingWiring | None:
@@ -151,7 +152,8 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
         # into and there is no path that makes an expert resident.
         raise RuntimeError(
             "kt_offload: dynamic_resident without stream_prefill; the swap-in is folded into the streaming "
-            "pass and there is nothing to fold into.")
+            "pass and there is nothing to fold into."
+        )
 
     offloads = offload_layers_to_install(layers, what="stream")
     # Both boundaries, before a single byte is allocated. The CALLER's config is
@@ -163,7 +165,8 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
             f"kt_offload: the KV cache has already been sized ({blocks} blocks) in the config handed to "
             "setup_streaming, so the profile run is over. The streaming slot and the fold's ND staging are "
             "allocated here and would come out of memory vLLM has already promised to the KV cache "
-            "; wire the streaming path before the profile run, from NPUWorker.load_model.")
+            "; wire the streaming path before the profile run, from NPUWorker.load_model."
+        )
     refuse_after_kv_profile(offloads, "The streaming slot and the fold's ND staging are allocated here and")
     _refuse_streamable_capture_size(offloads, int(cfg.stream_prefill_min_tokens))
 
@@ -172,19 +175,18 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
     # KTLayerOffload.__init__ already read them from
     # ``model_config.hf_text_config``; reading them again would be a second
     # source of truth for the shapes the cast depends on.
-    weight_path = _agreed(offloads, "the checkpoint kt reads (cfg.weight_path or model_config.model)",
-                          lambda rt: rt.weight_path)
+    weight_path = _agreed(
+        offloads, "the checkpoint kt reads (cfg.weight_path or model_config.model)", lambda rt: rt.weight_path
+    )
     hidden_size = _agreed(offloads, "hidden_size", lambda rt: int(rt.hidden_size))
     intermediate_size = _agreed(offloads, "moe_intermediate_size", lambda rt: int(rt.intermediate_size))
     num_experts = _agreed(offloads, "the routed expert count", lambda rt: int(rt.placement.num_experts))
-    device = _agreed(offloads, "the device their weights live on",
-                     lambda rt: KTLayerOffload._device_of(rt._module))
+    device = _agreed(offloads, "the device their weights live on", lambda rt: KTLayerOffload._device_of(rt._module))
     # The cast is the layer's own post-load hook. ``stream_io.default_post_load``
     # unwraps kt's patch (``_kt_offload_original``): handing it the patched
     # wrapper would rebind the live tables of whichever layer is in flight and
     # reload that layer's entire CPU half.
-    _agreed(offloads, "the quant method class of their MoE weights",
-            lambda rt: type(rt._module.quant_method).__name__)
+    _agreed(offloads, "the quant method class of their MoE weights", lambda rt: type(rt._module.quant_method).__name__)
     first = offloads[min(offloads)]
     quant_method = first._module.quant_method
 
@@ -199,7 +201,8 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
             f"divide the layer's {num_experts} experts: the last chunk of every layer would be short "
             f"({num_experts % int(cfg.stream_prefill_chunk_experts)} of the slot's "
             f"{cfg.stream_prefill_chunk_experts}), and the post-load cast of a slot that is only partly "
-            "filled has no on-card reading. Pick a divisor of the expert count.")
+            "filled has no on-card reading. Pick a divisor of the expert count."
+        )
 
     # Stage 2: the bank replaces the checkpoint as the source of streamed
     # chunks. Chosen HERE because the provider's device side must agree with it:
@@ -207,6 +210,7 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
     bank_dir = str(getattr(cfg, "bank_dir", "") or "")
     if bank_dir:
         from vllm_ascend.kt_offload.bank_source import BankSource
+
         # 🔴 EXPLICIT thread count. BankSource's own default is
         # MIN_LOADER_THREADS (4) while the checkpoint arm below gets
         # weight_source.DEFAULT_COPY_THREADS (8), so leaving it out quietly
@@ -241,6 +245,7 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
     # Diagnostics (both default off), set up before anything is installed so
     # that an OFF arm can be made to carry the same allocation as an ON arm.
     from vllm_ascend.kt_offload import stream_chain as _sc
+
     _sc.set_chunk_timing(bool(getattr(cfg, "debug_time_chunks", False)))
     _dummy_hbm = None
     _hold = int(getattr(cfg, "debug_hold_hbm_bytes", 0) or 0)
@@ -251,8 +256,11 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
         # present in every ON arm of both campaigns, and fragmentation is not
         # headroom. This separates "holding it" from "using it".
         _dummy_hbm = torch.empty(_hold, dtype=torch.uint8, device=device)
-        logger.info("kt_offload: DIAGNOSTIC holding %d B (%.3f GiB) of HBM for the process lifetime",
-                    _hold, _hold / float(1 << 30))
+        logger.info(
+            "kt_offload: DIAGNOSTIC holding %d B (%.3f GiB) of HBM for the process lifetime",
+            _hold,
+            _hold / float(1 << 30),
+        )
 
     # Stage 1 (default off): accumulate every chunk's cast output into ONE
     # whole-layer NZ buffer instead of dropping it. The wrap MUST happen here
@@ -267,12 +275,12 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
     # close, so everything downstream keeps working unchanged.
     if bool(getattr(cfg, "stream_layer_buffer", False)):
         from vllm_ascend.kt_offload import stream_layer
+
         provider = stream_layer.install_layer_buffer(
             provider,
             sync_scope=str(getattr(cfg, "stream_layer_sync_scope", "device")),
             num_experts=num_experts,
-            probe_bytes=int(getattr(cfg, "stream_layer_probe_bytes",
-                                    stream_layer.DEFAULT_PROBE_BYTES)),
+            probe_bytes=int(getattr(cfg, "stream_layer_probe_bytes", stream_layer.DEFAULT_PROBE_BYTES)),
         )
 
     fold = None
@@ -291,9 +299,13 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
     logger.info(
         "kt_offload: streaming prefill wired on layers %s -- one provider (%d experts/chunk, %d B/expert, "
         "%.3f GiB of pinned staging) reading %s; folded swap-in %s",
-        sorted(offloads), provider.chunk_experts, provider.bytes_per_expert,
-        provider.coverage.pinned_bytes / float(1 << 30), weight_path,
-        "installed" if fold is not None else "off (dynamic_resident=false)")
+        sorted(offloads),
+        provider.chunk_experts,
+        provider.bytes_per_expert,
+        provider.coverage.pinned_bytes / float(1 << 30),
+        weight_path,
+        "installed" if fold is not None else "off (dynamic_resident=false)",
+    )
     if _dummy_hbm is not None:
         # StreamingWiring is frozen, and a local would be freed on return -- the
         # diagnostic would then silently measure nothing. Hold a module-level
@@ -315,7 +327,6 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
 
         drop_checkpoint_expert_cache(weight_path)
     return StreamingWiring(provider=provider, fold=fold, layers=tuple(sorted(offloads)))
-
 
 
 def setup_placement(vllm_config, *, ascend_config=None, layers=None, experts=None):
@@ -365,8 +376,9 @@ def setup_placement(vllm_config, *, ascend_config=None, layers=None, experts=Non
         # w2 and the scales have one consumer (streaming prefill) and are not
         # split, so they go wherever there is room -- measured, not assumed.
         mem = read_node_memory(part_nodes)
-        streaming_node = max(part_nodes, key=lambda n: mem[n].available(
-            int(float(cfg.zerocopy_reserve_gib) * (1 << 30))))
+        streaming_node = max(
+            part_nodes, key=lambda n: mem[n].available(int(float(cfg.zerocopy_reserve_gib) * (1 << 30)))
+        )
         streaming_source = "derived"
     else:
         streaming_node = int(streaming_node)
@@ -391,24 +403,40 @@ def setup_placement(vllm_config, *, ascend_config=None, layers=None, experts=Non
         # WeightSource's own default expert count: KTOffloadConfig has no such
         # field (num_resident_experts is a different number).
         source = WeightSource(weight_path)
-    layer_ids = list(layers) if layers is not None else list(
-        range(int(vllm_config.model_config.hf_text_config.num_hidden_layers)))
+    layer_ids = (
+        list(layers)
+        if layers is not None
+        else list(range(int(vllm_config.model_config.hf_text_config.num_hidden_layers)))
+    )
     n_experts = kt_bank.num_experts if kt_bank is not None else source.num_experts
     expert_ids = list(experts) if experts is not None else list(range(n_experts))
 
     logger.info(
-        "kt_offload: placing %d layer(s) x %d experts of %s -- fraction=%s (%s), "
-        "part_nodes=%s, streaming_node=%d (%s)",
-        len(layer_ids), len(expert_ids),
-        (f"the NZ BANK {cfg.bank_dir} (w13 per part + w2 per part)" if kt_bank is not None
-         else f"the checkpoint {weight_path} (w13 per part, w2 streaming-only)"),
+        "kt_offload: placing %d layer(s) x %d experts of %s -- fraction=%s (%s), part_nodes=%s, streaming_node=%d (%s)",
+        len(layer_ids),
+        len(expert_ids),
+        (
+            f"the NZ BANK {cfg.bank_dir} (w13 per part + w2 per part)"
+            if kt_bank is not None
+            else f"the checkpoint {weight_path} (w13 per part, w2 streaming-only)"
+        ),
         [round(f, 4) for f in fraction],
-        source_kind, part_nodes, streaming_node, streaming_source)
+        source_kind,
+        part_nodes,
+        streaming_node,
+        streaming_source,
+    )
     try:
         plan, report = place_weights(
-            source, layer_ids, expert_ids, tp=tp, part_nodes=part_nodes,
-            streaming_node=streaming_node, fraction=fraction,
-            fraction_source=source_kind, reserve_gib=float(cfg.zerocopy_reserve_gib),
+            source,
+            layer_ids,
+            expert_ids,
+            tp=tp,
+            part_nodes=part_nodes,
+            streaming_node=streaming_node,
+            fraction=fraction,
+            fraction_source=source_kind,
+            reserve_gib=float(cfg.zerocopy_reserve_gib),
         )
     finally:
         # The bank source's own mmaps are not opened by placement (it only
@@ -424,7 +452,8 @@ def setup_placement(vllm_config, *, ascend_config=None, layers=None, experts=Non
             f"kt_offload: zerocopy_w13 is on but the placement planned 0 pages over "
             f"{len(layer_ids)} layer(s) and {len(expert_ids)} expert(s) of {weight_path}. "
             "The switch reached nothing, so the run is the copy path with a zero-copy label "
-            "on it.")
+            "on it."
+        )
     # The start-up self-report: every number an operator needs to tell "it
     # worked" from "it ran". fault_seconds is the disk read, i.e. the start-up
     # cost.
@@ -434,7 +463,8 @@ def setup_placement(vllm_config, *, ascend_config=None, layers=None, experts=Non
             "kt_offload: the placement changed nothing (needed_move=0, faulted_in=0). Every "
             "page was already where it should be, which is possible on a second start-up -- "
             "but this run is NOT evidence that placement is working, and it cannot be an arm "
-            "of an A/B.")
+            "of an A/B."
+        )
     return plan, report
 
 
@@ -450,10 +480,10 @@ def _assert_installed(offloads: dict[int, KTLayerOffload], provider, fold, *, dy
         if rt._stream_provider is not provider:
             raise RuntimeError(
                 f"kt_offload: layer {idx} did not take the streaming provider; the fold reads its chunks out "
-                "of the object that served them, so every layer must hold the same one")
+                "of the object that served them, so every layer must hold the same one"
+            )
         if rt._stream_slot_provider != provider.slot_for:
-            raise RuntimeError(
-                f"kt_offload: layer {idx}'s slot callback is not this provider's slot_for")
+            raise RuntimeError(f"kt_offload: layer {idx}'s slot callback is not this provider's slot_for")
         if dynamic and fold is not None and fold.stream_min_tokens != int(rt.cfg.stream_prefill_min_tokens):
             # Read back off the layer that applies the gate, not off the number
             # we passed down. The fold commits on the last forward that will
@@ -464,14 +494,15 @@ def _assert_installed(offloads: dict[int, KTLayerOffload], provider, fold, *, dy
             raise RuntimeError(
                 f"kt_offload: layer {idx} streams at >= {rt.cfg.stream_prefill_min_tokens} tokens but the "
                 f"folded swap-in was built for {fold.stream_min_tokens}; they are the same number or the "
-                "fold commits on a forward that never streams")
+                "fold commits on a forward that never streams"
+            )
         if dynamic and rt._resident_fold is not fold:
             raise RuntimeError(
                 f"kt_offload: layer {idx} did not take the folded swap-in; dynamic_resident is on and "
-                "_fold_for_this_forward would refuse this layer on the first streamed prefill")
+                "_fold_for_this_forward would refuse this layer on the first streamed prefill"
+            )
         if not dynamic and rt._resident_fold is not None:
-            raise RuntimeError(
-                f"kt_offload: layer {idx} carries a folded swap-in although dynamic_resident is off")
+            raise RuntimeError(f"kt_offload: layer {idx} carries a folded swap-in although dynamic_resident is off")
 
 
 __all__ = ["StreamingWiring", "setup_streaming", "setup_placement"]

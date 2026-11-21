@@ -198,9 +198,14 @@ class _Scratch:
 
     @classmethod
     def of(cls, size: int) -> _Scratch:
-        return cls(np.empty(size, dtype=np.int64), np.empty(size, dtype=np.intp),
-                   np.empty(size, dtype=np.intp), np.empty(size, dtype=np.uint8),
-                   np.empty(size, dtype=np.uint8), np.empty(size, dtype=np.uint8))
+        return cls(
+            np.empty(size, dtype=np.int64),
+            np.empty(size, dtype=np.intp),
+            np.empty(size, dtype=np.intp),
+            np.empty(size, dtype=np.uint8),
+            np.empty(size, dtype=np.uint8),
+            np.empty(size, dtype=np.uint8),
+        )
 
 
 @dataclass(frozen=True)
@@ -218,8 +223,7 @@ class _Content:
     @classmethod
     def for_size(cls, total: int, salt: int = 0) -> _Content:
         blocks = -(-total // _CONTENT_BLOCK)
-        return cls(_mix_bytes(_CONTENT_BLOCK, salt),
-                   _mix_bytes(blocks, salt + _CONTENT_HIGH_SALT))
+        return cls(_mix_bytes(_CONTENT_BLOCK, salt), _mix_bytes(blocks, salt + _CONTENT_HIGH_SALT))
 
     def at(self, offsets: np.ndarray) -> np.ndarray:
         """Content bytes at arbitrary ND offsets -- the whole point of the split.
@@ -342,7 +346,7 @@ def storage_ptr(t: Any) -> int:
     storage = t.untyped_storage()
     try:
         return int(storage.data_ptr())
-    except Exception:                                        # noqa: BLE001 - internal format refuses metadata
+    except Exception:  # noqa: BLE001 - internal format refuses metadata
         return int(t.data_ptr())
 
 
@@ -382,8 +386,9 @@ class Case:
         return (self.num_experts, self.N, self.Kb)
 
 
-def selfcheck_cases(num_experts: int = SELFCHECK_EXPERTS, hidden: int = SELFCHECK_HIDDEN,
-                    intermediate: int = SELFCHECK_INTERMEDIATE) -> list[Case]:
+def selfcheck_cases(
+    num_experts: int = SELFCHECK_EXPERTS, hidden: int = SELFCHECK_HIDDEN, intermediate: int = SELFCHECK_INTERMEDIATE
+) -> list[Case]:
     """w13 and w2, derived the way production derives them.
 
     ``w13`` is ``[E, 2*intermediate, hidden/2]`` and ``w2`` is
@@ -406,7 +411,8 @@ def selfcheck_cases(num_experts: int = SELFCHECK_EXPERTS, hidden: int = SELFCHEC
             raise ValueError(
                 f"nz self-check case {c.name}: Kb={c.Kb} is not a multiple of C0={NZ_C0}. The "
                 f"shapes must keep that property (hidden % {2 * NZ_C0} == 0 and "
-                f"intermediate % {2 * NZ_C0} == 0); got hidden={hidden}, intermediate={intermediate}.")
+                f"intermediate % {2 * NZ_C0} == 0); got hidden={hidden}, intermediate={intermediate}."
+            )
         if c.N % NZ_C0:
             raise ValueError(f"nz self-check case {c.name}: N={c.N} is not a multiple of {NZ_C0}.")
     return cases
@@ -446,9 +452,12 @@ def production_cast(nd: Any) -> Any:
     """
     import torch_npu  # noqa: PLC0415 - lazy: registers torch.npu, absent off-card
 
-    return torch_npu.npu_format_cast(nd.view(torch.uint8), NZ_CAST_FORMAT,
-                                     customize_dtype=torch.float8_e4m3fn,
-                                     input_dtype=torch_npu.float4_e2m1fn_x2)
+    return torch_npu.npu_format_cast(
+        nd.view(torch.uint8),
+        NZ_CAST_FORMAT,
+        customize_dtype=torch.float8_e4m3fn,
+        input_dtype=torch_npu.float4_e2m1fn_x2,
+    )
 
 
 def _npu_format(t: Any) -> int | None:
@@ -462,7 +471,7 @@ def _npu_format(t: Any) -> int | None:
         import torch_npu  # noqa: PLC0415 - lazy, as above
 
         return int(torch_npu.get_npu_format(t))
-    except Exception:                                        # noqa: BLE001 - internal format refuses metadata
+    except Exception:  # noqa: BLE001 - internal format refuses metadata
         return None
 
 
@@ -538,9 +547,9 @@ class _Mismatch:
     total: int
 
 
-def _compare_nz(out: Any, case: Case, content: _Content,
-                permute: Callable[..., np.ndarray] | None,
-                *, chunked: bool = False) -> _Mismatch | None:
+def _compare_nz(
+    out: Any, case: Case, content: _Content, permute: Callable[..., np.ndarray] | None, *, chunked: bool = False
+) -> _Mismatch | None:
     """Compare every NZ byte of ``out`` against the formula.
 
     Two implementations, same verdict and same reported numbers (checked by
@@ -563,8 +572,9 @@ def _compare_nz(out: Any, case: Case, content: _Content,
     return _Mismatch(first, int(want[first]), int(got[first]), int(diff.size))
 
 
-def _compare_chunked(out: Any, case: Case, content: _Content,
-                     permute: Callable[..., np.ndarray] | None) -> _Mismatch | None:
+def _compare_chunked(
+    out: Any, case: Case, content: _Content, permute: Callable[..., np.ndarray] | None
+) -> _Mismatch | None:
     """Compare every NZ byte against the formula, one gidx slice at a time.
 
     A gidx slice is ``buf[e][g]``: ``N * C0`` bytes, contiguous in the NZ buffer
@@ -603,8 +613,7 @@ def _compare_chunked(out: Any, case: Case, content: _Content,
     # ND linear offset of each byte of a slice, relative to the expert and to
     # g*c0: byte (n, r) of slice (e, g) came from ND (e, n, g*c0 + r), i.e.
     # e*per_expert + n*Kb + g*c0 + r. This is nz_offset inverted.
-    base = (np.arange(case.N, dtype=np.int64)[:, None] * case.Kb
-            + np.arange(c0, dtype=np.int64)[None, :]).reshape(-1)
+    base = (np.arange(case.N, dtype=np.int64)[:, None] * case.Kb + np.arange(c0, dtype=np.int64)[None, :]).reshape(-1)
 
     expect_whole = None
     if permute is not None:
@@ -622,7 +631,7 @@ def _compare_chunked(out: Any, case: Case, content: _Content,
             if expect_whole is None:
                 want = content.at_into(base, e * per_expert + g * c0, scratch)
             else:
-                want = expect_whole[off:off + slice_bytes]
+                want = expect_whole[off : off + slice_bytes]
             if np.array_equal(got, want):
                 continue
             diff = np.flatnonzero(got != want)
@@ -706,7 +715,8 @@ def verify_nz_geometry(
     if missing:
         raise ValueError(
             f"the NZ self-check must cover both production shapes; no case for {missing}. "
-            "A check that only exercises w13 cannot see a geometry change that depends on Kb.")
+            "A check that only exercises w13 cannot see a geometry change that depends on Kb."
+        )
     if device is None:
         device = torch.device("npu", torch.npu.current_device())
 
@@ -730,16 +740,15 @@ def verify_nz_geometry(
         if (2 * c.Kb) % group_size or k_scale % 2:
             raise ValueError(
                 f"nz self-check case {c.name}: K_fp4={2 * c.Kb} gives {k_scale} scale columns for "
-                f"group_size={group_size}; the production hook needs a whole, even number of them.")
-        tensors[f"{param}_scale"] = torch.full((c.num_experts, c.N, k_scale), 127,
-                                               dtype=torch.uint8, device=device)
+                f"group_size={group_size}; the production hook needs a whole, even number of them."
+            )
+        tensors[f"{param}_scale"] = torch.full((c.num_experts, c.N, k_scale), 127, dtype=torch.uint8, device=device)
 
     module = _SelfCheckModule(**tensors)
     runner(module, quant_method)
     torch.npu.synchronize()
 
-    report: dict[str, Any] = {"cases": [], "group_size": group_size,
-                              "path": "chunked" if chunked else "whole"}
+    report: dict[str, Any] = {"cases": [], "group_size": group_size, "path": "chunked" if chunked else "whole"}
     for c in cases:
         out = getattr(module, c.param).data
         want_bytes = nz_storage_bytes(c.num_experts, c.N, c.Kb)
@@ -751,7 +760,8 @@ def verify_nz_geometry(
                 f"expected E*N*Kb = {want_bytes} B (npu_format={fmt}). The layout is no longer the dense, "
                 f"unpadded buffer this version assumes -- it looks padded or re-tiled.\n"
                 "CANN 的 NZ 几何与本版本假设不符，拒绝启动。 "
-                "(CANN's NZ geometry does not match this build's assumption; refusing to start.)")
+                "(CANN's NZ geometry does not match this build's assumption; refusing to start.)"
+            )
         bad = _compare_nz(out, c, content[c.name], permute, chunked=chunked)
         if bad is not None:
             e, rest = divmod(bad.first, c.N * c.Kb)
@@ -769,12 +779,20 @@ def verify_nz_geometry(
                 "CANN 的 NZ 几何与本版本假设不符，拒绝启动。 "
                 "(CANN's NZ geometry does not match this build's assumption; refusing to start. "
                 "The CPU MoE kernel reads these same bytes, so continuing would not raise -- it would "
-                "compute wrong numbers.)")
-        report["cases"].append({
-            "name": c.name, "param": c.param, "nd_shape": c.shape,
-            "bytes": want_bytes, "gidx": c.Kb // NZ_C0, "npu_format": fmt,
-            "slices": c.num_experts * (c.Kb // NZ_C0), "slice_bytes": c.N * NZ_C0,
-        })
+                "compute wrong numbers.)"
+            )
+        report["cases"].append(
+            {
+                "name": c.name,
+                "param": c.param,
+                "nd_shape": c.shape,
+                "bytes": want_bytes,
+                "gidx": c.Kb // NZ_C0,
+                "npu_format": fmt,
+                "slices": c.num_experts * (c.Kb // NZ_C0),
+                "slice_bytes": c.N * NZ_C0,
+            }
+        )
         del out
         content.pop(c.name, None)
 
@@ -838,16 +856,26 @@ def log_pass(report: Mapping[str, Any]) -> None:
     """
     cann = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_TOOLKIT_HOME") or "unknown"
     cases = list(report.get("cases") or ())
-    shapes = "; ".join(
-        f"{c.get('name')}({c.get('param')}) nd={tuple(c.get('nd_shape') or ())} "
-        f"gidx={c.get('gidx')} fmt={c.get('npu_format')}" for c in cases) or "none"
+    shapes = (
+        "; ".join(
+            f"{c.get('name')}({c.get('param')}) nd={tuple(c.get('nd_shape') or ())} "
+            f"gidx={c.get('gidx')} fmt={c.get('npu_format')}"
+            for c in cases
+        )
+        or "none"
+    )
     logger.info(
         "kt_offload nz_geometry: PASS -- FRACTAL_NZ byte geometry matches the assumed "
         "dst = e*(N*Kb) + (kb//16)*(N*16) + n*16 + (kb%%16). %d case(s) compared "
         "byte-for-byte over %d B, C0=%s, %.1f ms; %s; hook asks format %s; cann=%s",
-        len(cases), int(report.get("total_bytes") or 0), report.get("c0"),
-        float(report.get("elapsed_ms") or 0.0), shapes, NZ_CAST_FORMAT,
-        os.path.basename(str(cann)))
+        len(cases),
+        int(report.get("total_bytes") or 0),
+        report.get("c0"),
+        float(report.get("elapsed_ms") or 0.0),
+        shapes,
+        NZ_CAST_FORMAT,
+        os.path.basename(str(cann)),
+    )
 
 
 def check_enabled(cfg: Any) -> bool:

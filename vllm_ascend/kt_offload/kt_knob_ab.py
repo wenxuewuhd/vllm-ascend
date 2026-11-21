@@ -124,7 +124,8 @@ def apply(values: dict[str, object], ext=None) -> dict[str, object]:
         if fn is None:
             raise RuntimeError(
                 f"this kt build has no {setter}: the runtime knob is not in the LIVE binary "
-                "(measure/kt_rebuild.sh rebuilds and verifies it)")
+                "(measure/kt_rebuild.sh rebuilds and verifies it)"
+            )
         fn(val)
         reader = getattr(ext, key, None)
         got[key] = reader() if reader is not None else val
@@ -139,7 +140,7 @@ def _watch(path: str, interval: float, stop: threading.Event) -> None:
             sig = (st.st_mtime_ns, st.st_size)
         except FileNotFoundError:
             continue
-        except OSError as exc:                      # pragma: no cover - defensive
+        except OSError as exc:  # pragma: no cover - defensive
             logger.warning("kt_offload knob watcher: stat(%s) failed: %s", path, exc)
             continue
         if sig == last_sig:
@@ -152,11 +153,12 @@ def _watch(path: str, interval: float, stop: threading.Event) -> None:
             if not values:
                 continue
             got = apply(values)
-        except Exception as exc:                    # noqa: BLE001 - must not kill the server
+        except Exception as exc:  # noqa: BLE001 - must not kill the server
             logger.warning("kt_offload knob watcher: %s: %s: %s", path, type(exc).__name__, exc)
             continue
-        logger.info("kt_offload knob watcher: applied %s (kt reports %s) from %s mtime_ns=%d",
-                    values, got, path, sig[0])
+        logger.info(
+            "kt_offload knob watcher: applied %s (kt reports %s) from %s mtime_ns=%d", values, got, path, sig[0]
+        )
 
 
 def start_if_configured(*, interval: float = POLL_SECONDS) -> threading.Thread | None:
@@ -169,12 +171,15 @@ def start_if_configured(*, interval: float = POLL_SECONDS) -> threading.Thread |
         if _thread is not None:
             return _thread
         stop = threading.Event()
-        t = threading.Thread(target=_watch, args=(path, interval, stop),
-                             name="kt-knob-ab", daemon=True)
-        t.stop_event = stop                        # type: ignore[attr-defined]
+        t = threading.Thread(target=_watch, args=(path, interval, stop), name="kt-knob-ab", daemon=True)
+        t.stop_event = stop  # type: ignore[attr-defined]
         _thread = t
         t.start()
-    logger.info("kt_offload knob watcher: 🔴 MEASUREMENT MODE -- watching %s every %.2f s for "
-                "%s. A run with this set is an A/B run; its arms are in this log.",
-                path, interval, sorted(_KNOBS))
+    logger.info(
+        "kt_offload knob watcher: 🔴 MEASUREMENT MODE -- watching %s every %.2f s for "
+        "%s. A run with this set is an A/B run; its arms are in this log.",
+        path,
+        interval,
+        sorted(_KNOBS),
+    )
     return t

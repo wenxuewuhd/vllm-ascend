@@ -96,8 +96,9 @@ def test_window_ops_criterion_accepts_the_side_stream_off_order():
         # shared moved out of the window but still before the merge: correct,
         # yet pointless -- the window is already over
         (
-            lambda ops: [o for o in ops if o[0] not in ("shared",)][:2]
-            + [("join", None), ("shared", "qbmm1"), ("merge", None)],
+            lambda ops: (
+                [o for o in ops if o[0] not in ("shared",)][:2] + [("join", None), ("shared", "qbmm1"), ("merge", None)]
+            ),
             "after the join",
         ),
     ],
@@ -508,8 +509,9 @@ def test_no_other_caller_of_forward_impl_defers():
 
 import contextlib  # noqa: E402
 import inspect  # noqa: E402
-import re  # noqa: E402
 import textwrap  # noqa: E402
+
+import regex as re  # noqa: E402
 
 from vllm_ascend.ops.fused_moe import fused_moe as fm  # noqa: E402
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: E402
@@ -777,5 +779,3 @@ def test_side_stream_off_either_order_is_the_same(monkeypatch, sim):
     _, o_before, t_before = _replays(monkeypatch, sim, overlap=False, shared_before_merge=True)
     assert sso._bits_equal(o_after, o_before)
     assert t_after == pytest.approx(t_before)
-
-

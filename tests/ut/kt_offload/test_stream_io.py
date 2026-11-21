@@ -47,7 +47,7 @@ from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import AscendW4A8MXFPDSDyn
 HIDDEN, INTER, GROUP = 64, 64, 32
 SYN_LAYERS, SYN_EXPERTS = 2, 6
 CHUNK = 3
-RESIDENT_SLOTS = 16          # what a slot mis-sized "like the resident layer" would be
+RESIDENT_SLOTS = 16  # what a slot mis-sized "like the resident layer" would be
 
 # Points at a real checkpoint; the tests that use it skip when it is absent.
 # Override with KT_TEST_CKPT to run them against a checkpoint elsewhere.
@@ -195,8 +195,9 @@ class Recorder:
 
     # 3. H2D
     def h2d(self, dst, src, *, what):
-        self.h2d_calls.append({"what": what, "dst_bytes": int(dst.numel()), "src_bytes": int(src.numel()),
-                               "dst_ptr": dst.data_ptr()})
+        self.h2d_calls.append(
+            {"what": what, "dst_bytes": int(dst.numel()), "src_bytes": int(src.numel()), "dst_ptr": dst.data_ptr()}
+        )
         if self._h2d is not None:
             return self._h2d(dst, src, what=what)
         dst.copy_(src)
@@ -207,24 +208,38 @@ class Recorder:
 
     # 4. the production post-load hook
     def post_load(self, qm, module):
-        self.post_load_calls.append({
-            "quant_method": qm,
-            "module": module,
-            "before": {n: getattr(module, n).data for n in SLOT_WEIGHT_ATTRS},
-        })
+        self.post_load_calls.append(
+            {
+                "quant_method": qm,
+                "module": module,
+                "before": {n: getattr(module, n).data for n in SLOT_WEIGHT_ATTRS},
+            }
+        )
         (self._post_load or cpu_post_load)(qm, module)
 
     def seam(self) -> DeviceSeam:
-        return DeviceSeam(alloc_pinned=self.alloc_pinned, alloc_device=self.alloc_device, h2d=self.h2d,
-                          wait=self.wait, post_load=self.post_load)
+        return DeviceSeam(
+            alloc_pinned=self.alloc_pinned,
+            alloc_device=self.alloc_device,
+            h2d=self.h2d,
+            wait=self.wait,
+            post_load=self.post_load,
+        )
 
 
 def make_provider(ckpt_dir, rec: Recorder | None = None, *, chunk=CHUNK, layer=0, **kw):
     rec = rec or Recorder()
     prov = StreamSlotProvider(
-        WeightSource(ckpt_dir, num_experts=SYN_EXPERTS), quant_method(),
-        hidden_size=HIDDEN, intermediate_size=INTER, chunk_experts=chunk,
-        device="cpu", seam=rec.seam(), layer=layer, **kw)
+        WeightSource(ckpt_dir, num_experts=SYN_EXPERTS),
+        quant_method(),
+        hidden_size=HIDDEN,
+        intermediate_size=INTER,
+        chunk_experts=chunk,
+        device="cpu",
+        seam=rec.seam(),
+        layer=layer,
+        **kw,
+    )
     return prov, rec
 
 
@@ -241,14 +256,29 @@ def test_copy_threads_is_refused_when_it_would_be_ignored(syn_ckpt):
     src = WeightSource(syn_ckpt, num_experts=SYN_EXPERTS, copy_threads=2)
     rec = Recorder()
     with pytest.raises(ValueError, match="contradicts the source"):
-        StreamSlotProvider(src, quant_method(), hidden_size=HIDDEN, intermediate_size=INTER,
-                           chunk_experts=CHUNK, device="cpu", seam=rec.seam(), copy_threads=4)
+        StreamSlotProvider(
+            src,
+            quant_method(),
+            hidden_size=HIDDEN,
+            intermediate_size=INTER,
+            chunk_experts=CHUNK,
+            device="cpu",
+            seam=rec.seam(),
+            copy_threads=4,
+        )
     # Two things that are NOT contradictions: the default (no claim about a
     # source this provider did not build), and the source's own number restated.
     for ct in (stream_io.DEFAULT_SLOT_COPY_THREADS, 2):
-        prov = StreamSlotProvider(src, quant_method(), hidden_size=HIDDEN, intermediate_size=INTER,
-                                  chunk_experts=CHUNK, device="cpu", seam=rec.seam(),
-                                  copy_threads=ct)
+        prov = StreamSlotProvider(
+            src,
+            quant_method(),
+            hidden_size=HIDDEN,
+            intermediate_size=INTER,
+            chunk_experts=CHUNK,
+            device="cpu",
+            seam=rec.seam(),
+            copy_threads=ct,
+        )
         assert prov.source is src and prov.source.copy_threads == 2
 
 
@@ -272,8 +302,9 @@ def test_module_imports_standalone():
     """Under pytest, conftest has already initialised ``vllm_ascend.ops`` before
     any test imports anything, so a module-scope import cycle inside kt_offload is
     invisible here but kills a script on its first import."""
-    r = subprocess.run([sys.executable, "-c", "import vllm_ascend.kt_offload.stream_io"],
-                       capture_output=True, text=True, timeout=300)
+    r = subprocess.run(
+        [sys.executable, "-c", "import vllm_ascend.kt_offload.stream_io"], capture_output=True, text=True, timeout=300
+    )
     assert r.returncode == 0, f"stream_io cannot be imported on its own:\n{r.stderr[-2000:]}"
 
 
@@ -297,9 +328,16 @@ def test_shapes_come_from_the_production_quant_method():
 def test_chunk_dimensions_must_match_the_checkpoint(syn_ckpt):
     """Built for the wrong hidden size => refused, not silently short-copied."""
     rec = Recorder()
-    prov = StreamSlotProvider(WeightSource(syn_ckpt, num_experts=SYN_EXPERTS), quant_method(),
-                              hidden_size=HIDDEN * 2, intermediate_size=INTER, chunk_experts=CHUNK,
-                              device="cpu", seam=rec.seam(), layer=0)
+    prov = StreamSlotProvider(
+        WeightSource(syn_ckpt, num_experts=SYN_EXPERTS),
+        quant_method(),
+        hidden_size=HIDDEN * 2,
+        intermediate_size=INTER,
+        chunk_experts=CHUNK,
+        device="cpu",
+        seam=rec.seam(),
+        layer=0,
+    )
     with pytest.raises(StreamIOError, match="per expert"):
         prov.slot_for(0, (0, 1, 2))
 
@@ -319,7 +357,8 @@ def test_arm_expert_gathered_from_the_wrong_offset(syn_ckpt):
     prov, rec = make_provider(syn_ckpt)
     real_locate = prov.source.locate
     prov.source.locate = lambda layer, expert, proj, kind="weight": real_locate(
-        layer, (expert + 1) % SYN_EXPERTS, proj, kind)
+        layer, (expert + 1) % SYN_EXPERTS, proj, kind
+    )
     experts = (1, 4, 5)
     prov.slot_for(0, experts)
     bad = record_mismatches(rec, syn_ckpt, 0, experts)
@@ -339,9 +378,15 @@ def test_gather_covers_every_layer_the_provider_is_bound_to(syn_ckpt):
 
 def test_layer_must_be_bound_before_a_chunk_is_asked_for(syn_ckpt):
     rec = Recorder()
-    prov = StreamSlotProvider(WeightSource(syn_ckpt, num_experts=SYN_EXPERTS), quant_method(),
-                              hidden_size=HIDDEN, intermediate_size=INTER, chunk_experts=CHUNK,
-                              device="cpu", seam=rec.seam())
+    prov = StreamSlotProvider(
+        WeightSource(syn_ckpt, num_experts=SYN_EXPERTS),
+        quant_method(),
+        hidden_size=HIDDEN,
+        intermediate_size=INTER,
+        chunk_experts=CHUNK,
+        device="cpu",
+        seam=rec.seam(),
+    )
     with pytest.raises(StreamIOError, match="no layer bound"):
         prov.slot_for(0, (0, 1))
 
@@ -383,8 +428,9 @@ def test_h2d_is_issued_per_chunk_with_the_right_sizes(syn_ckpt):
     prov, rec = make_provider(syn_ckpt)
     prov.slot_for(0, (0, 1, 2))
     calls = rec.h2d_calls
-    assert [c["what"] for c in calls] == [PARAM_FOR_GROUP[g] for g, _ in ws.GROUPS], \
+    assert [c["what"] for c in calls] == [PARAM_FOR_GROUP[g] for g, _ in ws.GROUPS], (
         "the copies must follow the staging layout, so the pinned buffer is read front to back"
+    )
     shapes = chunk_param_shapes(quant_method(), CHUNK, INTER, HIDDEN)
     for c in calls:
         want = shapes[c["what"]][0]
@@ -434,7 +480,7 @@ def test_arm_chunk_served_with_the_previous_chunks_bytes(syn_ckpt):
 
     def stale_h2d(dst, src, *, what):
         calls["n"] += 1
-        if calls["n"] > len(SLOT_WEIGHT_ATTRS):   # chunk 0 copies, chunk 1 does not
+        if calls["n"] > len(SLOT_WEIGHT_ATTRS):  # chunk 0 copies, chunk 1 does not
             return ("handle", calls["n"])
         dst.copy_(src)
         return ("handle", calls["n"])
@@ -496,8 +542,9 @@ def test_module_does_not_re_derive_the_cast():
 
     tokens = {"npu_format_cast", "customize_dtype", "float4_e2m1fn_x2", "float8_e8m0fnu"}
     prod_src = inspect.getsource(prod.AscendW4A8MXFPDSDynamicFusedMoEMethod.process_weights_after_loading)
-    assert {t for t in tokens if t in prod_src} >= {"npu_format_cast", "customize_dtype",
-                                                    "float4_e2m1fn_x2"}, "these are not the cast's names"
+    assert {t for t in tokens if t in prod_src} >= {"npu_format_cast", "customize_dtype", "float4_e2m1fn_x2"}, (
+        "these are not the cast's names"
+    )
 
     # AST, not substring: the module docstring *discusses* the cast (it has to --
     # explaining why it delegates), and a text search cannot tell prose from code.
@@ -535,6 +582,7 @@ def test_arm_post_load_hook_skipped(syn_ckpt):
 
 def test_arm_slot_sized_by_the_resident_count(syn_ckpt):
     """MUTATION ARM: a slot sized by the resident expert count."""
+
     def resident_sized(qm, module):
         cpu_post_load(qm, module)
         for name in SLOT_WEIGHT_ATTRS:
@@ -549,6 +597,7 @@ def test_arm_slot_sized_by_the_resident_count(syn_ckpt):
 
 def test_arm_device_buffers_allocated_with_the_wrong_row_count(syn_ckpt):
     """MUTATION ARM: the same mistake one step earlier, at allocation time."""
+
     def resident_alloc(shape, dtype, device):
         return torch.zeros((RESIDENT_SLOTS,) + tuple(shape)[1:], dtype=dtype)
 
@@ -588,8 +637,9 @@ def test_coverage_byte_accounting_is_checked_against_the_expert_count(syn_ckpt):
     assert prov.check_coverage(range(SYN_EXPERTS), layer=0) == []
     # MUTATION ARM: bytes that never reached the device, accounting untouched
     prov.coverage.bytes_to_device -= 1
-    bad = prov.coverage.check([(0, e) for e in range(SYN_EXPERTS)],
-                              bytes_per_expert=prov.bytes_per_expert, strict=False)
+    bad = prov.coverage.check(
+        [(0, e) for e in range(SYN_EXPERTS)], bytes_per_expert=prov.bytes_per_expert, strict=False
+    )
     assert bad and "expert slot(s)" in bad[0]
 
 
@@ -654,16 +704,26 @@ def test_real_checkpoint_chunk_matches_the_safe_open_oracle():
     assert rep.coverage.produced_tensors == len(REAL_EXPERTS) * 3 * 2
 
     rec = Recorder()
-    prov = StreamSlotProvider(src, quant_method(), hidden_size=REAL_HIDDEN, intermediate_size=REAL_INTER,
-                              chunk_experts=len(REAL_EXPERTS), device="cpu", seam=rec.seam(), layer=REAL_LAYER)
+    prov = StreamSlotProvider(
+        src,
+        quant_method(),
+        hidden_size=REAL_HIDDEN,
+        intermediate_size=REAL_INTER,
+        chunk_experts=len(REAL_EXPERTS),
+        device="cpu",
+        seam=rec.seam(),
+        layer=REAL_LAYER,
+    )
     assert prov.bytes_per_expert == 11_796_480 + 5_898_240 + 737_280 + 368_640 == 18_800_640
     slot = prov.slot_for(0, REAL_EXPERTS)
     assert slot.num_slots == len(REAL_EXPERTS)
 
-    pieces = {"w13_weight": (("w1", "weight"), ("w3", "weight")),
-              "w13_weight_scale": (("w1", "scale"), ("w3", "scale")),
-              "w2_weight": (("w2", "weight"),),
-              "w2_weight_scale": (("w2", "scale"),)}
+    pieces = {
+        "w13_weight": (("w1", "weight"), ("w3", "weight")),
+        "w13_weight_scale": (("w1", "scale"), ("w3", "scale")),
+        "w2_weight": (("w2", "weight"),),
+        "w2_weight_scale": (("w2", "scale"),),
+    }
     for name, members in pieces.items():
         buf = rec.device_tensors[name]
         for i, e in enumerate(REAL_EXPERTS):
@@ -708,7 +768,8 @@ def test_h2d_default_submits_without_blocking():
 
 def test_seam_namespace_is_exactly_the_four_device_steps():
     assert sorted(f for f in DeviceSeam.__dataclass_fields__) == sorted(
-        ["alloc_pinned", "alloc_device", "h2d", "wait", "post_load"])
+        ["alloc_pinned", "alloc_device", "h2d", "wait", "post_load"]
+    )
     # every field has a real default, so an injected seam replaces only what a
     # test means to replace and the rest stays production
     assert all(callable(f.default) for f in DeviceSeam.__dataclass_fields__.values())

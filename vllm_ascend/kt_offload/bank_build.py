@@ -70,15 +70,16 @@ are permuted.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import mmap
 import os
-import re
 from collections.abc import Iterator, Sequence
 from typing import Any
 
 import numpy as np
+import regex as re
 
 from vllm_ascend.kt_offload import nz_geometry
 
@@ -366,18 +367,14 @@ def build_layer(src: Any, layer: int, out_path: str, layout: BankLayout, *, drop
 
 def _advise_no_hugepage(mm: mmap.mmap) -> None:
     """Pin the mapping to base pages; 2 MiB pages cost 18 points here and buy nothing."""
-    try:
+    with contextlib.suppress(OSError, AttributeError, ValueError):
         mm.madvise(mmap.MADV_NOHUGEPAGE)
-    except (OSError, AttributeError, ValueError):
-        pass
 
 
 def _fadvise_dontneed(fd: int, offset: int, length: int) -> None:
     """Best-effort ``POSIX_FADV_DONTNEED``; a kernel that refuses is not an error."""
-    try:
+    with contextlib.suppress(OSError, AttributeError):
         os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
-    except (OSError, AttributeError):
-        pass
 
 
 def build(
@@ -589,8 +586,10 @@ def validate_segments(segments: Sequence[Segment], src_bytes: int, dst_bytes: in
     coverage summary so a caller can log what it validated.
     """
     if not segments:
-        raise BankBuildError("empty segment table: a chunk that copies nothing would "
-                             "leave the staging buffer holding the previous chunk's bytes")
+        raise BankBuildError(
+            "empty segment table: a chunk that copies nothing would "
+            "leave the staging buffer holding the previous chunk's bytes"
+        )
     # Destination coverage by interval merge: O(n log n), no dst-sized bitmap
     # (the staging buffer is ~600 MB and this runs on the start-up path).
     spans = sorted((s.dst_offset, s.dst_offset + s.nbytes) for s in segments)
@@ -598,25 +597,31 @@ def validate_segments(segments: Sequence[Segment], src_bytes: int, dst_bytes: in
     prev_end = None
     for lo, hi in spans:
         if lo < 0 or hi > dst_bytes:
-            raise BankBuildError(
-                f"segment writes [{lo}, {hi}) outside the {dst_bytes} B staging buffer")
+            raise BankBuildError(f"segment writes [{lo}, {hi}) outside the {dst_bytes} B staging buffer")
         if prev_end is not None and lo < prev_end:
             raise BankBuildError(
                 f"segments overlap in the destination at offset {lo} (previous ended {prev_end}); "
-                "two copies would write the same staging bytes and the later one would win silently")
+                "two copies would write the same staging bytes and the later one would win silently"
+            )
         covered += hi - lo
         prev_end = hi
     for seg in segments:
         if seg.src_offset < 0 or seg.src_offset + seg.nbytes > src_bytes:
             raise BankBuildError(
                 f"segment {seg.section} reads [{seg.src_offset}, {seg.src_offset + seg.nbytes}) "
-                f"outside the {src_bytes} B layer file")
+                f"outside the {src_bytes} B layer file"
+            )
     if covered != dst_bytes:
         raise BankBuildError(
             f"segments cover {covered} of {dst_bytes} staging bytes ({dst_bytes - covered} B left "
-            "uncovered); the gap would still hold the previous chunk's weights")
-    return {"segments": len(segments), "dst_bytes_covered": covered,
-            "contiguous_from_zero": spans[0][0] == 0, **segment_stats(segments)}
+            "uncovered); the gap would still hold the previous chunk's weights"
+        )
+    return {
+        "segments": len(segments),
+        "dst_bytes_covered": covered,
+        "contiguous_from_zero": spans[0][0] == 0,
+        **segment_stats(segments),
+    }
 
 
 def segment_stats(segments: Sequence[Segment]) -> dict[str, Any]:
@@ -713,8 +718,7 @@ def check_prefetch_placement(
         for b in cpus[i + 1 :]:
             if b in sibs:
                 raise LoaderPlacementError(
-                    f"prefetch cpus {a} and {b} are SMT siblings of one physical core; "
-                    "use distinct physical cores"
+                    f"prefetch cpus {a} and {b} are SMT siblings of one physical core; use distinct physical cores"
                 )
     if kt_cpus is not None:
         kt = {int(c) for c in kt_cpus}

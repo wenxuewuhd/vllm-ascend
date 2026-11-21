@@ -8,8 +8,8 @@ card and live in the harnesses, not here. What is testable off-card is the part
 that decides whether the GEMM is handed the right routing and whether a missed
 write can pass unnoticed.
 """
+
 import pytest
-import torch
 
 from vllm_ascend.kt_offload.stream_layer import (
     LayerWriteLedger,
@@ -41,7 +41,8 @@ def test_layer_tables_only_this_chunk_s_experts_can_receive_rows():
         reached = set(t.safe_slot_table.tolist())
         assert reached <= set(ids), (
             f"chunk {k} can reach slots {sorted(reached - set(ids))} outside its own "
-            f"{sorted(ids)}; every one of those is a non-empty group whose weights the GEMM reads")
+            f"{sorted(ids)}; every one of those is a non-empty group whose weights the GEMM reads"
+        )
 
 
 def test_layer_tables_maps_this_chunk_s_experts_to_their_own_slot():
@@ -122,7 +123,7 @@ def test_ledger_refuses_a_second_write_of_the_same_chunk():
 
 
 def test_ledger_reports_a_chunk_that_was_never_written():
-    plan = _plan(8, 2)          # 4 chunks
+    plan = _plan(8, 2)  # 4 chunks
     led = LayerWriteLedger()
     led.begin(3)
     for k in (0, 1, 3):
@@ -143,6 +144,6 @@ def test_ledger_is_clean_when_every_chunk_was_written():
 
 def test_config_refuses_the_switch_without_stream_prefill():
     from vllm_ascend.kt_offload.config import KTOffloadConfig
+
     with pytest.raises(ValueError, match="stream_layer_buffer needs stream_prefill"):
-        KTOffloadConfig(enabled=True, cpuinfer_threads=1, num_resident_experts=8,
-                        stream_layer_buffer=True)
+        KTOffloadConfig(enabled=True, cpuinfer_threads=1, num_resident_experts=8, stream_layer_buffer=True)

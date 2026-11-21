@@ -107,8 +107,10 @@ def test_subset_fills_those_slots_with_the_same_bytes_and_nothing_else(src):
         for lo, hi in _slot_ranges(src, len(ids), slot):
             assert torch.all(part[lo:hi] == SENTINEL), f"slot {slot} was touched; it must be left alone"
     # Coverage is about what this call produced.
-    assert res.coverage.produced_bytes == sum(
-        src.layout.device_record(t) for t in ("w13", "w2", "w13_scale", "w2_scale")) * 2
+    assert (
+        res.coverage.produced_bytes
+        == sum(src.layout.device_record(t) for t in ("w13", "w2", "w13_scale", "w2_scale")) * 2
+    )
     # The LAYOUT stays the whole chunk (it fixes the group bases); only
     # `produced` names what was filled.
     assert res.layout.experts == ids
@@ -146,7 +148,7 @@ def test_multithreaded_subset_agrees_with_single_threaded(bank):
     two = bank_source.BankSource(bank, num_experts=TINY.num_experts, copy_threads=1)
     try:
         b = _staging(two, len(ids))
-        two.gather(0, ids, b, only_slots=[3, 1])     # order must not matter
+        two.gather(0, ids, b, only_slots=[3, 1])  # order must not matter
     finally:
         two.close()
     assert torch.equal(a, b)

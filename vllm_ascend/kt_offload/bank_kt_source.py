@@ -41,6 +41,7 @@ silently produces wrong numbers or lost locality if it does not hold:
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import mmap
@@ -115,10 +116,8 @@ def drop_checkpoint_expert_cache(weight_path: str) -> tuple[int, int]:
     def _resident(paths) -> int:
         tot = 0
         for path in paths:
-            try:
+            with contextlib.suppress(OSError):
                 tot += _resident_bytes(path)
-            except OSError:
-                pass
         return tot
 
     before = _resident(shards)
@@ -129,11 +128,15 @@ def drop_checkpoint_expert_cache(weight_path: str) -> tuple[int, int]:
         finally:
             os.close(fd)
     after = _resident(shards)
-    logger.info("kt_offload: dropped the checkpoint's clean page cache over %d shard(s): "
-                "%.1f -> %.1f GiB resident (%.1f GiB released). kt and streaming prefill both "
-                "read the bank now, so nothing re-reads these during serving.",
-                len(shards), before / float(1 << 30), after / float(1 << 30),
-                (before - after) / float(1 << 30))
+    logger.info(
+        "kt_offload: dropped the checkpoint's clean page cache over %d shard(s): "
+        "%.1f -> %.1f GiB resident (%.1f GiB released). kt and streaming prefill both "
+        "read the bank now, so nothing re-reads these during serving.",
+        len(shards),
+        before / float(1 << 30),
+        after / float(1 << 30),
+        (before - after) / float(1 << 30),
+    )
     return (before, after)
 
 
@@ -144,8 +147,7 @@ def _resident_bytes(path: str) -> int:
         return 0
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     libc.mmap.restype = ctypes.c_void_p
-    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
-                          ctypes.c_int, ctypes.c_long]
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
     libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
     page = os.sysconf("SC_PAGE_SIZE")
     fd = os.open(path, os.O_RDONLY)
@@ -239,7 +241,7 @@ class BankPlacementSource:
             raise BankKtSourceError(f"{name}: record {rec} B does not halve")
         return self._path(layer), base + half * (rec // 2), rec // 2
 
-    def __init__(self, src: "KtBankSource"):
+    def __init__(self, src: KtBankSource):
         self.src = src
 
     def _path(self, layer: int) -> str:
@@ -247,16 +249,15 @@ class BankPlacementSource:
 
     def locate(self, layer: int, expert: int, proj: str, kind: str) -> BankSpan:
         path, start, nbytes = self._span(layer, expert, proj, kind)
-        return BankSpan(key=f"L{layer}.e{expert}.{proj}.{kind}", path=path,
-                        start=start, nbytes=nbytes)
+        return BankSpan(key=f"L{layer}.e{expert}.{proj}.{kind}", path=path, start=start, nbytes=nbytes)
 
-    def split_ranges(self, layer: int, expert: int, proj: str, kind: str,
-                     tp: int) -> list[tuple[str, int, int]]:
+    def split_ranges(self, layer: int, expert: int, proj: str, kind: str, tp: int) -> list[tuple[str, int, int]]:
         """``[(path, start, nbytes)]`` per TP part."""
         if tp != self.src.tp_count:
             raise BankKtSourceError(
                 f"placement asked for tp={tp} but the bank source was built for "
-                f"{self.src.tp_count}; the section layout depends on it")
+                f"{self.src.tp_count}; the section layout depends on it"
+            )
         path = self._path(layer)
         tmpl, half = self._SECTION[(proj, kind)]
         if half is not None:
@@ -274,7 +275,8 @@ class BankPlacementSource:
         if rec % tp or per % self.src.page:
             raise BankKtSourceError(
                 f"{tmpl}: record {rec} B does not split into {tp} whole-page parts, so the "
-                "parts would share pages and placement could not beat 1/tp local")
+                "parts would share pages and placement could not beat 1/tp local"
+            )
         base = off + expert * rec
         return [(path, base + part * per, per) for part in range(tp)]
 
@@ -288,7 +290,8 @@ class KtBankSource:
         path = os.path.join(self.bank_dir, "manifest.json")
         if not os.path.exists(path):
             raise BankKtSourceError(f"no manifest at {path}: {bank_dir} is not a bank")
-        self.manifest = json.load(open(path))
+        with open(path) as fh:
+            self.manifest = json.load(fh)
         d = self.manifest["derived"]
         self.sections = {k: tuple(v) for k, v in d["sections"].items()}
         self.bytes_per_expert = int(d["bytes_per_expert"])
@@ -318,9 +321,11 @@ class KtBankSource:
             if rec != want_w13:
                 bad.append(f"{name}: record {rec} B, expected inter/tp * hidden/2 = {want_w13}")
             if off % self.page or rec % self.page:
-                bad.append(f"{name}: offset {off} / record {rec} is not page aligned ({self.page} B), "
-                           "so two TP parts would share pages and no per-node placement can beat "
-                           "1/tp_count local")
+                bad.append(
+                    f"{name}: offset {off} / record {rec} is not page aligned ({self.page} B), "
+                    "so two TP parts would share pages and no per-node placement can beat "
+                    "1/tp_count local"
+                )
         if "w2" not in self.sections:
             bad.append("missing section w2")
         else:
@@ -328,18 +333,25 @@ class KtBankSource:
             if rec != want_w2:
                 bad.append(f"w2: record {rec} B, expected hidden * inter/2 = {want_w2}")
             if rec % self.tp_count:
-                bad.append(f"w2: record {rec} B does not divide by tp_count {self.tp_count}, so part 0 "
-                           "is not the contiguous prefix the kernel addresses")
+                bad.append(
+                    f"w2: record {rec} B does not divide by tp_count {self.tp_count}, so part 0 "
+                    "is not the contiguous prefix the kernel addresses"
+                )
             part = rec // self.tp_count
             if off % self.page or part % self.page:
                 bad.append(f"w2: offset {off} / per-part {part} is not page aligned ({self.page} B)")
         if bad:
-            raise BankKtSourceError(
-                f"{self.bank_dir} cannot be consumed in place by kt:\n  " + "\n  ".join(bad))
-        logger.info("kt_offload bank-as-kt-source: %d experts/layer, %d B each; w13 part record %d B "
-                    "(%d pages), w2 part %d B (%d pages); all page-exclusive per TP part",
-                    self.num_experts, self.bytes_per_expert, want_w13, want_w13 // self.page,
-                    want_w2 // self.tp_count, (want_w2 // self.tp_count) // self.page)
+            raise BankKtSourceError(f"{self.bank_dir} cannot be consumed in place by kt:\n  " + "\n  ".join(bad))
+        logger.info(
+            "kt_offload bank-as-kt-source: %d experts/layer, %d B each; w13 part record %d B "
+            "(%d pages), w2 part %d B (%d pages); all page-exclusive per TP part",
+            self.num_experts,
+            self.bytes_per_expert,
+            want_w13,
+            want_w13 // self.page,
+            want_w2 // self.tp_count,
+            (want_w2 // self.tp_count) // self.page,
+        )
 
     # -- mapping ----------------------------------------------------------
     def _layer_path(self, layer: int) -> str:
@@ -395,8 +407,10 @@ class KtBankSource:
             up_ptr=b + u_off + expert * u_rec,
             # w2 is stored whole; part i is the contiguous prefix/suffix of it.
             down_ptr=b + d_off + expert * d_rec + part * d_part,
-            w13_n=inter_tp, w13_k=self.hidden,
-            w2_n=self.hidden, w2_k=inter_tp,
+            w13_n=inter_tp,
+            w13_k=self.hidden,
+            w2_n=self.hidden,
+            w2_k=inter_tp,
         )
 
     def kt_pointer_arrays(self, layer: int) -> dict[str, list[list[int]]]:

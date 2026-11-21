@@ -27,11 +27,10 @@ import pytest
 import torch
 
 from vllm_ascend.kt_offload import stream_io
-from vllm_ascend.kt_offload.stream_chain import SLOT_WEIGHT_ATTRS
 from vllm_ascend.kt_offload.stream_io import StreamIOError, StreamSlotProvider
 
 NUM_EXPERTS = 8
-PER_NZ = 64            # bytes per slot in the (fake) NZ weight buffers
+PER_NZ = 64  # bytes per slot in the (fake) NZ weight buffers
 
 
 class _Resident(torch.nn.Module):
@@ -50,7 +49,7 @@ class _Resident(torch.nn.Module):
 
 
 CHUNK_SLOTS = 4
-PER_ND = 16            # bytes per slot in the (fake) ND scale buffers
+PER_ND = 16  # bytes per slot in the (fake) ND scale buffers
 
 
 def _prov(nz: bool = True):
@@ -66,8 +65,7 @@ def _prov(nz: bool = True):
     p._nz_device = nz
     p._nz_bytes = {n: PER_NZ for n in stream_io.NZ_WEIGHT_ATTRS}
     p.chunk_experts = CHUNK_SLOTS
-    p._device = {n: torch.zeros((CHUNK_SLOTS, PER_ND), dtype=torch.uint8)
-                 for n in stream_io.ND_SCALE_ATTRS}
+    p._device = {n: torch.zeros((CHUNK_SLOTS, PER_ND), dtype=torch.uint8) for n in stream_io.ND_SCALE_ATTRS}
     p._res_module = None
     p._res_slot = None
     p._res_per = {}
@@ -82,7 +80,7 @@ def test_off_by_default_everything_streams():
 
 def test_split_names_the_resident_positions_only():
     p = _prov()
-    l2s = [-1, 0, -1, 1, -1, -1, -1, -1]          # experts 1 and 3 are in HBM
+    l2s = [-1, 0, -1, 1, -1, -1, -1, -1]  # experts 1 and 3 are in HBM
     p.set_resident(_Resident(2), l2s)
     assert p._split_chunk((0, 1, 2, 3)) == ((0, 2), (1, 3))
     assert p._split_chunk((4, 5, 6, 7)) == ((0, 1, 2, 3), ())
@@ -231,7 +229,7 @@ def test_a_fully_resident_chunk_is_the_common_case_not_an_error():
     simply report that nothing is streamed.
     """
     p = _prov()
-    l2s = [i if i < 4 else -1 for i in range(NUM_EXPERTS)]     # 4 of 8 resident
+    l2s = [i if i < 4 else -1 for i in range(NUM_EXPERTS)]  # 4 of 8 resident
     p.set_resident(_Resident(4), l2s)
     assert p._split_chunk((0, 1, 2, 3)) == ((), (0, 1, 2, 3))
     assert p._split_chunk((4, 5, 6, 7)) == ((0, 1, 2, 3), ())
@@ -241,10 +239,8 @@ def test_a_fully_resident_chunk_is_the_common_case_not_an_error():
 def test_the_shipped_geometry_makes_three_chunks_fully_resident():
     """The arithmetic that made the above a blocking bug rather than an edge."""
     n, chunk, res = 384, 32, 100
-    fully = [k for k in range(n // chunk)
-             if all(e < res for e in range(k * chunk, (k + 1) * chunk))]
-    mixed = [k for k in range(n // chunk)
-             if any(e < res for e in range(k * chunk, (k + 1) * chunk)) and k not in fully]
+    fully = [k for k in range(n // chunk) if all(e < res for e in range(k * chunk, (k + 1) * chunk))]
+    mixed = [k for k in range(n // chunk) if any(e < res for e in range(k * chunk, (k + 1) * chunk)) and k not in fully]
     assert fully == [0, 1, 2] and mixed == [3]
 
 
@@ -293,7 +289,7 @@ def _drivable(nz: bool = True):
 
     p._fill_resident = _fill
     p.fake_stream = FAKE_STREAM
-    p._format = lambda n: (p.formatted.append(n) or "SLOT")
+    p._format = lambda n: p.formatted.append(n) or "SLOT"
     return p
 
 
@@ -333,7 +329,7 @@ def test_slot_for_on_a_MIXED_chunk_streams_only_the_rest_and_fills_the_residents
     positions must be filled afterwards, on the same stream.
     """
     p = _drivable()
-    p.set_resident(_Resident(2), [-1, 0, -1, 1])          # positions 1 and 3 resident
+    p.set_resident(_Resident(2), [-1, 0, -1, 1])  # positions 1 and 3 resident
     ids = (0, 1, 2, 3)
     asked: list = []
 
@@ -359,6 +355,7 @@ def test_slot_for_on_a_MIXED_chunk_streams_only_the_rest_and_fills_the_residents
 
     p._acquire = _acquire
     p._check_record_bytes = lambda layout, n: None
+
     # The real _upload_nz is what publishes the key once every group has been
     # copied; the stub keeps that part so the staleness check downstream
     # (served_nz / served_nd) is exercised too.
@@ -390,6 +387,7 @@ def test_slot_for_on_a_MIXED_chunk_streams_only_the_rest_and_fills_the_residents
 # stream_resident_from_hbm's 26% saving and added a wasted pass. The fix is that
 # prefetch derives the subset itself, exactly as slot_for does; these tests are
 # the reason it must stay that way.
+
 
 class _SubsetSource:
     """Only the flag `_check_subset` consults: can this source gather a subset?"""
@@ -430,7 +428,7 @@ def test_prefetch_derives_the_streamed_subset_not_the_whole_chunk():
     p = _prov()
     p._layer = 3
     p.source = _SubsetSource()
-    p.set_resident(_Resident(2), [-1, 0, -1, 1])   # logical 1 and 3 are resident
+    p.set_resident(_Resident(2), [-1, 0, -1, 1])  # logical 1 and 3 are resident
     ids = (0, 1, 2, 3)
     stream_pos, res_pos = p._split_chunk(ids)
     assert (stream_pos, res_pos) == ((0, 2), (1, 3))
@@ -445,7 +443,7 @@ def test_prefetch_declines_a_fully_resident_chunk():
     p = _prov()
     p._layer = 3
     p.source = _SubsetSource()
-    p.set_resident(_Resident(4), [0, 1, 2, 3])      # all four are resident
+    p.set_resident(_Resident(4), [0, 1, 2, 3])  # all four are resident
     ids = (0, 1, 2, 3)
     assert p._split_chunk(ids) == ((), (0, 1, 2, 3))
     stream_pos, res_pos = p._split_chunk(ids)

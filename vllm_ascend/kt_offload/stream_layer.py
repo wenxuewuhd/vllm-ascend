@@ -41,6 +41,7 @@ TWO THINGS THE PLATFORM FORCED
 
 Origin: dsv41 stream-prefill, stage 1.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -86,9 +87,14 @@ class StreamLayerError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def layer_tables(plan: ChunkPlan, chunk_index: int, *, device: torch.device | str = "cpu",
-                 id_dtype: torch.dtype = torch.int32,
-                 weight_dtype: torch.dtype = torch.float32) -> ChunkTables:
+def layer_tables(
+    plan: ChunkPlan,
+    chunk_index: int,
+    *,
+    device: torch.device | str = "cpu",
+    id_dtype: torch.dtype = torch.int32,
+    weight_dtype: torch.dtype = torch.float32,
+) -> ChunkTables:
     """``ChunkTables`` for chunk ``k`` over a whole-layer buffer.
 
     Two differences from ``stream_prefill.chunk_tables``:
@@ -178,15 +184,18 @@ class LayerWriteLedger:
         if chunk_index in self.written:
             raise StreamLayerError(
                 f"chunk {chunk_index} written twice into the layer buffer: the second write would "
-                "silently replace the first and the coverage check cannot see it")
+                "silently replace the first and the coverage check cannot see it"
+            )
         self.written.add(chunk_index)
         self.bytes_written += nbytes
 
     def violations(self, plan: ChunkPlan) -> list[str]:
         missing = sorted(set(range(plan.num_chunks)) - self.written)
         if missing:
-            return [f"chunks {missing[:8]} were never written into the layer buffer: their slots "
-                    f"still hold whatever was there before (the previous layer, or the poison)"]
+            return [
+                f"chunks {missing[:8]} were never written into the layer buffer: their slots "
+                f"still hold whatever was there before (the previous layer, or the poison)"
+            ]
         return []
 
 
@@ -205,10 +214,16 @@ class LayerSlotProvider:
     is what it wants.
     """
 
-    def __init__(self, inner: Any, *, num_experts: int, chunk_experts: int,
-                 nd_shapes: Mapping[str, Sequence[int]],
-                 probe_bytes: int = DEFAULT_PROBE_BYTES,
-                 sync_before_write: bool = True):
+    def __init__(
+        self,
+        inner: Any,
+        *,
+        num_experts: int,
+        chunk_experts: int,
+        nd_shapes: Mapping[str, Sequence[int]],
+        probe_bytes: int = DEFAULT_PROBE_BYTES,
+        sync_before_write: bool = True,
+    ):
         """``nd_shapes``: per-expert ND shape of each of the four params.
 
         Taken from the caller rather than inferred from a chunk's slot, because
@@ -260,20 +275,22 @@ class LayerSlotProvider:
         """
         if self._slot is not None:
             return self._slot
-        nd = {name: torch.zeros((self.num_experts, *self.nd_shapes[name]),
-                                dtype=dtypes[name], device=device)
-              for name in SLOT_WEIGHT_ATTRS}
+        nd = {
+            name: torch.zeros((self.num_experts, *self.nd_shapes[name]), dtype=dtypes[name], device=device)
+            for name in SLOT_WEIGHT_ATTRS
+        }
         slot = self.inner.format_nd(nd, self.num_experts)
         self._slot = slot
         for name in ND_ATTRS:
-            self._nd_scale[name] = nd[name]          # the slot's scale is a view of this
+            self._nd_scale[name] = nd[name]  # the slot's scale is a view of this
         for name in SLOT_WEIGHT_ATTRS:
             t = getattr(slot, name)
             st = t.untyped_storage()
             if st.nbytes() % self.num_experts:
                 raise StreamLayerError(
                     f"{name}: storage {st.nbytes()} B is not a multiple of {self.num_experts} "
-                    "slots, so a per-slot byte offset is not defined")
+                    "slots, so a per-slot byte offset is not defined"
+                )
             # The VIEW must cover the WHOLE storage. Measured on card: the
             # operator reads the group count from the NZ format descriptor,
             # which belongs to the *storage*, while a second check in the same
@@ -289,13 +306,19 @@ class LayerSlotProvider:
                     f"{name}: the view covers {view_bytes} B of a {st.nbytes()} B storage at offset "
                     f"{t.storage_offset()}. The layer buffer must own its whole storage: the operator "
                     "takes the group count from the storage's NZ descriptor and from the view's shape "
-                    "in two different checks, and a partial view can never satisfy both.")
+                    "in two different checks, and a partial view can never satisfy both."
+                )
             self._base[name] = st.data_ptr()
             self._per_expert[name] = st.nbytes() // self.num_experts
-            logger.info("kt_offload stream_layer: %s %s storage=%d B (%d B/slot) fmt-tagged",
-                        name, tuple(t.shape), st.nbytes(), self._per_expert[name])
+            logger.info(
+                "kt_offload stream_layer: %s %s storage=%d B (%d B/slot) fmt-tagged",
+                name,
+                tuple(t.shape),
+                st.nbytes(),
+                self._per_expert[name],
+            )
         for name in NZ_ATTRS:
-            del nd[name]                              # the NZ output owns its own bytes
+            del nd[name]  # the NZ output owns its own bytes
         return slot
 
     @property
@@ -305,8 +328,9 @@ class LayerSlotProvider:
         return self._slot
 
     # -- the write --------------------------------------------------------
-    def _write_nz(self, name: str, first_slot: int, src: torch.Tensor, count: int,
-                  src_first: int = 0, src_per: int | None = None) -> int:
+    def _write_nz(
+        self, name: str, first_slot: int, src: torch.Tensor, count: int, src_first: int = 0, src_per: int | None = None
+    ) -> int:
         """Copy ``count`` slots into the layer buffer at ``first_slot``.
 
         ``src_first``/``src_per`` let the source start at a slot other than 0
@@ -317,12 +341,14 @@ class LayerSlotProvider:
         call passes neither and is unchanged.
         """
         import acl  # device-only dependency, imported at the call site
+
         per = self._per_expert[name]
         if src_per is not None and int(src_per) != per:
             raise StreamLayerError(
                 f"{name}: source holds {src_per} B per slot, the layer buffer {per} B. Both come "
                 "from the same process_weights_after_loading, so this is a layout divergence, not "
-                "a copy that can be rescaled")
+                "a copy that can be rescaled"
+            )
         nbytes = per * count
         # aclrtMemcpy/Async take destMax but have NO srcMax (acl_rt.h:2262/2309),
         # and destMax is the amount we PROMISE to write rather than the buffer's
@@ -335,26 +361,32 @@ class LayerSlotProvider:
         if first_slot < 0 or first_slot + count > self.num_experts:
             raise StreamLayerError(
                 f"{name}: slots [{first_slot}, {first_slot + count}) fall outside the "
-                f"{self.num_experts}-slot layer buffer")
+                f"{self.num_experts}-slot layer buffer"
+            )
         src_off = per * int(src_first)
         src_bytes = src.untyped_storage().nbytes() - src_off
         if src_off < 0 or src_bytes < nbytes:
             raise StreamLayerError(
                 f"{name}: reading {nbytes} B from a source storage of only {src_bytes} B "
                 f"(first_slot={first_slot} count={count} per={per}) -- aclrtMemcpy has no "
-                f"srcMax, so this would be a silent out-of-bounds read, not an error")
+                f"srcMax, so this would be a silent out-of-bounds read, not an error"
+            )
         if src_bytes != nbytes and src_first == 0 and src_per is None:
             # Not fatal: a source with headroom is legal. But for a WHOLE-chunk
             # write it means our model of the chunk layout is off somewhere, so
             # it must not pass in silence. A run out of a mixed chunk, or a slot
             # out of the resident parameter, has headroom by construction.
             logger.warning(
-                "kt_offload stream_layer: %s source storage is %d B for a %d B write "
-                "(first_slot=%d count=%d)", name, src_bytes, nbytes, first_slot, count)
+                "kt_offload stream_layer: %s source storage is %d B for a %d B write (first_slot=%d count=%d)",
+                name,
+                src_bytes,
+                nbytes,
+                first_slot,
+                count,
+            )
         dst = self._base[name] + first_slot * per
         stream = torch.npu.current_stream().npu_stream
-        ret = acl.rt.memcpy_async(dst, nbytes, src.untyped_storage().data_ptr() + src_off, nbytes,
-                                  3, stream)
+        ret = acl.rt.memcpy_async(dst, nbytes, src.untyped_storage().data_ptr() + src_off, nbytes, 3, stream)
         if ret != 0:
             raise StreamLayerError(f"{name}: memcpy_async into slot {first_slot} returned {ret}")
         return nbytes
@@ -368,14 +400,17 @@ class LayerSlotProvider:
         # the slots twice -- and the second skip has nothing to fill it.
         chunk = self.inner.slot_for(chunk_index, ids)
         if self._slot is None:
-            raise StreamLayerError("slot_for before build(): the layer buffer must be allocated once, "
-                                   "at wiring time, not lazily on the first chunk of a forward")
+            raise StreamLayerError(
+                "slot_for before build(): the layer buffer must be allocated once, "
+                "at wiring time, not lazily on the first chunk of a forward"
+            )
         count = len(ids)
         first = chunk_index * self.chunk_experts
         if first + count > self.num_experts:
             raise StreamLayerError(
                 f"chunk {chunk_index} of {count} experts starts at slot {first}, past the layer's "
-                f"{self.num_experts} slots: the chunk tiling and the buffer disagree")
+                f"{self.num_experts} slots: the chunk tiling and the buffer disagree"
+            )
         if self.sync_before_write:
             # See the module docstring: the cast is a torch op and may still be
             # sitting in torch_npu's host-side queue when we submit the raw copy.
@@ -395,7 +430,7 @@ class LayerSlotProvider:
             # ND destination: an ordinary copy_ is valid and torch orders it.
             # The source must be the ND bytes, NOT the slot's 4-D transposed
             # view of them -- copying that would transpose the data.
-            self._nd_scale[name][first:first + count].copy_(nd[name])
+            self._nd_scale[name][first : first + count].copy_(nd[name])
         self.ledger.note(chunk_index, moved)
         if self.probe_bytes:
             self._probe(chunk, first, count)
@@ -410,6 +445,7 @@ class LayerSlotProvider:
         import ctypes
 
         import acl
+
         torch.npu.synchronize()
         for name in NZ_ATTRS:
             per = self._per_expert[name]
@@ -417,15 +453,17 @@ class LayerSlotProvider:
             src_base = getattr(chunk, name).untyped_storage().data_ptr()
             for where, off in (("head", 0), ("tail", per * count - n)):
                 got, want = (ctypes.c_char * n)(), (ctypes.c_char * n)()
-                if acl.rt.memcpy(ctypes.addressof(got), n,
-                                 self._base[name] + first * per + off, n, 2) != 0 or \
-                   acl.rt.memcpy(ctypes.addressof(want), n, src_base + off, n, 2) != 0:
+                if (
+                    acl.rt.memcpy(ctypes.addressof(got), n, self._base[name] + first * per + off, n, 2) != 0
+                    or acl.rt.memcpy(ctypes.addressof(want), n, src_base + off, n, 2) != 0
+                ):
                     raise StreamLayerError(f"{name}: probe read-back failed")
                 if bytes(got) != bytes(want):
                     raise StreamLayerError(
                         f"{name}: the layer buffer does not hold the bytes written for slots "
                         f"[{first},{first + count}) ({where} {n} B differ). The copy was issued but "
-                        "the GEMM would run on some other chunk's weights.")
+                        "the GEMM would run on some other chunk's weights."
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -433,16 +471,25 @@ class LayerSlotProvider:
 # ---------------------------------------------------------------------------
 
 
-def run_streamed_layer_buffered(*, quant_method, provider: LayerSlotProvider, plan: ChunkPlan,
-                                hidden_states: torch.Tensor, topk_ids: torch.Tensor,
-                                topk_weights: torch.Tensor, moe_config, top_k: int,
-                                capture_sizes, min_tokens: int,
-                                slot_for: Any = None,
-                                resident_layer: torch.nn.Module | None = None,
-                                accum_dtype: torch.dtype = torch.float32,
-                                after_chunk: Callable[[int, Sequence[int]], None] | None = None,
-                                expected_expert_ids: Sequence[int] | None = None,
-                                strict: bool = True) -> StreamChainResult:
+def run_streamed_layer_buffered(
+    *,
+    quant_method,
+    provider: LayerSlotProvider,
+    plan: ChunkPlan,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    moe_config,
+    top_k: int,
+    capture_sizes,
+    min_tokens: int,
+    slot_for: Any = None,
+    resident_layer: torch.nn.Module | None = None,
+    accum_dtype: torch.dtype = torch.float32,
+    after_chunk: Callable[[int, Sequence[int]], None] | None = None,
+    expected_expert_ids: Sequence[int] | None = None,
+    strict: bool = True,
+) -> StreamChainResult:
     """``run_streamed_layer`` over a whole-layer buffer. Same arithmetic.
 
     Signature mirrors ``stream_chain.run_streamed_layer`` so the call site picks
@@ -460,27 +507,34 @@ def run_streamed_layer_buffered(*, quant_method, provider: LayerSlotProvider, pl
     """
     if strict:
         if expected_expert_ids is None:
-            raise ValueError("run_streamed_layer_buffered(strict=True) needs expected_expert_ids: a "
-                             "coverage check whose expectation is the plan under test cannot fail.")
+            raise ValueError(
+                "run_streamed_layer_buffered(strict=True) needs expected_expert_ids: a "
+                "coverage check whose expectation is the plan under test cannot fail."
+            )
         bad = check_chunk_plan(plan, expected_expert_ids)
         if bad:
-            raise ValueError("stream_layer: the chunk plan does not cover what was expected: "
-                             + "; ".join(bad))
+            raise ValueError("stream_layer: the chunk plan does not cover what was expected: " + "; ".join(bad))
     # Same refusal as the per-chunk chain: this path is eager-only, and a token
     # count that is also a capture size means a graph would be captured over it.
-    assert_eager_only(int(hidden_states.shape[:-1].numel()), capture_sizes, min_tokens,
-                      where="stream_layer")
+    assert_eager_only(int(hidden_states.shape[:-1].numel()), capture_sizes, min_tokens, where="stream_layer")
     provider.ledger.begin(int(provider.layer))
     coverage = ChainCoverage()
     runs: list[Any] = []
     total: torch.Tensor | None = None
     for k in range(plan.num_chunks):
-        tables = layer_tables(plan, k, device=topk_ids.device, id_dtype=topk_ids.dtype,
-                              weight_dtype=topk_weights.dtype)
+        tables = layer_tables(plan, k, device=topk_ids.device, id_dtype=topk_ids.dtype, weight_dtype=topk_weights.dtype)
         slot = provider.slot_for(k, plan.chunks[k])
-        run = run_chunk(quant_method=quant_method, slot=slot, tables=tables,
-                        hidden_states=hidden_states, topk_ids=topk_ids, topk_weights=topk_weights,
-                        moe_config=moe_config, top_k=top_k, resident_layer=resident_layer)
+        run = run_chunk(
+            quant_method=quant_method,
+            slot=slot,
+            tables=tables,
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            moe_config=moe_config,
+            top_k=top_k,
+            resident_layer=resident_layer,
+        )
         # ``tables.expert_ids`` had to be the identity for run_chunk's slot->expert
         # naming; the accounting wants the chunk's own set back.
         run = dataclasses.replace(run, expert_ids=tuple(plan.chunks[k]))
@@ -504,8 +558,9 @@ def run_streamed_layer_buffered(*, quant_method, provider: LayerSlotProvider, pl
 # ---------------------------------------------------------------------------
 
 
-def install_layer_buffer(inner: Any, *, num_experts: int, probe_bytes: int = DEFAULT_PROBE_BYTES,
-                         sync_scope: str = "device") -> LayerSlotProvider:
+def install_layer_buffer(
+    inner: Any, *, num_experts: int, probe_bytes: int = DEFAULT_PROBE_BYTES, sync_scope: str = "device"
+) -> LayerSlotProvider:
     """Wrap the ONE streaming provider and allocate the ONE layer buffer.
 
     Shapes and dtypes come off the inner provider's own ``shapes``
@@ -519,18 +574,29 @@ def install_layer_buffer(inner: Any, *, num_experts: int, probe_bytes: int = DEF
         raise StreamLayerError(
             "the streaming provider has no `shapes`: the layer buffer is built from the quant "
             "method's declared ND shapes (stream_io.chunk_param_shapes), not from a chunk's "
-            "post-cast slot, whose weights are already transposed")
+            "post-cast slot, whose weights are already transposed"
+        )
     nd_shapes = {n: tuple(v[0][1:]) for n, v in shapes.items()}
     dtypes = {n: v[1] for n, v in shapes.items()}
-    wrapper = LayerSlotProvider(inner, num_experts=int(num_experts),
-                                chunk_experts=int(inner.chunk_experts),
-                                nd_shapes=nd_shapes, probe_bytes=int(probe_bytes))
+    wrapper = LayerSlotProvider(
+        inner,
+        num_experts=int(num_experts),
+        chunk_experts=int(inner.chunk_experts),
+        nd_shapes=nd_shapes,
+        probe_bytes=int(probe_bytes),
+    )
     if sync_scope not in ("device", "stream"):
         raise StreamLayerError(f"sync_scope must be 'device' or 'stream', got {sync_scope!r}")
     wrapper.sync_scope = sync_scope
     wrapper.build(inner.device, dtypes)
-    logger.info("kt_offload stream_layer: layer buffer installed for %d experts "
-                "(%d per chunk, probe %d B)", num_experts, inner.chunk_experts, probe_bytes)
-    logger.info("kt_offload stream_layer: pre-write flush scope = %s (device = all streams, "
-                "stream = only the cast's stream)", sync_scope)
+    logger.info(
+        "kt_offload stream_layer: layer buffer installed for %d experts (%d per chunk, probe %d B)",
+        num_experts,
+        inner.chunk_experts,
+        probe_bytes,
+    )
+    logger.info(
+        "kt_offload stream_layer: pre-write flush scope = %s (device = all streams, stream = only the cast's stream)",
+        sync_scope,
+    )
     return wrapper

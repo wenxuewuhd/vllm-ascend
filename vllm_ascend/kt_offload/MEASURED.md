@@ -431,7 +431,7 @@ Paired on one host, one card, prompt 4096, gen 512, 10 requests per arm,
 | TTFT p50 | 23.62 s | **8.88 s** | **0.376x, 2.66x faster** |
 | TPOT p50 | 24.12 ms | **24.08 ms** | **0.998x -- unchanged** |
 
-```
+```text
 base ttft [22.79 22.98 23.02 23.53 23.61 23.63 23.77 23.77 24.05 24.10]
 now  ttft [ 8.53  8.58  8.61  8.76  8.81  8.95  8.99  9.03  9.16  9.20]
 base tpot [23.50 23.81 23.93 24.00 24.12 24.12 24.12 24.14 24.20 24.29]
@@ -445,13 +445,13 @@ the pair trustworthy.
 
 Arm identity, from the deterministic counters (no noise floor):
 
-```
+```text
 base:  chunk lookahead OFF   layout=ND  walk=row-outer    acquire 2.36s (94%, 28.4 GiB/s)
 now:   chunk lookahead ON    layout=NZ  walk=GROUP-outer  acquire 0.08s (31%, 838.8 GiB/s)
        HOST MOVED 49.7 of 67.2 GiB (74.0%)
 ```
 
-Reproduction from nothing: `measure/REPRO_ttft8.8_tpot24.md`.
+Reproduction from nothing: `vllm_ascend/kt_offload/REPRODUCING.md`.
 
 ### 🔴 Retraction: every earlier now/base ratio was invalid
 

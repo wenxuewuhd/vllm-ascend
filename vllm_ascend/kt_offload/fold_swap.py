@@ -77,13 +77,13 @@ from vllm_ascend.kt_offload.resident_driver import (
     pinned_resident_ids,
     plan_from_heat,
 )
-from vllm_ascend.kt_offload.stream_io import ND_SCALE_ATTRS, NZ_WEIGHT_ATTRS
 from vllm_ascend.kt_offload.resident_swap import (
     LayerSwapTargets,
     ResidentSwapCommitter,
     SwapReport,
     ZeroCoverageError,
 )
+from vllm_ascend.kt_offload.stream_io import ND_SCALE_ATTRS, NZ_WEIGHT_ATTRS
 
 __all__ = [
     "FoldError",
@@ -216,8 +216,10 @@ def merge_runs(pairs: Sequence[tuple[int, int]]) -> list[tuple[int, int, int]]:
     seen: set[int] = set()
     for dst, src in sorted(pairs):
         if dst in seen:
-            raise FoldError(f"destination row {dst} appears twice in one chunk's copy plan: two sources "
-                            "would be written into one slot")
+            raise FoldError(
+                f"destination row {dst} appears twice in one chunk's copy plan: two sources "
+                "would be written into one slot"
+            )
         seen.add(dst)
         if cur is not None and dst == cur[0] + cur[2] and src == cur[1] + cur[2]:
             cur = (cur[0], cur[1], cur[2] + 1)
@@ -230,8 +232,9 @@ def merge_runs(pairs: Sequence[tuple[int, int]]) -> list[tuple[int, int, int]]:
     return out
 
 
-def fold_stage_write_nz(dst: torch.Tensor, src: torch.Tensor, *, bytes_per_slot: int,
-                        runs: Sequence[tuple[int, int, int]], stream: int) -> int:
+def fold_stage_write_nz(
+    dst: torch.Tensor, src: torch.Tensor, *, bytes_per_slot: int, runs: Sequence[tuple[int, int, int]], stream: int
+) -> int:
     """The ONE write into an NZ staging buffer: a raw ACL device-to-device memcpy.
 
     Why a raw memcpy at all. In NZ device mode (the bank path) the chunk's bytes
@@ -276,28 +279,37 @@ def fold_stage_write_nz(dst: torch.Tensor, src: torch.Tensor, *, bytes_per_slot:
     dst_n, src_n = dst_st.nbytes(), src_st.nbytes()
     for what, n in (("destination", dst_n), ("source", src_n)):
         if n % bytes_per_slot:
-            raise FoldError(f"fold_stage_write_nz: the {what} is {n} B, not a whole number of "
-                            f"{bytes_per_slot} B slots; a per-slot offset into it is undefined")
+            raise FoldError(
+                f"fold_stage_write_nz: the {what} is {n} B, not a whole number of "
+                f"{bytes_per_slot} B slots; a per-slot offset into it is undefined"
+            )
     dst_base, src_base = dst_st.data_ptr(), src_st.data_ptr()
     counts: list[int] = []
     for dst_row, src_row, nrows in runs:
         if nrows <= 0 or dst_row < 0 or src_row < 0:
-            raise FoldError(f"fold_stage_write_nz: run (dst={dst_row}, src={src_row}, n={nrows}) is not a "
-                            "forward run of at least one slot")
+            raise FoldError(
+                f"fold_stage_write_nz: run (dst={dst_row}, src={src_row}, n={nrows}) is not a "
+                "forward run of at least one slot"
+            )
         count = nrows * bytes_per_slot
         d_off, s_off = dst_row * bytes_per_slot, src_row * bytes_per_slot
         if d_off + count > dst_n:
-            raise FoldError(f"fold_stage_write_nz: rows {dst_row}..{dst_row + nrows - 1} end at "
-                            f"{d_off + count} B of a {dst_n} B destination")
+            raise FoldError(
+                f"fold_stage_write_nz: rows {dst_row}..{dst_row + nrows - 1} end at "
+                f"{d_off + count} B of a {dst_n} B destination"
+            )
         if s_off + count > src_n:
-            raise FoldError(f"fold_stage_write_nz: source rows {src_row}..{src_row + nrows - 1} end at "
-                            f"{s_off + count} B of a {src_n} B source -- and aclrtMemcpyAsync has no srcMax, "
-                            "so nothing downstream would catch it")
-        ret = acl.rt.memcpy_async(dst_base + d_off, count, src_base + s_off, count,
-                                  ACL_MEMCPY_DEVICE_TO_DEVICE, stream)
+            raise FoldError(
+                f"fold_stage_write_nz: source rows {src_row}..{src_row + nrows - 1} end at "
+                f"{s_off + count} B of a {src_n} B source -- and aclrtMemcpyAsync has no srcMax, "
+                "so nothing downstream would catch it"
+            )
+        ret = acl.rt.memcpy_async(dst_base + d_off, count, src_base + s_off, count, ACL_MEMCPY_DEVICE_TO_DEVICE, stream)
         if ret != 0:
-            raise FoldError(f"fold_stage_write_nz: D2D memcpy_async returned {ret} for {count} B "
-                            f"(dst row {dst_row}, src row {src_row})")
+            raise FoldError(
+                f"fold_stage_write_nz: D2D memcpy_async returned {ret} for {count} B "
+                f"(dst row {dst_row}, src row {src_row})"
+            )
         # Appended only after the call returned 0: a copy that was refused is
         # not bytes moved, and finish() reconciles against this number.
         counts.append(count)
@@ -344,7 +356,7 @@ class FoldedLayer:
     layer: int
     plan: LayerPlan
     weights: dict[str, torch.Tensor]
-    staged: tuple[int, ...]           # chosen experts staged, in the order they came by
+    staged: tuple[int, ...]  # chosen experts staged, in the order they came by
     chunks_seen: int
     #: Bytes the staging copies moved for this layer, reconciled in ``finish``
     #: against ``len(chosen) x bytes per expert``. See ``_Active.bytes_staged``.
@@ -397,40 +409,48 @@ class FoldCoverage:
     prefills_without_commit: int = 0
 
     def summary(self) -> str:
-        return (f"fold coverage: decisions {self.decisions_seen} (skipped {dict(sorted(self.skipped.items()))}), "
-                f"layers folded {self.layers_folded} committed {self.layers_committed} "
-                f"(recovered {self.layers_recovered}, unverified {self.layers_unverified}), "
-                f"experts staged {self.experts_staged} ({self.bytes_staged} B copied), "
-                f"pairs moved {len(self.pairs_moved)}, "
-                f"prefills that committed nothing {self.prefills_without_commit}")
+        return (
+            f"fold coverage: decisions {self.decisions_seen} (skipped {dict(sorted(self.skipped.items()))}), "
+            f"layers folded {self.layers_folded} committed {self.layers_committed} "
+            f"(recovered {self.layers_recovered}, unverified {self.layers_unverified}), "
+            f"experts staged {self.experts_staged} ({self.bytes_staged} B copied), "
+            f"pairs moved {len(self.pairs_moved)}, "
+            f"prefills that committed nothing {self.prefills_without_commit}"
+        )
 
     def violations(self, expected_staged: Iterable[tuple[int, int]] | None = None) -> list[str]:
         bad = []
         taken = self.layers_folded + sum(self.skipped.values())
         if taken != self.decisions_seen:
-            bad.append(f"denominator: seen {self.decisions_seen} != folded {self.layers_folded} + skipped "
-                       f"{sum(self.skipped.values())}")
+            bad.append(
+                f"denominator: seen {self.decisions_seen} != folded {self.layers_folded} + skipped "
+                f"{sum(self.skipped.values())}"
+            )
         if self.layers_committed == 0:
             bad.append("no layer was committed: zero coverage is a failure, not a pass")
         if self.experts_staged == 0:
             bad.append("no expert was staged")
         if self.experts_staged and self.bytes_staged == 0:
-            bad.append(f"{self.experts_staged} expert stagings copied 0 bytes: the accounting and the copies "
-                       "disagree")
+            bad.append(f"{self.experts_staged} expert stagings copied 0 bytes: the accounting and the copies disagree")
         if not self.pairs_moved:
             bad.append("no (layer, expert) changed owner")
         if self.prefills_without_commit:
-            bad.append(f"{self.prefills_without_commit} request(s) prefilled end to end without one commit: "
-                       "their heat was accumulated and thrown away")
+            bad.append(
+                f"{self.prefills_without_commit} request(s) prefilled end to end without one commit: "
+                "their heat was accumulated and thrown away"
+            )
         if expected_staged is not None:
             want = {(int(a), int(b)) for a, b in expected_staged}
             if not want:
-                raise ValueError("expected staged pairs is empty: 'nothing was supposed to be staged' is not "
-                                 "a criterion")
+                raise ValueError(
+                    "expected staged pairs is empty: 'nothing was supposed to be staged' is not a criterion"
+                )
             if self.staged_pairs != want:
-                bad.append(f"staged {len(self.staged_pairs)} (layer, expert) pairs, expected {len(want)} "
-                           f"(missing {sorted(want - self.staged_pairs)[:8]}, "
-                           f"extra {sorted(self.staged_pairs - want)[:8]})")
+                bad.append(
+                    f"staged {len(self.staged_pairs)} (layer, expert) pairs, expected {len(want)} "
+                    f"(missing {sorted(want - self.staged_pairs)[:8]}, "
+                    f"extra {sorted(self.staged_pairs - want)[:8]})"
+                )
         return bad
 
     def check(self, expected_staged: Iterable[tuple[int, int]] | None = None, *, strict: bool = True) -> list[str]:
@@ -440,8 +460,10 @@ class FoldCoverage:
         chosen set the scenario was BUILT to produce.
         """
         if strict and expected_staged is None:
-            raise ValueError("FoldCoverage.check(strict=True) needs the expected (layer, expert) pairs, and they "
-                             "must not come from the fold")
+            raise ValueError(
+                "FoldCoverage.check(strict=True) needs the expected (layer, expert) pairs, and they "
+                "must not come from the fold"
+            )
         bad = self.violations(expected_staged)
         if bad and strict:
             raise ZeroCoverageError(f"{self.summary()} -- " + "; ".join(bad))
@@ -547,8 +569,10 @@ class ResidentFold:
         # could put the commit on a forward that takes the hybrid path.
         self.stream_min_tokens = int(stream_min_tokens)
         if self.stream_min_tokens <= 0:
-            raise FoldError(f"stream_min_tokens={stream_min_tokens}: it is the layer's "
-                            "stream_prefill_min_tokens, which config.py refuses at or below 0")
+            raise FoldError(
+                f"stream_min_tokens={stream_min_tokens}: it is the layer's "
+                "stream_prefill_min_tokens, which config.py refuses at or below 0"
+            )
         self.strict = bool(strict)
         self.coverage = FoldCoverage()
         # The running heat of the request being prefilled: one row per layer,
@@ -577,10 +601,16 @@ class ResidentFold:
         self._committing: FoldedLayer | None = None
         self._lock = threading.Lock()
         self.committer = ResidentSwapCommitter(
-            placements, targets, strict=strict, weight_writer=fold_weight_write,
-            weight_refetch=self._refetch, stream_id=stream_id,
-            writer_busy=self.layer_in_flight, on_write=on_write,
-            live_objects=live_objects)
+            placements,
+            targets,
+            strict=strict,
+            weight_writer=fold_weight_write,
+            weight_refetch=self._refetch,
+            stream_id=stream_id,
+            writer_busy=self.layer_in_flight,
+            on_write=on_write,
+            live_objects=live_objects,
+        )
 
         layers = sorted(placements)
         if not layers:
@@ -591,10 +621,13 @@ class ResidentFold:
                 raise FoldError(
                     f"layer {layer}: {p.num_resident} resident experts in {p.num_slots} slots. The commit writes "
                     f"the whole [{p.num_slots}, ...] storage and the staging holds only the resident rows, so "
-                    "the zeroed tail slots would be overwritten; not implemented (same limit as the driver).")
+                    "the zeroed tail slots would be overwritten; not implemented (same limit as the driver)."
+                )
             if set(tg.weights) != set(SLOT_WEIGHT_ATTRS):
-                raise FoldError(f"layer {layer}: commit targets are {sorted(tg.weights)}, the staging carries "
-                                f"{list(SLOT_WEIGHT_ATTRS)}")
+                raise FoldError(
+                    f"layer {layer}: commit targets are {sorted(tg.weights)}, the staging carries "
+                    f"{list(SLOT_WEIGHT_ATTRS)}"
+                )
         num_slots = {self.committer.placement(layer).num_slots for layer in layers}
         if len(num_slots) != 1:
             raise FoldError(f"layers disagree on num_slots {sorted(num_slots)}; it is one number per model")
@@ -607,8 +640,9 @@ class ResidentFold:
         # bank+fold config refusal was standing in for).
         for need in ("shapes", "seam", "device", "served_nd", "served_nz", "format_nd", "nz_device"):
             if getattr(provider, need, None) is None:
-                raise FoldError(f"the slot provider has no {need!r}; the fold copies chunks out of it and casts "
-                                "through it")
+                raise FoldError(
+                    f"the slot provider has no {need!r}; the fold copies chunks out of it and casts through it"
+                )
         # The staging: allocated once, through the provider's device seam, with
         # the provider's per-expert shapes (which the production method declared).
         self._staging: dict[str, torch.Tensor] = {}
@@ -672,8 +706,10 @@ class ResidentFold:
         for name in NZ_WEIGHT_ATTRS:
             nbytes = tensors[name].untyped_storage().nbytes()
             if nbytes % self.num_slots:
-                raise FoldError(f"staging {name}: the cast produced {nbytes} B for {self.num_slots} slots, "
-                                "not a whole number of slots; a per-slot offset into it is undefined")
+                raise FoldError(
+                    f"staging {name}: the cast produced {nbytes} B for {self.num_slots} slots, "
+                    "not a whole number of slots; a per-slot offset into it is undefined"
+                )
             per_slot = nbytes // self.num_slots
             nd_row = _row_bytes(self._staging[name])
             if per_slot != nd_row:
@@ -681,7 +717,8 @@ class ResidentFold:
                     f"staging {name}: one slot is {per_slot} B in NZ and {nd_row} B in ND. The fold's "
                     "byte accounting, the chunk's per-slot offsets and the resident parameter's size are all "
                     "one number; NZ was measured to be a pure permutation with no padding on this model, and "
-                    "this says it is not.")
+                    "this says it is not."
+                )
             pairs.append((name, per_slot))
         nz_bytes = dict(pairs)
         # The chunk side's per-slot size must be the same number, or a slot-sized
@@ -689,8 +726,10 @@ class ResidentFold:
         chunk_bytes = self.provider.nz_bytes_per_slot
         for name in NZ_WEIGHT_ATTRS:
             if int(chunk_bytes.get(name, -1)) != nz_bytes[name]:
-                raise FoldError(f"{name}: a slot is {chunk_bytes.get(name)} B in the provider's chunk buffer "
-                                f"and {nz_bytes[name]} B in the fold's staging")
+                raise FoldError(
+                    f"{name}: a slot is {chunk_bytes.get(name)} B in the provider's chunk buffer "
+                    f"and {nz_bytes[name]} B in the fold's staging"
+                )
         freed = sum(self._staging[n].numel() * self._staging[n].element_size() for n in NZ_WEIGHT_ATTRS)
         for name in NZ_WEIGHT_ATTRS:
             self._staging[name] = tensors[name]
@@ -705,13 +744,19 @@ class ResidentFold:
         self._nz_slot = slot
         self._nz_bytes = nz_bytes
         self._staging_addrs0 = {n: _base_ptr(t) for n, t in self._staging.items()}
-        if self._expert_bytes != sum(nz_bytes.values()) + sum(
-                _row_bytes(self._staging[n]) for n in ND_SCALE_ATTRS):
-            raise FoldError("the per-expert byte total changed when the staging became NZ; the reconciliation "
-                            "in finish() would be against the wrong unit")
-        logger.info("kt_offload fold: NZ staging -- weights filled by raw D2D at %s B/slot, scales still ND; "
-                    "no per-layer cast; freed %d B (%.3f GiB) of ND weight staging; barrier=%s",
-                    dict(nz_bytes), freed, freed / float(1 << 30), self._nz_barrier)
+        if self._expert_bytes != sum(nz_bytes.values()) + sum(_row_bytes(self._staging[n]) for n in ND_SCALE_ATTRS):
+            raise FoldError(
+                "the per-expert byte total changed when the staging became NZ; the reconciliation "
+                "in finish() would be against the wrong unit"
+            )
+        logger.info(
+            "kt_offload fold: NZ staging -- weights filled by raw D2D at %s B/slot, scales still ND; "
+            "no per-layer cast; freed %d B (%.3f GiB) of ND weight staging; barrier=%s",
+            dict(nz_bytes),
+            freed,
+            freed / float(1 << 30),
+            self._nz_barrier,
+        )
 
     # -- state ------------------------------------------------------------
     def layer_in_flight(self) -> bool:
@@ -779,7 +824,10 @@ class ResidentFold:
             # dynamic_resident measurement rests on.
             logger.info(
                 "kt_offload fold: request %s committed %d layer(s) over its prefill (%s)",
-                key, self._request_commits, self.coverage.summary())
+                key,
+                self._request_commits,
+                self.coverage.summary(),
+            )
             return
         self.coverage.prefills_without_commit += 1
         decisions = self._request_decisions if mine else 0
@@ -790,13 +838,15 @@ class ResidentFold:
                 f"Every forward of it was declined before the fold -- a forward of fewer than "
                 f"{self.stream_min_tokens} tokens (stream_prefill_min_tokens) takes the hybrid path and "
                 "never reaches it. The request's heat was never counted and its resident set never moved; "
-                "nothing is computed incorrectly, but dynamic_resident did NOT run for this request.")
+                "nothing is computed incorrectly, but dynamic_resident did NOT run for this request.",
+            )
         else:
             self._say_once(
                 "prefill_ended_without_commit",
                 f"request {key}: {decisions} fold decision(s) over its prefill and not one commit, so its "
                 f"resident set never moved ({self.coverage.summary()}). The heat was accumulated and "
-                "thrown away.")
+                "thrown away.",
+            )
 
     # -- heat, accumulated across the request's prefill chunks --------------
     def accumulated_heat(self, layer: int) -> torch.Tensor | None:
@@ -891,8 +941,10 @@ class ResidentFold:
         """
         with self._lock:
             if self._active is not None:
-                raise FoldError(f"layer {self._active.layer} is still being folded: finish() or abort() it "
-                                "before beginning another layer")
+                raise FoldError(
+                    f"layer {self._active.layer} is still being folded: finish() or abort() it "
+                    "before beginning another layer"
+                )
             # Before the counters: a missing runner hook is a wiring failure,
             # not a decision this fold declined to take.
             window = self.window_source()
@@ -915,8 +967,9 @@ class ResidentFold:
                 self._skip(f"raised_{type(exc).__name__}")
                 raise
 
-    def _decide(self, layer: int, topk_ids: torch.Tensor, window: prefill_window.PrefillWindow | None
-                ) -> LayerPlan | None:
+    def _decide(
+        self, layer: int, topk_ids: torch.Tensor, window: prefill_window.PrefillWindow | None
+    ) -> LayerPlan | None:
         """``begin`` with the lock held and the decision counted. Every exit is accounted."""
         cap = self.capture_predicate()
         if cap is True:
@@ -932,7 +985,8 @@ class ResidentFold:
                 f"layer {layer}: this step is not one request's prefill as far as the scheduler output "
                 "goes (a decode step, or several requests prefilling at once). The folded swap-in "
                 "accumulates a request's heat and commits on its last prefill chunk, and it has no "
-                "commit point here, so it neither counts this forward nor moves anything.")
+                "commit point here, so it neither counts this forward nor moves anything.",
+            )
         if window.key != self._request_key:
             # Per-request, so the previous request's commits cannot answer for
             # this one (``note_prefill_end``). Counted here rather than in
@@ -951,14 +1005,16 @@ class ResidentFold:
                 "all_resident_pinned",
                 f"layer {layer}: all {p.num_resident} resident experts are pinned (kt reports CPU weights "
                 "for none of them), so the folded swap cannot move anything. The full-set load ("
-                "KT_FULLSET_LOAD) has to be on before dynamic_resident can do anything at all.")
+                "KT_FULLSET_LOAD) has to be on before dynamic_resident can do anything at all.",
+            )
         if self._decided_at.get(layer) == window.seq:
             raise FoldError(
                 f"layer {layer} has already been decided under prefill window {window} -- the runner "
                 "published no new one between the two forwards. Accumulating this forward's routing "
                 "again would count its tokens twice, and a window whose 'last' is stale would commit a "
                 "second time on a chunk that is not the last. prefill_window.observe() must run once "
-                "per execute_model.")
+                "per execute_model."
+            )
         self._note_window(window)
         self._decided_at[layer] = window.seq
         heat = self._accumulate(layer, heat_from_topk(topk_ids, p.num_experts))
@@ -991,22 +1047,25 @@ class ResidentFold:
             raise FoldError("after_chunk without begin(): the hook is wired to a layer the fold did not open")
         self._check_staging(a)
         if int(self.provider.layer) != a.layer:
-            raise FoldError(f"the provider is bound to layer {self.provider.layer}, the fold is on layer "
-                            f"{a.layer}: the chunk's bytes belong to another layer")
+            raise FoldError(
+                f"the provider is bound to layer {self.provider.layer}, the fold is on layer "
+                f"{a.layer}: the chunk's bytes belong to another layer"
+            )
         ids = tuple(int(e) for e in expert_ids)
         # Both accessors make the same staleness check (this layer, this chunk
         # index, these ids) and both refuse the mode they are not for, so asking
         # the wrong one cannot quietly hand back the other layout's buffers.
-        served = self.provider.served_nz(chunk_index, ids) if self._nz else \
-            self.provider.served_nd(chunk_index, ids)
+        served = self.provider.served_nz(chunk_index, ids) if self._nz else self.provider.served_nd(chunk_index, ids)
         rows, cols = [], []
         for pos, e in enumerate(ids):
             row = a.row_of.get(e)
             if row is None:
                 continue
             if a.filled[row]:
-                raise FoldError(f"layer {a.layer}: expert {e} came by in two chunks; its staging row would be "
-                                "written twice from two different sources")
+                raise FoldError(
+                    f"layer {a.layer}: expert {e} came by in two chunks; its staging row would be "
+                    "written twice from two different sources"
+                )
             rows.append(row)
             cols.append(pos)
         a.chunks_seen += 1
@@ -1020,14 +1079,14 @@ class ResidentFold:
         if self._nz:
             a.bytes_staged += self._stage_chunk_nz(served, rows, cols, r, c)
         else:
-            a.bytes_staged += sum(_stage_rows(self._staging[name], r, served[name], c)
-                                  for name in SLOT_WEIGHT_ATTRS)
+            a.bytes_staged += sum(_stage_rows(self._staging[name], r, served[name], c) for name in SLOT_WEIGHT_ATTRS)
         for row, pos in zip(rows, cols):
             a.filled[row] = True
             a.staged.append(ids[pos])
 
-    def _stage_chunk_nz(self, served: Any, rows: Sequence[int], cols: Sequence[int],
-                        r: torch.Tensor, c: torch.Tensor) -> int:
+    def _stage_chunk_nz(
+        self, served: Any, rows: Sequence[int], cols: Sequence[int], r: torch.Tensor, c: torch.Tensor
+    ) -> int:
         """One chunk into the NZ staging: scales by ``index_copy_``, weights by address.
 
         The split is not a style choice. The scales never went through the cast,
@@ -1044,19 +1103,25 @@ class ResidentFold:
             raise FoldError(
                 f"the chunk's H2D went to ACL stream {served.stream} and this forward is on {now}: a raw "
                 "device-to-device copy issued on a different stream is ordered against the H2D by nothing, "
-                "so it could read the previous chunk's bytes")
+                "so it could read the previous chunk's bytes"
+            )
         if int(served.num_slots) <= 0:
             raise FoldError("the served chunk declares no slots")
         for pos in cols:
             if not 0 <= int(pos) < int(served.num_slots):
                 raise FoldError(f"slot {pos} is outside the chunk's {served.num_slots} slots")
         runs = merge_runs(list(zip((int(x) for x in rows), (int(x) for x in cols))))
-        scales = [_stage_rows(self._staging[name], r, served.nd_scales[name], c)
-                  for name in ND_SCALE_ATTRS]
-        weights = [fold_stage_write_nz(self._staging[name], served.nz_weights[name],
-                                       bytes_per_slot=self._nz_bytes[name], runs=runs,
-                                       stream=int(served.stream))
-                   for name in NZ_WEIGHT_ATTRS]
+        scales = [_stage_rows(self._staging[name], r, served.nd_scales[name], c) for name in ND_SCALE_ATTRS]
+        weights = [
+            fold_stage_write_nz(
+                self._staging[name],
+                served.nz_weights[name],
+                bytes_per_slot=self._nz_bytes[name],
+                runs=runs,
+                stream=int(served.stream),
+            )
+            for name in NZ_WEIGHT_ATTRS
+        ]
         return sum(scales) + sum(weights)
 
     def _nz_barrier_wait(self) -> None:
@@ -1094,8 +1159,9 @@ class ResidentFold:
     def _check_staging(self, a: _Active) -> None:
         moved = self._staging_moved(a.staging_addrs)
         if moved:
-            raise FoldError(f"layer {a.layer}: staging {moved} was reallocated mid-layer; the rows staged "
-                            "before are gone")
+            raise FoldError(
+                f"layer {a.layer}: staging {moved} was reallocated mid-layer; the rows staged before are gone"
+            )
 
     # -- 3. after the last chunk ------------------------------------------
     def finish(self) -> FoldedLayer:
@@ -1111,7 +1177,8 @@ class ResidentFold:
                     f"layer {a.layer}: chosen experts {sorted(missing)[:8]} ({len(missing)} of "
                     f"{len(a.row_of)}) never came by in any of the {a.chunks_seen} chunk(s). Their bytes exist "
                     "nowhere on the device (the resident NZ bytes cannot be read back to ND), so "
-                    "the whole-tensor write would carry stale rows into their slots.")
+                    "the whole-tensor write would carry stale rows into their slots."
+                )
             want = len(a.row_of) * self._expert_bytes
             if a.bytes_staged != want:
                 raise FoldError(
@@ -1119,13 +1186,15 @@ class ResidentFold:
                     f"experts x {self._expert_bytes} B = {want} B were accounted as staged. The rows this "
                     "layer believes it filled and the copies that actually ran have come apart ("
                     "J2). 🔴 The reverse does NOT hold: equal byte counts say nothing about the CONTENT of "
-                    "the staging -- only the bit-for-bit criterion does.")
+                    "the staging -- only the bit-for-bit criterion does."
+                )
             if self._nz:
                 if len(a.plan.new_ids) != self.num_slots:
                     raise FoldError(
                         f"layer {a.layer}: the plan has {len(a.plan.new_ids)} rows and the NZ staging holds "
                         f"{self.num_slots} slots. The prebuilt slot describes the WHOLE staging, so a short "
-                        "plan would commit the tail slots as well -- whatever the previous layer left there.")
+                        "plan would commit the tail slots as well -- whatever the previous layer left there."
+                    )
                 # The staging IS the cast output (built once, in
                 # ``_enable_nz_staging``): its weights are the NZ allocations the
                 # chunks were copied into and its scales are the views
@@ -1154,9 +1223,15 @@ class ResidentFold:
         self.coverage.experts_staged += len(a.staged)
         self.coverage.bytes_staged += a.bytes_staged
         self.coverage.staged_pairs |= {(a.layer, e) for e in a.staged}
-        return FoldedLayer(layer=a.layer, plan=a.plan, weights=slot.tensors(), staged=tuple(a.staged),
-                           chunks_seen=a.chunks_seen, bytes_staged=a.bytes_staged,
-                           staging_generation=self._staging_generation)
+        return FoldedLayer(
+            layer=a.layer,
+            plan=a.plan,
+            weights=slot.tensors(),
+            staged=tuple(a.staged),
+            chunks_seen=a.chunks_seen,
+            bytes_staged=a.bytes_staged,
+            staging_generation=self._staging_generation,
+        )
 
     def abort(self) -> None:
         """Drop the layer in flight (the streamed layer raised). Nothing was written to it."""
@@ -1174,11 +1249,14 @@ class ResidentFold:
                 f"{self._staging_generation - folded.staging_generation} time(s) since this layer was cast, "
                 "and the scales of a cast slot are VIEWS of the staging "
                 "(stream_io.format_nd) -- committing now would write another layer's scale bytes with every "
-                "guard green. Commit a folded layer before staging the next one.")
+                "guard green. Commit a folded layer before staging the next one."
+            )
         moved = self._staging_moved(self._staging_addrs0)
         if moved:
-            raise FoldError(f"layer {folded.layer}: staging {moved} was reallocated before the commit; the "
-                            "cast slot's scale views point into the old storage")
+            raise FoldError(
+                f"layer {folded.layer}: staging {moved} was reallocated before the commit; the "
+                "cast slot's scale views point into the old storage"
+            )
         self._committing = folded
         try:
             rep = self.committer.commit(step, folded.layer, folded.plan.new_ids, folded.weights)
@@ -1194,17 +1272,25 @@ class ResidentFold:
             if set(rep.promoted) != set(folded.plan.promote) or set(rep.demoted) != set(folded.plan.demote):
                 raise FoldError(
                     f"layer {folded.layer}: the plan promoted {folded.plan.promote[:8]} / demoted "
-                    f"{folded.plan.demote[:8]}, the commit reports {rep.promoted[:8]} / {rep.demoted[:8]}")
+                    f"{folded.plan.demote[:8]}, the commit reports {rep.promoted[:8]} / {rep.demoted[:8]}"
+                )
             cov.layers_committed += 1
             self._request_commits += 1
             cov.layers_recovered += int(rep.recovered)
             cov.layers_unverified += int(rep.weights_verified is not True)
             cov.pairs_moved |= {(folded.layer, e) for e in rep.promoted + rep.demoted}
             if rep.recovered:
-                logger.warning("kt_offload fold: layer %d reached the new set only by rolling forward: %s",
-                               folded.layer, rep.error)
-        return FoldReport(step=step, layer=folded.layer, plan=folded.plan, swap=rep, staged=len(folded.staged),
-                          bytes_staged=folded.bytes_staged)
+                logger.warning(
+                    "kt_offload fold: layer %d reached the new set only by rolling forward: %s", folded.layer, rep.error
+                )
+        return FoldReport(
+            step=step,
+            layer=folded.layer,
+            plan=folded.plan,
+            swap=rep,
+            staged=len(folded.staged),
+            bytes_staged=folded.bytes_staged,
+        )
 
     def _refetch(self, layer: int, new_ids: Sequence[int]) -> dict[str, torch.Tensor]:
         """The committer's roll-forward source: the cast staging being committed, re-offered.
@@ -1215,8 +1301,10 @@ class ResidentFold:
         """
         f = self._committing
         if f is None or f.layer != int(layer) or tuple(f.plan.new_ids) != tuple(int(e) for e in new_ids):
-            raise FoldError(f"roll-forward asked for layer {layer} {tuple(new_ids)[:8]}, but the fold is "
-                            f"committing {None if f is None else (f.layer, f.plan.new_ids[:8])}")
+            raise FoldError(
+                f"roll-forward asked for layer {layer} {tuple(new_ids)[:8]}, but the fold is "
+                f"committing {None if f is None else (f.layer, f.plan.new_ids[:8])}"
+            )
         return dict(f.weights)
 
     # -- convenience for the wiring ---------------------------------------

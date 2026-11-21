@@ -50,9 +50,14 @@ class FakeSource:
     because a real safetensors data section does too.
     """
 
-    ORDER = (("w1", "weight", W13_BYTES), ("w3", "weight", W13_BYTES),
-             ("w2", "weight", W2_BYTES), ("w1", "scale", SCALE_BYTES),
-             ("w3", "scale", SCALE_BYTES), ("w2", "scale", SCALE_BYTES))
+    ORDER = (
+        ("w1", "weight", W13_BYTES),
+        ("w3", "weight", W13_BYTES),
+        ("w2", "weight", W2_BYTES),
+        ("w1", "scale", SCALE_BYTES),
+        ("w3", "scale", SCALE_BYTES),
+        ("w2", "scale", SCALE_BYTES),
+    )
     PER_EXPERT = sum(n for _, _, n in ORDER)
 
     def __init__(self, path="/fake/shard-0.safetensors", data_start=1234, num_layers=2, num_experts=4):
@@ -80,8 +85,7 @@ def test_w13_is_split_into_contiguous_per_part_intervals():
     src = FakeSource(num_layers=1, num_experts=1)
     plan = plan_placement(src, [0], [0], tp=2, fraction=[0.5, 0.5], streaming_node=0)
     span = src.locate(0, 0, "w1", "weight")
-    w1 = sorted((s for s in plan.segments if (s.proj, s.kind) == ("w1", "weight")),
-                key=lambda s: s.start)
+    w1 = sorted((s for s in plan.segments if (s.proj, s.kind) == ("w1", "weight")), key=lambda s: s.start)
     # Two parts x (local prefix + overflow) with fraction 0.5 each.
     assert [s.part for s in w1] == [0, 0, 1, 1]
     # Contiguous and gapless over exactly the tensor.
@@ -102,9 +106,9 @@ def test_fraction_is_a_contiguous_prefix_on_the_parts_own_node():
     src = FakeSource(num_layers=1, num_experts=1)
     plan = plan_placement(src, [0], [0], tp=2, fraction=[0.25, 0.75], streaming_node=0)
     span = src.locate(0, 0, "w3", "weight")
-    part0 = sorted((s for s in plan.segments
-                    if (s.proj, s.kind) == ("w3", "weight") and s.part == 0),
-                   key=lambda s: s.start)
+    part0 = sorted(
+        (s for s in plan.segments if (s.proj, s.kind) == ("w3", "weight") and s.part == 0), key=lambda s: s.start
+    )
     half = span.nbytes // 2
     assert part0[0].node == 0 and part0[0].reason == "w13-local"
     assert part0[0].start == span.start
@@ -121,10 +125,8 @@ def test_w2_and_every_scale_go_to_the_streaming_node_whole():
     split here, by design, not by oversight."""
     src = FakeSource(num_layers=1, num_experts=2)
     plan = plan_placement(src, [0], [0, 1], tp=2, fraction=[0.5, 0.5], streaming_node=1)
-    whole = [s for s in plan.segments if (s.proj, s.kind) != ("w1", "weight")
-             and (s.proj, s.kind) != ("w3", "weight")]
-    assert {(s.proj, s.kind) for s in whole} == {("w2", "weight"), ("w1", "scale"),
-                                                 ("w3", "scale"), ("w2", "scale")}
+    whole = [s for s in plan.segments if (s.proj, s.kind) != ("w1", "weight") and (s.proj, s.kind) != ("w3", "weight")]
+    assert {(s.proj, s.kind) for s in whole} == {("w2", "weight"), ("w1", "scale"), ("w3", "scale"), ("w2", "scale")}
     for s in whole:
         assert s.node == 1, s
         assert s.part is None
@@ -210,7 +212,7 @@ def test_derive_fraction_reads_free_plus_reclaimable_file_cache():
     # node1: free 247.2 + (FilePages 73.1 - Shmem 46.2)  = 274.1 GiB
     mem = {0: _mem(52.8, 222.8, 159.9, 0), 1: _mem(247.2, 73.1, 46.2, 1)}
     f = derive_fraction(0.0, 2, memory=mem, need_bytes_per_part=NEED)
-    assert f == [1.0, 1.0]          # 两边都放得下 100 GiB
+    assert f == [1.0, 1.0]  # 两边都放得下 100 GiB
     # 把需求抬到 200 GiB，node0 的 115.7 就不够了，而 node1 的 274.1 够
     f2 = derive_fraction(0.0, 2, memory=mem, need_bytes_per_part=int(200 * GIB))
     assert f2[0] == pytest.approx(115.7 / 200.0, abs=1e-3)
@@ -229,10 +231,10 @@ def test_derive_fraction_subtracts_the_reserve_from_each_node():
     mem = {0: _mem(120.0, 0.0, 0.0, 0), 1: _mem(120.0, 0.0, 0.0, 1)}
     f0 = derive_fraction(0.0, 2, memory=mem, need_bytes_per_part=NEED)
     f16 = derive_fraction(16.0, 2, memory=mem, need_bytes_per_part=NEED)
-    assert f0 == [1.0, 1.0]                       # 120 > 100
-    assert f16 == [1.0, 1.0]                      # 120-16=104，仍 > 100
+    assert f0 == [1.0, 1.0]  # 120 > 100
+    assert f16 == [1.0, 1.0]  # 120-16=104，仍 > 100
     f40 = derive_fraction(40.0, 2, memory=mem, need_bytes_per_part=NEED)
-    assert f40[0] == pytest.approx(80.0 / 100.0, abs=1e-3)   # 120-40=80 < 100
+    assert f40[0] == pytest.approx(80.0 / 100.0, abs=1e-3)  # 120-40=80 < 100
 
 
 def test_derive_fraction_clamps_a_node_that_is_past_its_reserve():
@@ -293,12 +295,12 @@ def test_read_node_memory_raises_on_a_missing_field(tmp_path):
 @pytest.mark.parametrize(
     "frac, tp, match",
     [
-        ([0.5, 0.3, 0.2], 2, "lists 3"),          # wrong length
+        ([0.5, 0.3, 0.2], 2, "lists 3"),  # wrong length
         ([0.5], 2, "lists 1"),
         # 没有"和为 1"这条规则：各项独立，完美局部性是 [1.0]*tp
-        ([1.5, 0.5], 2, r"outside \[0, 1\]"),      # 越界仍要拒
+        ([1.5, 0.5], 2, r"outside \[0, 1\]"),  # 越界仍要拒
         ([-0.1, 1.0], 2, r"outside \[0, 1\]"),
-        ([-0.1, 1.1], 2, "outside"),              # negative entry
+        ([-0.1, 1.1], 2, "outside"),  # negative entry
         ([1.5, -0.5], 2, "outside"),
     ],
 )
@@ -339,31 +341,49 @@ def test_needed_move_zero_is_rejected():
     """The whole point of ``needed_move``. This test exists so the guard itself
     is known to be able to go red: build the report an implementation that did
     nothing would produce, and require that it is refused."""
-    rep = MigrationReport(planned_pages=1000, resident_pages=1000, needed_move=0,
-                          moved=1000, failed_pages=0,
-                          before_by_node={0: 1000}, after_by_node={0: 1000})
+    rep = MigrationReport(
+        planned_pages=1000,
+        resident_pages=1000,
+        needed_move=0,
+        moved=1000,
+        failed_pages=0,
+        before_by_node={0: 1000},
+        after_by_node={0: 1000},
+    )
     assert rep.failed_pages == 0 and rep.moved == rep.resident_pages  # "looks perfect"
     with pytest.raises(MutationNotAppliedError, match="needed_move=0"):
         rep.require_mutation_applied()
 
 
 def test_needed_move_positive_passes():
-    rep = MigrationReport(planned_pages=1000, resident_pages=1000, needed_move=500,
-                          moved=1000, failed_pages=0)
+    rep = MigrationReport(planned_pages=1000, resident_pages=1000, needed_move=500, moved=1000, failed_pages=0)
     assert rep.require_mutation_applied() is rep
 
 
 def test_report_merge_adds_every_counter():
     """Per-batch reports are merged under a lock; a counter dropped here would
     under-report failures, which is the direction that hides a bad run."""
-    a = MigrationReport(planned_pages=10, resident_pages=8, needed_move=4, moved=3,
-                        failed_pages=5, before_by_node={0: 8}, after_by_node={1: 3},
-                        errno_pages={"EBUSY(Device or resource busy)": 5})
-    b = MigrationReport(planned_pages=20, resident_pages=16, needed_move=6, moved=16,
-                        failed_pages=0, before_by_node={1: 16}, after_by_node={1: 16})
+    a = MigrationReport(
+        planned_pages=10,
+        resident_pages=8,
+        needed_move=4,
+        moved=3,
+        failed_pages=5,
+        before_by_node={0: 8},
+        after_by_node={1: 3},
+        errno_pages={"EBUSY(Device or resource busy)": 5},
+    )
+    b = MigrationReport(
+        planned_pages=20,
+        resident_pages=16,
+        needed_move=6,
+        moved=16,
+        failed_pages=0,
+        before_by_node={1: 16},
+        after_by_node={1: 16},
+    )
     a.merge(b)
-    assert (a.planned_pages, a.resident_pages, a.needed_move, a.moved,
-            a.failed_pages) == (30, 24, 10, 19, 5)
+    assert (a.planned_pages, a.resident_pages, a.needed_move, a.moved, a.failed_pages) == (30, 24, 10, 19, 5)
     assert a.before_by_node == {0: 8, 1: 16}
     assert a.after_by_node == {1: 19}
     assert a.errno_pages == {"EBUSY(Device or resource busy)": 5}
@@ -386,9 +406,14 @@ def test_apply_placement_raises_when_nothing_is_resident(monkeypatch, tmp_path):
     shard = tmp_path / "shard.safetensors"
     shard.write_bytes(b"\0" * (4 * 1024 * 1024))
     src = FakeSource(path=str(shard), data_start=0, num_layers=1, num_experts=1)
-    src.ORDER = (("w1", "weight", 1 << 20), ("w3", "weight", 1 << 20),
-                 ("w2", "weight", 1 << 20), ("w1", "scale", 4096),
-                 ("w3", "scale", 4096), ("w2", "scale", 4096))
+    src.ORDER = (
+        ("w1", "weight", 1 << 20),
+        ("w3", "weight", 1 << 20),
+        ("w2", "weight", 1 << 20),
+        ("w1", "scale", 4096),
+        ("w3", "scale", 4096),
+        ("w2", "scale", 4096),
+    )
     src.PER_EXPERT = sum(n for _, _, n in src.ORDER)
     plan = plan_placement(src, [0], [0], tp=2, fraction=[0.5, 0.5])
     monkeypatch.setattr(np_._Libc, "resident", lambda self, addr, lo, n: [])
@@ -489,6 +514,7 @@ class _RecordingLogger:
     def _rec(self, level):
         def log(fmt, *args):
             self.lines.append((level, fmt % args if args else fmt))
+
         return log
 
     def __getattr__(self, name):
@@ -504,9 +530,11 @@ def test_a_failing_reset_never_replaces_the_bodys_exception(monkeypatch):
     rec = _RecordingLogger()
     monkeypatch.setattr(np_, "logger", rec)
     try:
-        with pytest.raises(RuntimeError, match="the real failure"):
-            with np_._bound_policy(_ResetFails(real), np_.MPOL_BIND, 1):
-                raise RuntimeError("the real failure")
+        with (
+            pytest.raises(RuntimeError, match="the real failure"),
+            np_._bound_policy(_ResetFails(real), np_.MPOL_BIND, 1),
+        ):
+            raise RuntimeError("the real failure")
         crit = [m for lvl, m in rec.lines if lvl == "critical"]
         assert crit and "left bound to node1" in crit[0], rec.lines
         # and it told the truth: the thread really is still bound
@@ -524,9 +552,8 @@ def test_a_failing_reset_is_loud_when_the_body_succeeded(monkeypatch):
     real = np_._Libc.get()
     monkeypatch.setattr(np_, "logger", _RecordingLogger())
     try:
-        with pytest.raises(PlacementError, match="injected"):
-            with np_._bound_policy(_ResetFails(real), np_.MPOL_BIND, 1):
-                pass
+        with pytest.raises(PlacementError, match="injected"), np_._bound_policy(_ResetFails(real), np_.MPOL_BIND, 1):
+            pass
     finally:
         real.set_mempolicy(np_.MPOL_DEFAULT, None)
 
@@ -554,6 +581,7 @@ def test_a_pool_thread_is_clean_for_the_next_task_after_one_raises():
     libc = np_._Libc.get()
     pool = ThreadPoolExecutor(max_workers=1)
     try:
+
         def failing_task():
             with np_._bound_policy(libc, np_.MPOL_BIND, 1):
                 raise RuntimeError("batch died mid fault-in")
@@ -568,7 +596,8 @@ def test_a_pool_thread_is_clean_for_the_next_task_after_one_raises():
         assert tid == first_tid, "the pool did not reuse the thread; this test proves nothing"
         assert policy == (np_.MPOL_DEFAULT, 0), (
             f"the next task on the same pool thread started under {policy}; "
-            f"MPOL_BIND leaked out of the task that raised")
+            f"MPOL_BIND leaked out of the task that raised"
+        )
     finally:
         pool.shutdown()
 
@@ -593,14 +622,14 @@ def test_a_failing_fault_leg_leaves_the_calling_thread_unbound(tmp_path, monkeyp
             np_.apply_placement(plan, threads=1, readahead_pages=64)
         assert libc.get_mempolicy() == (np_.MPOL_DEFAULT, 0), (
             "the fault-in leg raised and left the CALLING thread bound; in production "
-            "that is the engine thread, for the life of the process")
+            "that is the engine thread, for the life of the process"
+        )
         # the amplifier: a thread created after the leak inherits it at clone time
         seen = []
         t = threading.Thread(target=lambda: seen.append(libc.get_mempolicy()))
         t.start()
         t.join()
-        assert seen == [(np_.MPOL_DEFAULT, 0)], (
-            f"a thread created after the fault-in leg inherited {seen}")
+        assert seen == [(np_.MPOL_DEFAULT, 0)], f"a thread created after the fault-in leg inherited {seen}"
     finally:
         libc.set_mempolicy(np_.MPOL_DEFAULT, None)
 
@@ -625,8 +654,7 @@ def test_apply_placement_validates_the_fault_in_arguments():
 def test_require_fault_applied_is_red_when_nothing_was_faulted_in():
     """The fault leg's version of the needed_move assertion, from the red side:
     a report that read nothing must not pass as an arm, however clean it looks."""
-    rep = MigrationReport(planned_pages=1000, fault_planned_pages=1000, faulted_in=0,
-                          fault_failed_pages=0)
+    rep = MigrationReport(planned_pages=1000, fault_planned_pages=1000, faulted_in=0, fault_failed_pages=0)
     with pytest.raises(MutationNotAppliedError, match="faulted_in=0"):
         rep.require_fault_applied()
 
@@ -635,22 +663,29 @@ def test_require_applied_passes_when_the_fault_leg_did_all_the_work():
     """An all-cold file gives the migrate leg nothing to move, so needed_move=0
     is the *expected* result of a successful bind -- not a failure. The gate is
     examined_pages, not resident_pages."""
-    rep = MigrationReport(planned_pages=1000, resident_pages=0, examined_pages=1000,
-                          needed_move=0, moved=1000, fault_planned_pages=1000,
-                          faulted_in=1000, fault_by_node={0: 1000})
+    rep = MigrationReport(
+        planned_pages=1000,
+        resident_pages=0,
+        examined_pages=1000,
+        needed_move=0,
+        moved=1000,
+        fault_planned_pages=1000,
+        faulted_in=1000,
+        fault_by_node={0: 1000},
+    )
     assert rep.require_applied() is rep
 
 
 def test_require_applied_is_red_when_neither_leg_applied_anything():
-    rep = MigrationReport(planned_pages=1000, resident_pages=0, examined_pages=0,
-                          needed_move=0, fault_planned_pages=0, faulted_in=0)
+    rep = MigrationReport(
+        planned_pages=1000, resident_pages=0, examined_pages=0, needed_move=0, fault_planned_pages=0, faulted_in=0
+    )
     with pytest.raises(MutationNotAppliedError, match="neither leg"):
         rep.require_applied()
 
 
 def test_require_applied_still_checks_the_migrate_leg_when_pages_were_resident():
-    rep = MigrationReport(planned_pages=1000, resident_pages=1000, examined_pages=1000,
-                          needed_move=0, moved=1000)
+    rep = MigrationReport(planned_pages=1000, resident_pages=1000, examined_pages=1000, needed_move=0, moved=1000)
     with pytest.raises(MutationNotAppliedError, match="needed_move=0"):
         rep.require_applied()
 
@@ -658,8 +693,14 @@ def test_require_applied_still_checks_the_migrate_leg_when_pages_were_resident()
 def test_percentages_use_examined_not_resident():
     """With everything brought in by the fault leg ``resident_pages`` is 0, so a
     resident denominator prints 'before={0: 5508000.00%}'."""
-    rep = MigrationReport(planned_pages=100, resident_pages=0, examined_pages=100,
-                          moved=100, before_by_node={0: 100}, after_by_node={0: 100})
+    rep = MigrationReport(
+        planned_pages=100,
+        resident_pages=0,
+        examined_pages=100,
+        moved=100,
+        before_by_node={0: 100},
+        after_by_node={0: 100},
+    )
     assert "5508000" not in str(rep)
     assert "before_of_examined={0: '100.00%'}" in str(rep)
 
@@ -701,8 +742,14 @@ def _cold_shard(tmp_path, experts=2):
     this host is reading.
     """
     w13, w2, sc = 1 << 20, 1 << 20, 4096
-    order = (("w1", "weight", w13), ("w3", "weight", w13), ("w2", "weight", w2),
-             ("w1", "scale", sc), ("w3", "scale", sc), ("w2", "scale", sc))
+    order = (
+        ("w1", "weight", w13),
+        ("w3", "weight", w13),
+        ("w2", "weight", w2),
+        ("w1", "scale", sc),
+        ("w3", "scale", sc),
+        ("w2", "scale", sc),
+    )
     per = sum(n for _, _, n in order)
     path = tmp_path / "cold.safetensors"
     with open(path, "wb") as f:
@@ -734,9 +781,16 @@ def test_fault_in_places_pages_that_move_pages_cannot_touch(tmp_path):
     landed = {}
     for node in (0, 1):
         evict()
-        _plan, rep = np_.place_weights(src, [0], [0, 1], tp=2, streaming_node=node,
-                                       fraction=[1.0, 0.0] if node == 0 else [0.0, 1.0],
-                                       threads=2, readahead_pages=64)
+        _plan, rep = np_.place_weights(
+            src,
+            [0],
+            [0, 1],
+            tp=2,
+            streaming_node=node,
+            fraction=[1.0, 0.0] if node == 0 else [0.0, 1.0],
+            threads=2,
+            readahead_pages=64,
+        )
         # the mutation was applied: these pages did not exist before this call
         assert rep.fault_planned_pages > 0
         assert rep.faulted_in > 0
@@ -783,11 +837,9 @@ def test_a_caller_that_derived_the_fraction_says_so(tmp_path):
     that derived the split and then pins it for one call must not have the plan
     report it as operator-pinned."""
     src = FakeSource()
-    plan = plan_placement(src, [0], [0], tp=2, fraction=[0.4, 0.6],
-                          fraction_source="derived")
+    plan = plan_placement(src, [0], [0], tp=2, fraction=[0.4, 0.6], fraction_source="derived")
     assert plan.fraction_source == "derived"
-    assert plan_placement(src, [0], [0], tp=2,
-                          fraction=[0.4, 0.6]).fraction_source == "configured"
+    assert plan_placement(src, [0], [0], tp=2, fraction=[0.4, 0.6]).fraction_source == "configured"
 
 
 def test_populate_issues_one_madvise_per_contiguous_run():
@@ -833,7 +885,8 @@ def test_the_fault_leg_does_not_touch_page_by_page(monkeypatch, tmp_path):
     def no_touch(buf, pages):
         raise AssertionError(
             "the fault-in leg touched pages from Python; that holds the GIL across every "
-            "major fault and serialises the threads (0.56 vs 2.85 GiB/s measured)")
+            "major fault and serialises the threads (0.56 vs 2.85 GiB/s measured)"
+        )
 
     monkeypatch.setattr(np_, "_touch", no_touch)
     rep = np_.apply_placement(plan, threads=2, readahead_pages=64)
@@ -848,9 +901,9 @@ class _FakeLibc:
     def __init__(self, size, resident, node_of, misplace_to=None):
         self.size = size
         self.resident_pages = set(resident)
-        self.node_of = dict(node_of)      # page -> node it is currently on
+        self.node_of = dict(node_of)  # page -> node it is currently on
         self.misplace_to = misplace_to or {}  # page -> node it will land on
-        self.examined = []                # pages handed to a real move
+        self.examined = []  # pages handed to a real move
         self.queried = []
 
     def map_readonly(self, path):
@@ -891,9 +944,14 @@ class _FakeLibc:
 def _fake_plan_single_file(npages, node):
     """A plan of one file, one run, all on `node` -- so the scope maths is the
     only thing under test."""
-    return PlacementPlan(segments=(), fraction=(1.0,), fraction_source="configured",
-                         part_nodes=(node,), streaming_node=node,
-                         page_runs={"/fake": ((0, npages, node),)})
+    return PlacementPlan(
+        segments=(),
+        fraction=(1.0,),
+        fraction_source="configured",
+        part_nodes=(node,),
+        streaming_node=node,
+        page_runs={"/fake": ((0, npages, node),)},
+    )
 
 
 @pytest.fixture
@@ -908,8 +966,7 @@ def fake_libc(monkeypatch):
         real_populate = libc.populate
 
         def populate(addr, first, count):
-            libc.fault_in([p for p in range(first, first + count)
-                           if p not in libc.resident_pages])
+            libc.fault_in([p for p in range(first, first + count) if p not in libc.resident_pages])
             return real_populate(addr, first, count)
 
         libc.populate = populate
@@ -923,9 +980,9 @@ def test_suspect_scope_examines_only_the_flagged_and_the_unseen(fake_libc):
     n = 100
     # pages 0-9 already cached (on the wrong node); 10-99 not cached yet.
     # Of the ones read in, 50 and 51 will land on node 1 despite the bind.
-    libc = fake_libc(_FakeLibc(n * np_.PAGE_SIZE, resident=range(10),
-                               node_of={p: 1 for p in range(10)},
-                               misplace_to={50: 1, 51: 1}))
+    libc = fake_libc(
+        _FakeLibc(n * np_.PAGE_SIZE, resident=range(10), node_of={p: 1 for p in range(10)}, misplace_to={50: 1, 51: 1})
+    )
     plan = _fake_plan_single_file(n, node=0)
     rep = np_.apply_placement(plan, threads=1, migrate_scope="suspect")
     assert rep.fault_misplaced == 2
@@ -935,9 +992,9 @@ def test_suspect_scope_examines_only_the_flagged_and_the_unseen(fake_libc):
 def test_all_scope_re_examines_every_page(fake_libc):
     """The old arm, kept so criterion 1 has something to compare against."""
     n = 100
-    libc = fake_libc(_FakeLibc(n * np_.PAGE_SIZE, resident=range(10),
-                               node_of={p: 1 for p in range(10)},
-                               misplace_to={50: 1, 51: 1}))
+    libc = fake_libc(
+        _FakeLibc(n * np_.PAGE_SIZE, resident=range(10), node_of={p: 1 for p in range(10)}, misplace_to={50: 1, 51: 1})
+    )
     plan = _fake_plan_single_file(n, node=0)
     np_.apply_placement(plan, threads=1, migrate_scope="all")
     assert sorted(libc.examined) == list(range(n))
@@ -948,9 +1005,9 @@ def test_resident_scope_is_the_negative_control(fake_libc):
     this arm ever matched 'suspect', the correction would be doing nothing and
     'faster' would be indistinguishable from 'skipped the work'."""
     n = 100
-    libc = fake_libc(_FakeLibc(n * np_.PAGE_SIZE, resident=range(10),
-                               node_of={p: 1 for p in range(10)},
-                               misplace_to={50: 1, 51: 1}))
+    libc = fake_libc(
+        _FakeLibc(n * np_.PAGE_SIZE, resident=range(10), node_of={p: 1 for p in range(10)}, misplace_to={50: 1, 51: 1})
+    )
     plan = _fake_plan_single_file(n, node=0)
     np_.apply_placement(plan, threads=1, migrate_scope="resident")
     assert sorted(libc.examined) == list(range(10))
@@ -969,26 +1026,28 @@ def test_audit_is_measured_over_every_planned_page_not_the_examined_ones(fake_li
     'suspect' examines a fraction of what 'all' does, so comparing the two
     reports would read a narrower arm as a worse one."""
     n = 100
-    fake_libc(_FakeLibc(n * np_.PAGE_SIZE, resident=range(10),
-                        node_of={p: 1 for p in range(10)},
-                        misplace_to={50: 1, 51: 1}))
+    fake_libc(
+        _FakeLibc(n * np_.PAGE_SIZE, resident=range(10), node_of={p: 1 for p in range(10)}, misplace_to={50: 1, 51: 1})
+    )
     plan = _fake_plan_single_file(n, node=0)
     rep = np_.apply_placement(plan, threads=1, migrate_scope="suspect")
-    assert rep.examined_pages == 12          # the report's view: 12 pages
+    assert rep.examined_pages == 12  # the report's view: 12 pages
     audit = np_.audit_placement(plan, threads=1)
-    assert audit.resident_pages == n         # the audit's view: all 100
+    assert audit.resident_pages == n  # the audit's view: all 100
     assert audit.on_target == n and audit.off_target == 0
     assert audit.on_target_pct == 100.0
 
 
 def test_audit_counts_pages_left_on_the_wrong_node(fake_libc):
-    fake_libc(_FakeLibc(100 * np_.PAGE_SIZE, resident=range(10),
-                        node_of={p: 1 for p in range(10)},
-                        misplace_to={50: 1, 51: 1}))
+    fake_libc(
+        _FakeLibc(
+            100 * np_.PAGE_SIZE, resident=range(10), node_of={p: 1 for p in range(10)}, misplace_to={50: 1, 51: 1}
+        )
+    )
     plan = _fake_plan_single_file(100, node=0)
     np_.apply_placement(plan, threads=1, migrate_scope="resident")
     audit = np_.audit_placement(plan, threads=1)
-    assert audit.off_target == 2             # 50 and 51, never corrected
+    assert audit.off_target == 2  # 50 and 51, never corrected
     assert audit.on_target_pct == 98.0
     assert audit.by_node == {0: 98, 1: 2}
     assert audit.target_by_node == {0: 100}
@@ -1000,9 +1059,11 @@ def test_final_by_node_covers_every_resident_page_whatever_the_scope(fake_libc):
     misplaced ones must report the same final distribution."""
     finals = {}
     for scope in ("all", "suspect", "resident"):
-        fake_libc(_FakeLibc(100 * np_.PAGE_SIZE, resident=range(10),
-                            node_of={p: 1 for p in range(10)},
-                            misplace_to={50: 1, 51: 1}))
+        fake_libc(
+            _FakeLibc(
+                100 * np_.PAGE_SIZE, resident=range(10), node_of={p: 1 for p in range(10)}, misplace_to={50: 1, 51: 1}
+            )
+        )
         plan = _fake_plan_single_file(100, node=0)
         rep = np_.apply_placement(plan, threads=1, migrate_scope=scope)
         assert sum(rep.final_by_node.values()) == 100, (scope, rep.final_by_node)
@@ -1018,9 +1079,11 @@ def test_final_by_node_agrees_with_an_independent_audit_when_nothing_drifts(fake
     state when each page was placed and the audit the state when it ran, so
     demanding equality there would be testing the kernel's mood."""
     for scope in ("all", "suspect", "resident"):
-        fake_libc(_FakeLibc(100 * np_.PAGE_SIZE, resident=range(10),
-                            node_of={p: 1 for p in range(10)},
-                            misplace_to={50: 1, 51: 1}))
+        fake_libc(
+            _FakeLibc(
+                100 * np_.PAGE_SIZE, resident=range(10), node_of={p: 1 for p in range(10)}, misplace_to={50: 1, 51: 1}
+            )
+        )
         plan = _fake_plan_single_file(100, node=0)
         rep = np_.apply_placement(plan, threads=1, migrate_scope=scope)
         audit = np_.audit_placement(plan, threads=1)
@@ -1037,14 +1100,22 @@ def test_landed_is_reported_against_the_pages_it_was_actually_asked_for(fake_lib
     # of those 40 land on node 0 anyway, so `landed` and `asked_for` are
     # DIFFERENT distributions. A fixture where they coincide cannot tell the
     # right denominator from the wrong one.
-    libc = _FakeLibc(100 * np_.PAGE_SIZE, resident=range(60),
-                     node_of={p: 0 for p in range(60)},
-                     misplace_to={p: 0 for p in range(60, 70)})
+    libc = _FakeLibc(
+        100 * np_.PAGE_SIZE,
+        resident=range(60),
+        node_of={p: 0 for p in range(60)},
+        misplace_to={p: 0 for p in range(60, 70)},
+    )
     fake_libc(libc)
-    plan = PlacementPlan(segments=(), fraction=(0.6, 0.4), fraction_source="configured",
-                         part_nodes=(0, 1), streaming_node=1,
-                         page_runs={"/fake": ((0, 60, 0), (60, 100, 1))})
-    assert plan.planned_pages_by_node() == {0: 60, 1: 40}   # the global plan: 60% node0
+    plan = PlacementPlan(
+        segments=(),
+        fraction=(0.6, 0.4),
+        fraction_source="configured",
+        part_nodes=(0, 1),
+        streaming_node=1,
+        page_runs={"/fake": ((0, 60, 0), (60, 100, 1))},
+    )
+    assert plan.planned_pages_by_node() == {0: 60, 1: 40}  # the global plan: 60% node0
     rep = np_.apply_placement(plan, threads=1, migrate_scope="suspect")
     # ...but what fault-in was asked for is 100% node1, and that is what its
     # landed distribution has to be read against.
@@ -1062,9 +1133,11 @@ def test_final_on_target_scores_every_placed_page_against_its_own_plan(fake_libc
     """One number for "did it work", instead of two distributions to difference.
     The negative control leaves 2 of 100 behind and must say 98%."""
     for scope, want_ok in (("all", 100), ("suspect", 100), ("resident", 98)):
-        fake_libc(_FakeLibc(100 * np_.PAGE_SIZE, resident=range(10),
-                            node_of={p: 1 for p in range(10)},
-                            misplace_to={50: 1, 51: 1}))
+        fake_libc(
+            _FakeLibc(
+                100 * np_.PAGE_SIZE, resident=range(10), node_of={p: 1 for p in range(10)}, misplace_to={50: 1, 51: 1}
+            )
+        )
         plan = _fake_plan_single_file(100, node=0)
         rep = np_.apply_placement(plan, threads=1, migrate_scope=scope)
         scored = rep.final_on_target + rep.final_off_target
@@ -1078,11 +1151,15 @@ def test_a_placement_that_mostly_missed_warns(fake_libc, monkeypatch):
     own logger rather than ``caplog``, which never sees it because this package
     logs through ``vllm.logger`` and that does not propagate to root."""
     said = []
-    monkeypatch.setattr(np_.logger, "warning",
-                        lambda msg, *a, **k: said.append(msg % a if a else msg))
-    fake_libc(_FakeLibc(100 * np_.PAGE_SIZE, resident=range(10),
-                        node_of={p: 1 for p in range(10)},
-                        misplace_to={p: 1 for p in range(20, 60)}))
+    monkeypatch.setattr(np_.logger, "warning", lambda msg, *a, **k: said.append(msg % a if a else msg))
+    fake_libc(
+        _FakeLibc(
+            100 * np_.PAGE_SIZE,
+            resident=range(10),
+            node_of={p: 1 for p in range(10)},
+            misplace_to={p: 1 for p in range(20, 60)},
+        )
+    )
     plan = _fake_plan_single_file(100, node=0)
     rep = np_.apply_placement(plan, threads=1, migrate_scope="resident")
     assert rep.final_off_target == 40
@@ -1093,11 +1170,12 @@ def test_a_placement_that_landed_does_not_warn(fake_libc, monkeypatch):
     """The other half: the warning has to stay quiet when it should, or it is
     noise and gets ignored the one time it matters."""
     said = []
-    monkeypatch.setattr(np_.logger, "warning",
-                        lambda msg, *a, **k: said.append(msg % a if a else msg))
-    fake_libc(_FakeLibc(100 * np_.PAGE_SIZE, resident=range(10),
-                        node_of={p: 1 for p in range(10)},
-                        misplace_to={50: 1, 51: 1}))
+    monkeypatch.setattr(np_.logger, "warning", lambda msg, *a, **k: said.append(msg % a if a else msg))
+    fake_libc(
+        _FakeLibc(
+            100 * np_.PAGE_SIZE, resident=range(10), node_of={p: 1 for p in range(10)}, misplace_to={50: 1, 51: 1}
+        )
+    )
     plan = _fake_plan_single_file(100, node=0)
     np_.apply_placement(plan, threads=1, migrate_scope="suspect")
     assert not [m for m in said if "on their planned node" in m], said
@@ -1108,7 +1186,7 @@ def test_split_share_is_w13s_share_of_the_planned_bytes():
     touches them, so it governs only w13's share of the planned bytes."""
     src = FakeSource(num_layers=1, num_experts=4)
     plan = plan_placement(src, [0], range(4), tp=2, fraction=[0.5, 0.5], streaming_node=1)
-    w13 = 2 * W13_BYTES                       # w1.weight + w3.weight
+    w13 = 2 * W13_BYTES  # w1.weight + w3.weight
     total = w13 + W2_BYTES + 3 * SCALE_BYTES  # + w2.weight + the three scales
     assert plan.split_share == pytest.approx(w13 / total, abs=1e-6)
     assert plan.split_share == pytest.approx(0.6275, abs=1e-3)
@@ -1143,8 +1221,9 @@ def test_explain_names_the_tensors_it_actually_split():
 
 def test_explain_still_says_w13_only_for_the_checkpoint():
     """The counterexample: the checkpoint cannot split w2, and must still say so."""
-    plan = plan_placement(FakeSource(num_layers=1, num_experts=4), [0], range(4),
-                          tp=2, fraction=[0.5, 0.5], streaming_node=1)
+    plan = plan_placement(
+        FakeSource(num_layers=1, num_experts=4), [0], range(4), tp=2, fraction=[0.5, 0.5], streaming_node=1
+    )
     assert plan.split_tensor_names == ("w1.weight", "w3.weight")
     assert "w2.weight" in plan.whole_tensor_names
     assert "w2.weight" in plan.explain().split("the rest (")[1]
@@ -1157,8 +1236,7 @@ def test_fraction_times_split_share_is_the_all_pages_share(f0, expect_all_pages)
     each other's counterexample -- 0.2229 prints as "22.29%", which is exactly
     how a w13 ratio gets read as an all-pages plan."""
     src = FakeSource(num_layers=1, num_experts=8)
-    plan = plan_placement(src, [0], range(8), tp=2, part_nodes=[0, 1],
-                          streaming_node=1, fraction=[f0, 1 - f0])
+    plan = plan_placement(src, [0], range(8), tp=2, part_nodes=[0, 1], streaming_node=1, fraction=[f0, 1 - f0])
     share = 100.0 * plan.planned_pages_by_node()[0] / plan.planned_pages
     assert share == pytest.approx(expect_all_pages, abs=0.05)
     assert share == pytest.approx(100 * f0 * plan.split_share, abs=0.05)
@@ -1170,8 +1248,7 @@ def test_explain_names_the_population_of_every_percentage():
     """The deliverable: one reading that puts them side by side. If these
     labels are dropped, the next person repeats the same misreading."""
     src = FakeSource(num_layers=1, num_experts=4)
-    plan = plan_placement(src, [0], range(4), tp=2, part_nodes=[0, 1],
-                          streaming_node=1, fraction=[0.2229, 0.7771])
+    plan = plan_placement(src, [0], range(4), tp=2, part_nodes=[0, 1], streaming_node=1, fraction=[0.2229, 0.7771])
     text = plan.explain()
     assert "OF W13 ONLY" in text
     assert "of ALL planned pages" in text
@@ -1184,11 +1261,19 @@ def test_explain_names_the_population_of_every_percentage():
 
 def test_runtime_labels_carry_their_denominator():
     """Same discipline in the per-run log line."""
-    rep = MigrationReport(planned_pages=100, resident_pages=10, examined_pages=10,
-                          faulted_in=90, fault_planned_pages=90,
-                          fault_by_node={0: 90}, fault_target_by_node={0: 90},
-                          before_by_node={0: 10}, after_by_node={0: 10},
-                          final_by_node={0: 100}, final_on_target=100)
+    rep = MigrationReport(
+        planned_pages=100,
+        resident_pages=10,
+        examined_pages=10,
+        faulted_in=90,
+        fault_planned_pages=90,
+        fault_by_node={0: 90},
+        fault_target_by_node={0: 90},
+        before_by_node={0: 10},
+        after_by_node={0: 10},
+        final_by_node={0: 100},
+        final_on_target=100,
+    )
     assert "landed_of_faulted=" in rep.fault_str()
     assert "asked_for_of_faulted=" in rep.fault_str()
     text = str(rep)
@@ -1197,6 +1282,7 @@ def test_runtime_labels_carry_their_denominator():
 
 
 def test_audit_labels_carry_their_denominator():
-    a = np_.PlacementAudit(resident_pages=100, on_target=98, off_target=2,
-                           by_node={0: 98, 1: 2}, target_by_node={0: 100})
+    a = np_.PlacementAudit(
+        resident_pages=100, on_target=98, off_target=2, by_node={0: 98, 1: 2}, target_by_node={0: 100}
+    )
     assert "actual_of_resident=" in str(a) and "planned_of_resident=" in str(a)

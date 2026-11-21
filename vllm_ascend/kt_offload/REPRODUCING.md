@@ -4,7 +4,7 @@ Measured 2026-11-21 00:50–01:40 UTC, card 3, prompt 4096, gen 512, 10 requests
 `max_num_seqs=1`. The numbers this produces, and their spread over those ten
 requests:
 
-```
+```text
 TTFT  p50 8.88 s   min 8.53   max 9.20     (spread 0.67 s)
 TPOT  p50 24.08 ms min 23.81  max 24.30    (spread 0.49 ms)
 ```
@@ -42,7 +42,7 @@ bash measure/kt_rebuild.sh        # ~95 s; refuses to run while a server is up
 
 Verify — the script prints it, and the number must be 1:
 
-```
+```text
 KT_PREFETCH_NZ16_SHORT4_NTA_RB8_GOUTERON_ND_MIN40_OVER_G4_STRIDED occurrences in the .so: 1
 === KT_REBUILD_DONE
 ```
@@ -59,7 +59,7 @@ python3 measure/build_bank.py --phase full      # ~5.6 min, 269 GiB
 
 Verify:
 
-```
+```text
 [full] built 40 layer(s) in ~336s
 du: 269G  /dev/shm/dsv41_nz_bank
 verify_layer(0|20|39): bytes_compared 94003200     <- byte-for-byte against the checkpoint
@@ -116,7 +116,7 @@ with room; `MAXLEN=16384` OOMs this card at 100 resident experts.
 Ready in **~420–480 s**. Then verify the five lines below; **if any is wrong the
 numbers mean nothing**:
 
-```
+```text
 kt_offload stream: chunk lookahead ON (depth 1, provider.prefetch)
 [kt prefetch] KT_PREFETCH_...RB8_GOUTERON...: gate/up layout=NZ ... walk=GROUP-outer
 kt_offload bank-as-kt-source: 384 experts/layer, 18800640 B each

@@ -53,13 +53,6 @@ import torch
 from vllm.logger import logger
 
 from vllm_ascend.kt_offload.stream_chain import SLOT_WEIGHT_ATTRS, ChunkSlot
-
-#: Of the four slot parameters, the two that go through the NZ cast and the two
-#: that do not. ``SLOT_WEIGHT_ATTRS`` holds all four, which is the right set to
-#: hand ``format_nd`` but the wrong set to raw-copy into: a scale is a plain ND
-#: view of the buffer passed in, so writing it needs an ordinary ``copy_``.
-NZ_WEIGHT_ATTRS = ("w13_weight", "w2_weight")
-ND_SCALE_ATTRS = ("w13_weight_scale", "w2_weight_scale")
 from vllm_ascend.kt_offload.weight_source import (
     DEFAULT_COPY_THREADS,
     GROUPS,
@@ -68,6 +61,13 @@ from vllm_ascend.kt_offload.weight_source import (
     WeightSource,
     ZeroCoverageError,
 )
+
+#: Of the four slot parameters, the two that go through the NZ cast and the two
+#: that do not. ``SLOT_WEIGHT_ATTRS`` holds all four, which is the right set to
+#: hand ``format_nd`` but the wrong set to raw-copy into: a scale is a plain ND
+#: view of the buffer passed in, so writing it needs an ordinary ``copy_``.
+NZ_WEIGHT_ATTRS = ("w13_weight", "w2_weight")
+ND_SCALE_ATTRS = ("w13_weight_scale", "w2_weight_scale")
 
 __all__ = [
     "PARAM_FOR_GROUP",
@@ -219,21 +219,23 @@ def moe_scheme(quant_method: Any, *required: str) -> Any:
     as a buffer the GEMM quietly rejects.
     """
     if not required:
-        raise ValueError("moe_scheme needs the attribute names the caller is about to use; "
-                         "without them it cannot tell a scheme from a wrapper")
+        raise ValueError(
+            "moe_scheme needs the attribute names the caller is about to use; "
+            "without them it cannot tell a scheme from a wrapper"
+        )
     if all(hasattr(quant_method, a) for a in required):
         return quant_method
     inner = getattr(quant_method, "quant_method", None)
     if inner is not None and all(hasattr(inner, a) for a in required):
         return inner
     missing_outer = [a for a in required if not hasattr(quant_method, a)]
-    missing_inner = ("n/a" if inner is None
-                     else [a for a in required if not hasattr(inner, a)])
+    missing_inner = "n/a" if inner is None else [a for a in required if not hasattr(inner, a)]
     raise StreamIOError(
         f"neither {type(quant_method).__name__} (missing {missing_outer}) nor its inner quant_method "
         f"({type(inner).__name__ if inner is not None else 'absent'}, missing {missing_inner}) carries "
         f"{list(required)}; the streaming chain reads these off the scheme the model loader used, and "
-        "there is no second source for them")
+        "there is no second source for them"
+    )
 
 
 def shape_declaring_method(quant_method: Any) -> Any:
@@ -243,8 +245,13 @@ def shape_declaring_method(quant_method: Any) -> Any:
     return moe_scheme(quant_method, "get_weight", "get_dynamic_quant_param")
 
 
-def chunk_param_shapes(quant_method: Any, chunk_experts: int, intermediate_size: int, hidden_size: int,
-                       params_dtype: torch.dtype = torch.bfloat16) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+def chunk_param_shapes(
+    quant_method: Any,
+    chunk_experts: int,
+    intermediate_size: int,
+    hidden_size: int,
+    params_dtype: torch.dtype = torch.bfloat16,
+) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """``name -> (shape, dtype)`` for a chunk-sized layer, from the quant method itself.
 
     ``get_weight`` / ``get_dynamic_quant_param`` are what the model loader asks
@@ -258,8 +265,10 @@ def chunk_param_shapes(quant_method: Any, chunk_experts: int, intermediate_size:
     shapes.update(decl.get_dynamic_quant_param(chunk_experts, intermediate_size, hidden_size, params_dtype))
     missing = [n for n in SLOT_WEIGHT_ATTRS if n not in shapes]
     if missing:
-        raise StreamIOError(f"{type(decl).__name__} does not declare {missing}; the streaming slot "
-                            f"is built from the parameters the post-load hook rewrites ({list(SLOT_WEIGHT_ATTRS)})")
+        raise StreamIOError(
+            f"{type(decl).__name__} does not declare {missing}; the streaming slot "
+            f"is built from the parameters the post-load hook rewrites ({list(SLOT_WEIGHT_ATTRS)})"
+        )
     out: dict[str, tuple[tuple[int, ...], torch.dtype]] = {}
     for name in SLOT_WEIGHT_ATTRS:
         t = shapes[name]
@@ -268,8 +277,10 @@ def chunk_param_shapes(quant_method: Any, chunk_experts: int, intermediate_size:
             # move: into a typed E8M0 buffer the copy becomes a value conversion
             # that flattens every exponent, with no error -- the same trap
             # weight_source refuses to walk into.
-            raise StreamIOError(f"{name} is declared {t.dtype}, not uint8: the streaming path moves BYTES, "
-                                "and a non-uint8 destination turns the copy into a value conversion")
+            raise StreamIOError(
+                f"{name} is declared {t.dtype}, not uint8: the streaming path moves BYTES, "
+                "and a non-uint8 destination turns the copy into a value conversion"
+            )
         if t.dim() != 3 or int(t.shape[0]) != chunk_experts:
             raise StreamIOError(f"{name} shape {tuple(t.shape)} is not [chunk_experts={chunk_experts}, n, k]")
         out[name] = (tuple(int(s) for s in t.shape), t.dtype)
@@ -280,11 +291,13 @@ def _check_group_map() -> None:
     """The two name spaces must still line up; a rename on either side fails here."""
     group_names = {g for g, _ in GROUPS}
     if set(PARAM_FOR_GROUP) != group_names:
-        raise StreamIOError(f"weight_source groups {sorted(group_names)} do not match the staging map "
-                            f"{sorted(PARAM_FOR_GROUP)}")
+        raise StreamIOError(
+            f"weight_source groups {sorted(group_names)} do not match the staging map {sorted(PARAM_FOR_GROUP)}"
+        )
     if set(PARAM_FOR_GROUP.values()) != set(SLOT_WEIGHT_ATTRS):
-        raise StreamIOError(f"staging map fills {sorted(PARAM_FOR_GROUP.values())} but the chunk slot is "
-                            f"{sorted(SLOT_WEIGHT_ATTRS)}")
+        raise StreamIOError(
+            f"staging map fills {sorted(PARAM_FOR_GROUP.values())} but the chunk slot is {sorted(SLOT_WEIGHT_ATTRS)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -329,18 +342,21 @@ class SlotCoverage:
     h2d_calls: int = 0
     pinned_buffers: int = 0
     pinned_bytes: int = 0
-    expert_slots_served: int = 0          # counts multiplicity across layers/chunks
-    experts_produced: set[tuple[int, int]] = field(default_factory=set)   # (layer, expert)
+    expert_slots_served: int = 0  # counts multiplicity across layers/chunks
+    experts_produced: set[tuple[int, int]] = field(default_factory=set)  # (layer, expert)
     layers_served: set[int] = field(default_factory=set)
 
     def summary(self) -> str:
-        return (f"stream_io coverage: chunks={self.chunks_served} experts={len(self.experts_produced)} "
-                f"layers={len(self.layers_served)} gathered={self.bytes_gathered} B "
-                f"to_device={self.bytes_to_device} B in {self.h2d_calls} copies "
-                f"pinned={self.pinned_buffers}x{self.pinned_bytes} B")
+        return (
+            f"stream_io coverage: chunks={self.chunks_served} experts={len(self.experts_produced)} "
+            f"layers={len(self.layers_served)} gathered={self.bytes_gathered} B "
+            f"to_device={self.bytes_to_device} B in {self.h2d_calls} copies "
+            f"pinned={self.pinned_buffers}x{self.pinned_bytes} B"
+        )
 
-    def violations(self, expected: Iterable[tuple[int, int]] | None = None,
-                   *, bytes_per_expert: int | None = None) -> list[str]:
+    def violations(
+        self, expected: Iterable[tuple[int, int]] | None = None, *, bytes_per_expert: int | None = None
+    ) -> list[str]:
         bad: list[str] = []
         if self.chunks_served == 0:
             bad.append("no chunk was served: zero coverage is a failure, not a pass")
@@ -353,19 +369,29 @@ class SlotCoverage:
         if bytes_per_expert is not None:
             want = self.expert_slots_served * bytes_per_expert
             if self.bytes_to_device != want:
-                bad.append(f"{self.bytes_to_device} B reached the device but {self.expert_slots_served} expert "
-                           f"slot(s) x {bytes_per_expert} B = {want} B were served")
+                bad.append(
+                    f"{self.bytes_to_device} B reached the device but {self.expert_slots_served} expert "
+                    f"slot(s) x {bytes_per_expert} B = {want} B were served"
+                )
         if expected is not None:
             want_set = {(int(a), int(b)) for a, b in expected}
             if self.experts_produced != want_set:
                 missing = sorted(want_set - self.experts_produced)
                 extra = sorted(self.experts_produced - want_set)
-                bad.append(f"produced {len(self.experts_produced)} of the expected {len(want_set)} "
-                           f"(layer, expert) pairs (missing {missing[:8]}, extra {extra[:8]})")
+                bad.append(
+                    f"produced {len(self.experts_produced)} of the expected {len(want_set)} "
+                    f"(layer, expert) pairs (missing {missing[:8]}, extra {extra[:8]})"
+                )
         return bad
 
-    def check(self, expected: Iterable[tuple[int, int]] | Sequence[int] | None = None, *, layer: int | None = None,
-              bytes_per_expert: int | None = None, strict: bool = True) -> list[str]:
+    def check(
+        self,
+        expected: Iterable[tuple[int, int]] | Sequence[int] | None = None,
+        *,
+        layer: int | None = None,
+        bytes_per_expert: int | None = None,
+        strict: bool = True,
+    ) -> list[str]:
         """Return the violations; with ``strict`` (the default) raise on any.
 
         ``expected`` is mandatory under ``strict`` and must come from OUTSIDE
@@ -375,7 +401,8 @@ class SlotCoverage:
         if strict and expected is None:
             raise ValueError(
                 "SlotCoverage.check(strict=True) needs the expected experts, and they must not come from "
-                "the provider: an expectation read off the object under test cannot fail.")
+                "the provider: an expectation read off the object under test cannot fail."
+            )
         bad = self.violations(_normalise_expected(expected, layer), bytes_per_expert=bytes_per_expert)
         if bad and strict:
             raise ZeroCoverageError(f"{self.summary()} -- " + "; ".join(bad))
@@ -405,10 +432,10 @@ class _HostBuffer:
     """One pinned staging buffer and what it currently holds."""
 
     buffer: torch.Tensor
-    key: tuple | None = None            # (layer, chunk_index, experts) it holds
-    pending: tuple | None = None        # key a background gather is filling in
+    key: tuple | None = None  # (layer, chunk_index, experts) it holds
+    pending: tuple | None = None  # key a background gather is filling in
     future: Future | None = None
-    h2d_handle: Any = None              # event of the last H2D that READ this buffer
+    h2d_handle: Any = None  # event of the last H2D that READ this buffer
     gather: GatherResult | None = None
 
 
@@ -454,11 +481,23 @@ class StreamSlotProvider:
     have no discriminating power.
     """
 
-    def __init__(self, source: WeightSource | str, quant_method: Any, *, hidden_size: int, intermediate_size: int,
-                 chunk_experts: int, device: Any = "npu", params_dtype: torch.dtype = torch.bfloat16,
-                 seam: DeviceSeam | None = None, host_buffers: int = DEFAULT_HOST_BUFFERS,
-                 copy_threads: int = DEFAULT_SLOT_COPY_THREADS, layer: int | None = None,
-                 probe_bytes: int = 0, strict: bool = True):
+    def __init__(
+        self,
+        source: WeightSource | str,
+        quant_method: Any,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        chunk_experts: int,
+        device: Any = "npu",
+        params_dtype: torch.dtype = torch.bfloat16,
+        seam: DeviceSeam | None = None,
+        host_buffers: int = DEFAULT_HOST_BUFFERS,
+        copy_threads: int = DEFAULT_SLOT_COPY_THREADS,
+        layer: int | None = None,
+        probe_bytes: int = 0,
+        strict: bool = True,
+    ):
         _check_group_map()
         if host_buffers < 1:
             raise ValueError(f"host_buffers must be >= 1, got {host_buffers}")
@@ -476,8 +515,9 @@ class StreamSlotProvider:
                     f"StreamSlotProvider: copy_threads={copy_threads} contradicts the source "
                     f"object's own {own}, and the SOURCE's number is what gathers -- this argument "
                     "only takes effect when the provider builds the source from a path. Set it on "
-                    "the source.")
-        self.source = (WeightSource(source, copy_threads=copy_threads) if isinstance(source, str) else source)
+                    "the source."
+                )
+        self.source = WeightSource(source, copy_threads=copy_threads) if isinstance(source, str) else source
         self.owns_source = isinstance(source, str)
         self.quant_method = quant_method
         self.chunk_experts = int(chunk_experts)
@@ -489,8 +529,7 @@ class StreamSlotProvider:
         self._layer = layer
         self._lock = threading.Lock()
 
-        self.shapes = chunk_param_shapes(quant_method, self.chunk_experts, intermediate_size, hidden_size,
-                                         params_dtype)
+        self.shapes = chunk_param_shapes(quant_method, self.chunk_experts, intermediate_size, hidden_size, params_dtype)
         #: bytes one expert occupies across the four parameters -- the number the
         #: H2D accounting is checked against.
         self.bytes_per_expert = sum(_prod(shape[1:]) for shape, _ in self.shapes.values())
@@ -501,8 +540,9 @@ class StreamSlotProvider:
         for name, (shape, dtype) in self.shapes.items():
             buf = self.seam.alloc_device(shape, dtype, device)
             if tuple(buf.shape) != shape or buf.dtype != dtype:
-                raise StreamIOError(f"device buffer {name} came back {buf.dtype}{tuple(buf.shape)}, "
-                                    f"asked for {dtype}{shape}")
+                raise StreamIOError(
+                    f"device buffer {name} came back {buf.dtype}{tuple(buf.shape)}, asked for {dtype}{shape}"
+                )
             self._device[name] = buf
         self._device_key: tuple | None = None
         # Stage 2 (default off): the staging arrives in device NZ layout, so the
@@ -517,8 +557,7 @@ class StreamSlotProvider:
         for _ in range(host_buffers):
             buf = self.seam.alloc_pinned(self.staging_bytes)
             if buf.dtype != torch.uint8 or buf.device.type != "cpu" or not buf.is_contiguous():
-                raise StreamIOError(f"staging buffer must be contiguous CPU uint8, got {buf.dtype} "
-                                    f"on {buf.device}")
+                raise StreamIOError(f"staging buffer must be contiguous CPU uint8, got {buf.dtype} on {buf.device}")
             if buf.numel() < self.staging_bytes:
                 raise StreamIOError(f"staging buffer holds {buf.numel()} B, a chunk needs {self.staging_bytes} B")
             self._host.append(_HostBuffer(buf))
@@ -554,8 +593,10 @@ class StreamSlotProvider:
     @property
     def layer(self) -> int:
         if self._layer is None:
-            raise StreamIOError("no layer bound: call set_layer(idx) before asking for a chunk "
-                                "(the slot_for callback carries the chunk index, not the layer)")
+            raise StreamIOError(
+                "no layer bound: call set_layer(idx) before asking for a chunk "
+                "(the slot_for callback carries the chunk index, not the layer)"
+            )
         return self._layer
 
     def set_layer(self, layer: int) -> StreamSlotProvider:
@@ -592,12 +633,14 @@ class StreamSlotProvider:
             raise StreamIOError(
                 "set_resident needs NZ device mode (the bank): the ND path copies whole group "
                 "blocks out of the staging, so a slot it did not stream would be overwritten with "
-                "stale bytes rather than kept")
+                "stale bytes rather than kept"
+            )
         if module is None:
             raise StreamIOError(
                 "set_resident needs the module whose parameters hold the resident experts: with no "
                 "source for those slots, the chunks containing them would be computed from "
-                "whatever the buffer held last")
+                "whatever the buffer held last"
+            )
         l2s = tuple(int(x) for x in logical_to_slot)
         per: dict[str, int] = {}
         for name in SLOT_WEIGHT_ATTRS:
@@ -606,7 +649,8 @@ class StreamSlotProvider:
                 raise StreamIOError(
                     f"the resident module has no {name}; all four parameters are needed, because a "
                     "slot filled for the weights but not the scales is wrong in a way no shape "
-                    "check would catch")
+                    "check would catch"
+                )
             rows = int(t.shape[0])
             if rows <= 0:
                 raise StreamIOError(f"the resident module's {name} has no rows")
@@ -614,20 +658,21 @@ class StreamSlotProvider:
             if nbytes % rows:
                 raise StreamIOError(
                     f"{name}: resident storage {nbytes} B is not a multiple of its {rows} slots, so "
-                    "a per-slot offset into it is undefined")
+                    "a per-slot offset into it is undefined"
+                )
             per[name] = nbytes // rows
-            want = (self._nz_bytes.get(name) if name in NZ_WEIGHT_ATTRS
-                    else self._slot_bytes_nd(name))
+            want = self._nz_bytes.get(name) if name in NZ_WEIGHT_ATTRS else self._slot_bytes_nd(name)
             if per[name] != want:
                 raise StreamIOError(
                     f"{name}: the resident parameter holds {per[name]} B per slot, the chunk buffer "
                     f"{want} B. Both come out of the same process_weights_after_loading, so this is "
-                    "a layout divergence and every copy after it would be misaligned")
+                    "a layout divergence and every copy after it would be misaligned"
+                )
             bad = [e for e, sl in enumerate(l2s) if sl >= rows]
             if bad:
                 raise StreamIOError(
-                    f"logical_to_slot sends experts {bad[:4]} to slots past the resident "
-                    f"parameter's {rows}")
+                    f"logical_to_slot sends experts {bad[:4]} to slots past the resident parameter's {rows}"
+                )
         self._res_module, self._res_slot, self._res_per = module, l2s, per
 
     def _slot_bytes_nd(self, name: str) -> int:
@@ -639,12 +684,10 @@ class StreamSlotProvider:
         """
         t = self._device.get(name)
         if t is None:
-            raise StreamIOError(
-                f"{name}: no ND buffer on this provider, so a resident scale has nowhere to land")
+            raise StreamIOError(f"{name}: no ND buffer on this provider, so a resident scale has nowhere to land")
         nbytes = t.untyped_storage().nbytes()
         if nbytes % self.chunk_experts:
-            raise StreamIOError(
-                f"{name}: ND storage {nbytes} B is not a multiple of {self.chunk_experts} slots")
+            raise StreamIOError(f"{name}: ND storage {nbytes} B is not a multiple of {self.chunk_experts} slots")
         return nbytes // self.chunk_experts
 
     def _split_chunk(self, ids: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -653,13 +696,11 @@ class StreamSlotProvider:
             return tuple(range(len(ids))), ()
         bad = [e for e in ids if e >= len(self._res_slot)]
         if bad:
-            raise StreamIOError(
-                f"expert ids {bad[:4]} are outside the {len(self._res_slot)}-entry residency map")
+            raise StreamIOError(f"expert ids {bad[:4]} are outside the {len(self._res_slot)}-entry residency map")
         res = tuple(i for i, e in enumerate(ids) if self._res_slot[e] >= 0)
         return tuple(i for i in range(len(ids)) if i not in set(res)), res
 
-    def _fill_resident(self, ids: tuple[int, ...], positions: Sequence[int],
-                       num_experts: int) -> int:
+    def _fill_resident(self, ids: tuple[int, ...], positions: Sequence[int], num_experts: int) -> int:
         """D2D the resident members' slots of the chunk buffer, weights and scales.
 
         Returns the ACL stream the copies went to. A FULLY resident chunk runs
@@ -673,7 +714,7 @@ class StreamSlotProvider:
         from vllm_ascend.kt_offload.fold_swap import merge_runs  # noqa: PLC0415 - import cycle
 
         module, l2s = self._res_module, self._res_slot
-        if module is None or l2s is None:          # _split_chunk guarantees it
+        if module is None or l2s is None:  # _split_chunk guarantees it
             raise StreamIOError("_fill_resident without a binding")
         pairs = [(p, l2s[ids[p]]) for p in positions]
         runs = merge_runs(pairs)
@@ -702,14 +743,13 @@ class StreamSlotProvider:
                 off = per * dst_row
                 if off < 0 or off + nbytes > cap:
                     raise StreamIOError(
-                        f"{name}: resident fill would write [{off}, {off + nbytes}) of a {cap} B "
-                        f"chunk buffer")
+                        f"{name}: resident fill would write [{off}, {off + nbytes}) of a {cap} B chunk buffer"
+                    )
                 # ACL_MEMCPY_DEVICE_TO_DEVICE = 3. destMax is a promise, there is
                 # no srcMax, so both ends are bounded here: the destination above,
                 # and the source by set_resident's per-slot arithmetic plus the
                 # slot range it checked against the parameter's own rows.
-                ret = acl.rt.memcpy_async(base + off, nbytes, src_base + per * src_slot, nbytes,
-                                          3, stream)
+                ret = acl.rt.memcpy_async(base + off, nbytes, src_base + per * src_slot, nbytes, 3, stream)
                 if ret != 0:
                     raise StreamIOError(f"{name}: resident D2D memcpy_async returned {ret}")
                 self._stage_d2d_calls += 1
@@ -718,8 +758,7 @@ class StreamSlotProvider:
         return int(stream)
 
     # -- the callback -----------------------------------------------------
-    def _key(self, chunk_index: int, ids: tuple[int, ...],
-             sub: tuple[int, ...] | None = None) -> tuple:
+    def _key(self, chunk_index: int, ids: tuple[int, ...], sub: tuple[int, ...] | None = None) -> tuple:
         """What identifies the bytes in the buffers: layer, chunk, ids, SUBSET.
 
         The subset belongs in the key because a buffer gathered for a different
@@ -729,8 +768,9 @@ class StreamSlotProvider:
         """
         return (self.layer, int(chunk_index), ids, sub)
 
-    def slot_for(self, chunk_index: int, expert_ids: Sequence[int],
-                 only_slots: Sequence[int] | None = None) -> ChunkSlot:
+    def slot_for(
+        self, chunk_index: int, expert_ids: Sequence[int], only_slots: Sequence[int] | None = None
+    ) -> ChunkSlot:
         """Gather -> H2D -> production post-load hook -> ``ChunkSlot``.
 
         ``only_slots`` streams just those POSITIONS of the chunk. The rest of
@@ -744,8 +784,10 @@ class StreamSlotProvider:
         if not ids:
             raise ZeroCoverageError(f"chunk {chunk_index}: no expert to stream")
         if len(ids) > self.chunk_experts:
-            raise StreamIOError(f"chunk {chunk_index} has {len(ids)} experts but the slot holds "
-                                f"{self.chunk_experts}; the device buffer is allocated once and not grown")
+            raise StreamIOError(
+                f"chunk {chunk_index} has {len(ids)} experts but the slot holds "
+                f"{self.chunk_experts}; the device buffer is allocated once and not grown"
+            )
         if len(set(ids)) != len(ids):
             raise ValueError(f"chunk {chunk_index}: duplicate expert ids {ids}")
         stream_pos, res_pos = self._split_chunk(ids)
@@ -753,7 +795,8 @@ class StreamSlotProvider:
             raise StreamIOError(
                 f"chunk {chunk_index}: only_slots was given AND {len(res_pos)} of its experts are "
                 "bound as resident. Two different answers to 'which slots does the host fill' is "
-                "one too many")
+                "one too many"
+            )
         # The key first: every branch below needs it, including the one that
         # never touches the host. `sub` is the subset the HOST is responsible
         # for -- () means "none of it", which is a different claim from None
@@ -844,19 +887,21 @@ class StreamSlotProvider:
         parts = []
         for name in ("acquire", "upload", "format"):
             t = self._stage_s[name]
-            parts.append(f"{name} {t:.2f}s ({100 * t / total:.0f}%, {gib / t:.1f} GiB/s)" if t > 0
-                         else f"{name} 0")
-        out = (f"{n} chunk(s), {gib:.1f} GiB staged, {total:.2f}s total "
-               f"({1000 * total / n:.1f} ms/chunk): " + ", ".join(parts))
+            parts.append(f"{name} {t:.2f}s ({100 * t / total:.0f}%, {gib / t:.1f} GiB/s)" if t > 0 else f"{name} 0")
+        out = f"{n} chunk(s), {gib:.1f} GiB staged, {total:.2f}s total ({1000 * total / n:.1f} ms/chunk): " + ", ".join(
+            parts
+        )
         if self._stage_hbm_slots:
             # 🔴 The mechanism, in the server's own words: how much the host
             # actually moved against what a whole-chunk run would have, and how
             # many slots came from HBM instead.
-            out += (f"; HOST MOVED {moved_gib:.1f} of {gib:.1f} GiB "
-                    f"({100.0 * moved_gib / gib:.1f}%), {self._stage_hbm_slots} slot(s) filled "
-                    f"from HBM instead in {self._stage_d2d_calls} D2D call(s) "
-                    f"({self._stage_d2d_bytes / float(1 << 30):.2f} GiB, "
-                    f"{self._stage_full_chunks} whole / {self._stage_mixed_chunks} mixed chunks)")
+            out += (
+                f"; HOST MOVED {moved_gib:.1f} of {gib:.1f} GiB "
+                f"({100.0 * moved_gib / gib:.1f}%), {self._stage_hbm_slots} slot(s) filled "
+                f"from HBM instead in {self._stage_d2d_calls} D2D call(s) "
+                f"({self._stage_d2d_bytes / float(1 << 30):.2f} GiB, "
+                f"{self._stage_full_chunks} whole / {self._stage_mixed_chunks} mixed chunks)"
+            )
         if reset:
             self._stage_h2d_bytes = 0
             self._stage_hbm_slots = 0
@@ -869,8 +914,7 @@ class StreamSlotProvider:
         return out
 
     # -- 1. host gather ---------------------------------------------------
-    def prefetch(self, chunk_index: int, expert_ids: Sequence[int],
-                 only_slots: Sequence[int] | None = None) -> bool:
+    def prefetch(self, chunk_index: int, expert_ids: Sequence[int], only_slots: Sequence[int] | None = None) -> bool:
         """Start filling a pinned buffer for a chunk in the background.
 
         The ping-pong: host side only, no device buffer doubled. Returns whether
@@ -894,7 +938,8 @@ class StreamSlotProvider:
             raise StreamIOError(
                 f"chunk {chunk_index}: only_slots was given AND {len(res_pos)} of its experts are "
                 "bound as resident; prefetch cannot answer 'which slots does the host fill' twice "
-                "either")
+                "either"
+            )
         if res_pos:
             sub = self._check_subset(chunk_index, ids, stream_pos) if stream_pos else ()
         else:
@@ -923,25 +968,26 @@ class StreamSlotProvider:
             target.future = self._prefetch_pool.submit(self._fill, target, key)
             return True
 
-    def _check_subset(self, chunk_index: int, ids: tuple[int, ...],
-                      only_slots: Sequence[int] | None) -> tuple[int, ...] | None:
+    def _check_subset(
+        self, chunk_index: int, ids: tuple[int, ...], only_slots: Sequence[int] | None
+    ) -> tuple[int, ...] | None:
         """Normalise and refuse an impossible subset. None = the whole chunk."""
         if only_slots is None:
             return None
         sub = tuple(sorted({int(x) for x in only_slots}))
         if not sub:
             raise ZeroCoverageError(
-                f"chunk {chunk_index}: only_slots is empty, so this would H2D whatever the staging "
-                "held last")
+                f"chunk {chunk_index}: only_slots is empty, so this would H2D whatever the staging held last"
+            )
         if sub[0] < 0 or sub[-1] >= len(ids):
-            raise StreamIOError(
-                f"chunk {chunk_index}: only_slots {sub} outside the {len(ids)}-slot chunk")
+            raise StreamIOError(f"chunk {chunk_index}: only_slots {sub} outside the {len(ids)}-slot chunk")
         if len(sub) == len(ids):
-            return None                      # a "subset" of everything is the whole chunk
+            return None  # a "subset" of everything is the whole chunk
         if not getattr(self.source, "supports_subset_gather", False):
             raise StreamIOError(
                 f"{type(self.source).__name__} cannot gather a subset of a chunk, so asking for one "
-                "would stream the whole chunk and then H2D only part of it")
+                "would stream the whole chunk and then H2D only part of it"
+            )
         return sub
 
     def _served_subset(self) -> tuple[int, ...] | None:
@@ -957,9 +1003,11 @@ class StreamSlotProvider:
             host.h2d_handle = None
         host.key = None
         host.gather = None
-        result = (self.source.gather(key[0], key[2], host.buffer)
-                  if key[3] is None else
-                  self.source.gather(key[0], key[2], host.buffer, only_slots=key[3]))
+        result = (
+            self.source.gather(key[0], key[2], host.buffer)
+            if key[3] is None
+            else self.source.gather(key[0], key[2], host.buffer, only_slots=key[3])
+        )
         host.gather = result
         host.key = key
         with self._lock:
@@ -1024,10 +1072,12 @@ class StreamSlotProvider:
                 raise StreamIOError(
                     f"checkpoint gives {record} B per expert for {group}, but {param} holds {want} B per "
                     f"expert ({self.shapes[param][0]}): the provider's hidden/intermediate sizes do not "
-                    "match the checkpoint")
+                    "match the checkpoint"
+                )
         if layout.nbytes != self.bytes_per_expert * num_experts:
-            raise StreamIOError(f"chunk layout is {layout.nbytes} B, parameters need "
-                                f"{self.bytes_per_expert * num_experts} B")
+            raise StreamIOError(
+                f"chunk layout is {layout.nbytes} B, parameters need {self.bytes_per_expert * num_experts} B"
+            )
         self._record_bytes_checked = True
 
     # -- 2. H2D -----------------------------------------------------------
@@ -1078,15 +1128,15 @@ class StreamSlotProvider:
         if self._nz_device:
             return
         self._nz_device = True
-        self._nz_slot = self.format_nd({n: self._device[n] for n in SLOT_WEIGHT_ATTRS},
-                                       self.chunk_experts)
+        self._nz_slot = self.format_nd({n: self._device[n] for n in SLOT_WEIGHT_ATTRS}, self.chunk_experts)
         for name in NZ_WEIGHT_ATTRS:
             t = getattr(self._nz_slot, name)
             st = t.untyped_storage()
             if st.nbytes() % self.chunk_experts:
                 raise StreamIOError(
                     f"{name}: NZ storage {st.nbytes()} B is not a multiple of "
-                    f"{self.chunk_experts} slots, so a per-slot offset is undefined")
+                    f"{self.chunk_experts} slots, so a per-slot offset is undefined"
+                )
             self._nz_bytes[name] = st.nbytes() // self.chunk_experts
         # Drop the ND WEIGHT buffers: the cast handed back fresh NZ allocations
         # and nothing writes the ND ones again, so holding them is pure waste
@@ -1101,14 +1151,19 @@ class StreamSlotProvider:
                 del t
         if freed:
             import gc
+
             gc.collect()
             torch.npu.empty_cache()
-        logger.info("kt_offload stream I/O: NZ device mode -- staging arrives in device layout, "
-                    "no per-chunk cast; per-slot bytes %s; freed %d B (%.3f GiB) of ND weight "
-                    "landing buffers", dict(self._nz_bytes), freed, freed / float(1 << 30))
+        logger.info(
+            "kt_offload stream I/O: NZ device mode -- staging arrives in device layout, "
+            "no per-chunk cast; per-slot bytes %s; freed %d B (%.3f GiB) of ND weight "
+            "landing buffers",
+            dict(self._nz_bytes),
+            freed,
+            freed / float(1 << 30),
+        )
 
-    def _upload_nz(self, host: "_HostBuffer", views: Mapping[str, torch.Tensor],
-                   num_experts: int, key: tuple) -> None:
+    def _upload_nz(self, host: _HostBuffer, views: Mapping[str, torch.Tensor], num_experts: int, key: tuple) -> None:
         """H2D straight into the NZ-tagged buffers. No cast follows this."""
         import acl  # device-only dependency, imported at the call site
 
@@ -1141,7 +1196,8 @@ class StreamSlotProvider:
                 if int(src.numel()) != want:
                     raise StreamIOError(
                         f"{param}: staging group {group} has {src.numel()} B, the NZ buffer needs "
-                        f"{want} B for {num_experts} slots")
+                        f"{want} B for {num_experts} slots"
+                    )
                 base = getattr(self._nz_slot, param).untyped_storage().data_ptr()
                 per = self._nz_bytes[param]
                 for first, count in runs:
@@ -1164,7 +1220,7 @@ class StreamSlotProvider:
         host.h2d_handle = ev
         self._device_key = key
 
-    def _filled_runs(self, host: "_HostBuffer", num_experts: int) -> list[tuple[int, int]]:
+    def _filled_runs(self, host: _HostBuffer, num_experts: int) -> list[tuple[int, int]]:
         """``[(first_slot, count)]`` for the positions this gather filled.
 
         A whole-chunk gather returns exactly ``[(0, num_experts)]``. The run
@@ -1188,8 +1244,9 @@ class StreamSlotProvider:
             raise StreamIOError(
                 "a subset gather reached the ND upload path, which copies whole group blocks and "
                 "would overwrite the slots it did not stream with stale staging. Subsets are NZ "
-                "device mode only (the bank).")
-        self._device_key = None   # stale until every group has been copied
+                "device mode only (the bank)."
+            )
+        self._device_key = None  # stale until every group has been copied
         handle = None
         # In staging order (``weight_source.GROUPS``), so the pinned buffer is
         # read front to back rather than jumped around.
@@ -1198,8 +1255,9 @@ class StreamSlotProvider:
             dst = self._device_view(param, num_experts).reshape(-1)
             src = views[group].reshape(-1)
             if dst.numel() != src.numel():
-                raise StreamIOError(f"{param}: device view holds {dst.numel()} B, staging group {group} "
-                                    f"has {src.numel()} B")
+                raise StreamIOError(
+                    f"{param}: device view holds {dst.numel()} B, staging group {group} has {src.numel()} B"
+                )
             handle = self.seam.h2d(dst, src, what=param)
             self.coverage.h2d_calls += 1
             self.coverage.bytes_to_device += int(src.numel())
@@ -1231,7 +1289,8 @@ class StreamSlotProvider:
                     raise StreamIOError(
                         f"chunk {key[1]} layer {key[0]}: the device buffer for {param} does not hold the "
                         f"bytes that were staged for it ({where} {n} B differ). The copy was issued but the "
-                        "slot would have been computed with some other chunk's weights.")
+                        "slot would have been computed with some other chunk's weights."
+                    )
 
     # -- 3. format (the production hook) ----------------------------------
     def _probe_nz(self, views: Mapping[str, torch.Tensor], num_experts: int, key: tuple) -> None:
@@ -1261,7 +1320,8 @@ class StreamSlotProvider:
                     if not torch.equal(dev[w].to("cpu"), src[w]):
                         raise StreamIOError(
                             f"chunk {key[1]} layer {key[0]}: NZ-mode scale {param} {where} does not "
-                            "match the staging it was copied from")
+                            "match the staging it was copied from"
+                        )
                 continue
             base = getattr(self._nz_slot, param).untyped_storage().data_ptr()
             total = self._nz_bytes[param] * num_experts
@@ -1271,11 +1331,12 @@ class StreamSlotProvider:
                 ret = acl.rt.memcpy(got.data_ptr(), n, base + off, n, 2)
                 if ret != 0:
                     raise StreamIOError(f"{param}: probe D2H returned {ret}")
-                want = src[off:off + n] if where == "head" else src[src.numel() - n:]
+                want = src[off : off + n] if where == "head" else src[src.numel() - n :]
                 if not torch.equal(got, want.cpu() if want.device.type != "cpu" else want):
                     raise StreamIOError(
                         f"chunk {key[1]} layer {key[0]}: NZ-mode {param} {where} does not hold the "
-                        "bytes the staging had -- the raw H2D did not land where it was asked to")
+                        "bytes the staging had -- the raw H2D did not land where it was asked to"
+                    )
 
     def _format(self, num_experts: int) -> ChunkSlot:
         if self._nz_device:
@@ -1283,10 +1344,11 @@ class StreamSlotProvider:
                 raise StreamIOError("the NZ device buffers were not filled for this chunk")
             return self._nz_slot
         if self._device_key is None:
-            raise StreamIOError("the device buffers were not filled for this chunk: refusing to format and "
-                                "hand back whatever the previous chunk left there")
-        return self.format_nd({name: self._device_view(name, num_experts) for name in SLOT_WEIGHT_ATTRS},
-                              num_experts)
+            raise StreamIOError(
+                "the device buffers were not filled for this chunk: refusing to format and "
+                "hand back whatever the previous chunk left there"
+            )
+        return self.format_nd({name: self._device_view(name, num_experts) for name in SLOT_WEIGHT_ATTRS}, num_experts)
 
     def format_nd(self, tensors: Mapping[str, torch.Tensor], num_experts: int) -> ChunkSlot:
         """Run the production post-load hook on ND device tensors and hand back the slot.
@@ -1312,16 +1374,18 @@ class StreamSlotProvider:
             # refusing the call (161002), at worst numbers. Identity (``is``) is
             # NOT the test: ``param.data`` hands back a fresh tensor object on
             # every access, so it would pass for a hook that did nothing.
-            raise StreamIOError(f"the post-load hook left {unchanged} exactly as they were: the chunk would "
-                                "be handed to the GEMM in the checkpoint's ND layout, not the layout "
-                                "process_weights_after_loading produces")
+            raise StreamIOError(
+                f"the post-load hook left {unchanged} exactly as they were: the chunk would "
+                "be handed to the GEMM in the checkpoint's ND layout, not the layout "
+                "process_weights_after_loading produces"
+            )
         slot = ChunkSlot(**{name: after[name] for name in SLOT_WEIGHT_ATTRS})
         bad = slot.violations(expect_slots=num_experts)
         if bad:
             raise StreamIOError(f"the formatted chunk is not a usable slot: {'; '.join(bad)}")
         return slot
 
-    def served_nz(self, chunk_index: int, expert_ids: Sequence[int]) -> "ServedNZChunk":
+    def served_nz(self, chunk_index: int, expert_ids: Sequence[int]) -> ServedNZChunk:
         """The chunk just served, as it exists in NZ device mode. The fold's source.
 
         Counterpart of :meth:`served_nd` for the bank path, where the ND landing
@@ -1346,12 +1410,15 @@ class StreamSlotProvider:
         if not self._nz_device:
             raise StreamIOError(
                 "served_nz() is only meaningful in NZ device mode; without the bank the chunk's bytes "
-                "are in the ND landing buffers, which served_nd() hands back")
+                "are in the ND landing buffers, which served_nd() hands back"
+            )
         ids = tuple(int(e) for e in expert_ids)
         key = self._key(chunk_index, ids, self._served_subset())
         if self._device_key != key:
-            raise StreamIOError(f"the device buffers hold {self._device_key}, not {key}: the chunk asked for "
-                                "was not the last one served, and its bytes are gone")
+            raise StreamIOError(
+                f"the device buffers hold {self._device_key}, not {key}: the chunk asked for "
+                "was not the last one served, and its bytes are gone"
+            )
         if self._nz_h2d_stream is None:
             raise StreamIOError("no H2D has run yet, so there is no stream to order a raw read against")
         return ServedNZChunk(
@@ -1377,20 +1444,28 @@ class StreamSlotProvider:
                 "served_nd() has no meaning in NZ device mode: the staging goes straight into the "
                 "NZ-tagged destination, so the ND landing buffers are never written (and are freed "
                 "at start-up). A caller that read them would get unwritten bytes and no error. The "
-                "config refuses bank_dir together with dynamic_resident for exactly this reason.")
+                "config refuses bank_dir together with dynamic_resident for exactly this reason."
+            )
         ids = tuple(int(e) for e in expert_ids)
         key = self._key(chunk_index, ids, self._served_subset())
         if self._device_key != key:
-            raise StreamIOError(f"the device buffers hold {self._device_key}, not {key}: the chunk asked for "
-                                "was not the last one served, and its bytes are gone")
+            raise StreamIOError(
+                f"the device buffers hold {self._device_key}, not {key}: the chunk asked for "
+                "was not the last one served, and its bytes are gone"
+            )
         return {name: self._device_view(name, len(ids)) for name in SLOT_WEIGHT_ATTRS}
 
     # -- coverage / teardown ----------------------------------------------
-    def check_coverage(self, expected: Iterable[Any] | None = None, *, layer: int | None = None,
-                       strict: bool | None = None) -> list[str]:
+    def check_coverage(
+        self, expected: Iterable[Any] | None = None, *, layer: int | None = None, strict: bool | None = None
+    ) -> list[str]:
         """Coverage verdict; ``expected`` must come from outside (see ``SlotCoverage.check``)."""
-        return self.coverage.check(expected, layer=layer, bytes_per_expert=self.bytes_per_expert,
-                                   strict=self.strict if strict is None else strict)
+        return self.coverage.check(
+            expected,
+            layer=layer,
+            bytes_per_expert=self.bytes_per_expert,
+            strict=self.strict if strict is None else strict,
+        )
 
     def close(self) -> None:
         self._drain_prefetch()

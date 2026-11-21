@@ -328,8 +328,10 @@ class KTOffloadConfig:
         if self.resident_strategy == "explicit" and not self.resident_experts_path:
             raise ValueError("kt_offload_config.resident_strategy='explicit' needs resident_experts_path.")
         if self.stream_prefill_chunk_experts <= 0:
-            raise ValueError("kt_offload_config.stream_prefill_chunk_experts must be > 0 "
-                             "(0 would stream nothing and still cost a pass).")
+            raise ValueError(
+                "kt_offload_config.stream_prefill_chunk_experts must be > 0 "
+                "(0 would stream nothing and still cost a pass)."
+            )
         if self.stream_prefill_min_tokens <= 0:
             raise ValueError("kt_offload_config.stream_prefill_min_tokens must be > 0.")
         # bank_dir + dynamic_resident WAS refused here: the fold copied its chosen
@@ -347,7 +349,8 @@ class KTOffloadConfig:
         if self.kt_reads_bank and not self.zerocopy_w13:
             raise ValueError(
                 "kt_offload_config.kt_reads_bank needs zerocopy_w13: the bank is consumed IN PLACE, "
-                "and the copy path would memcpy NZ bytes into a row-major BufferB.")
+                "and the copy path would memcpy NZ bytes into a row-major BufferB."
+            )
         if self.kt_reads_bank and self.zerocopy_scope != "all":
             # 🔴 Silent wrong answer, not a slowdown. Under KT_ZEROCOPY_SCOPE=w13
             # kt STAGES w2 itself, and fp4-moe.hpp does that with an ND
@@ -360,29 +363,40 @@ class KTOffloadConfig:
             raise ValueError(
                 "kt_offload_config.kt_reads_bank needs zerocopy_scope='all': with 'w13' kt stages "
                 "w2 itself through an ND column walk, which cannot read the bank's NZ w2 -- it "
-                "would compute wrong numbers rather than fail.")
+                "would compute wrong numbers rather than fail."
+            )
         if self.zerocopy_scope not in ("w13", "all"):
-            raise ValueError("kt_offload_config.zerocopy_scope must be 'w13' or 'all' "
-                             "(the two scopes kt's KT_ZEROCOPY_SCOPE parser accepts).")
+            raise ValueError(
+                "kt_offload_config.zerocopy_scope must be 'w13' or 'all' "
+                "(the two scopes kt's KT_ZEROCOPY_SCOPE parser accepts)."
+            )
         if self.zerocopy_scope != "w13" and not self.zerocopy_w13:
-            raise ValueError("kt_offload_config.zerocopy_scope only means anything with "
-                             "zerocopy_w13=true; with zero-copy off kt copies everything.")
+            raise ValueError(
+                "kt_offload_config.zerocopy_scope only means anything with "
+                "zerocopy_w13=true; with zero-copy off kt copies everything."
+            )
         if self.fold_nz_barrier not in ("device", "stream", "none"):
             raise ValueError("kt_offload_config.fold_nz_barrier must be 'device', 'stream' or 'none'.")
         if self.fold_nz_barrier == "none" and not self.bank_dir:
-            raise ValueError("kt_offload_config.fold_nz_barrier='none' only means anything with bank_dir; "
-                             "it removes the ordering between a commit's read of the fold staging and the "
-                             "next layer's raw writes to it, and exists to drive that failure on card.")
+            raise ValueError(
+                "kt_offload_config.fold_nz_barrier='none' only means anything with bank_dir; "
+                "it removes the ordering between a commit's read of the fold staging and the "
+                "next layer's raw writes to it, and exists to drive that failure on card."
+            )
         if self.bank_dir and not self.stream_prefill:
-            raise ValueError("kt_offload_config.bank_dir needs stream_prefill: the bank only "
-                             "replaces the source of the streamed chunks.")
+            raise ValueError(
+                "kt_offload_config.bank_dir needs stream_prefill: the bank only "
+                "replaces the source of the streamed chunks."
+            )
         if self.stream_layer_sync_scope not in ("device", "stream"):
             raise ValueError("kt_offload_config.stream_layer_sync_scope must be 'device' or 'stream'.")
         if self.debug_hold_hbm_bytes < 0:
             raise ValueError("kt_offload_config.debug_hold_hbm_bytes must be >= 0.")
         if self.stream_layer_buffer and not self.stream_prefill:
-            raise ValueError("kt_offload_config.stream_layer_buffer needs stream_prefill: it only "
-                             "changes where the streamed chunks accumulate.")
+            raise ValueError(
+                "kt_offload_config.stream_layer_buffer needs stream_prefill: it only "
+                "changes where the streamed chunks accumulate."
+            )
         if self.stream_resident_from_hbm:
             # Each precondition is a different silent-wrong-answer if missing.
             # NOTE it does NOT need stream_layer_buffer: the fill happens in the
@@ -391,16 +405,19 @@ class KTOffloadConfig:
             if not self.stream_prefill:
                 raise ValueError(
                     "kt_offload_config.stream_resident_from_hbm needs stream_prefill: it only "
-                    "changes where a streamed chunk's bytes come from.")
+                    "changes where a streamed chunk's bytes come from."
+                )
             if not self.bank_dir:
                 raise ValueError(
                     "kt_offload_config.stream_resident_from_hbm needs bank_dir: skipping slots "
                     "requires a source that can gather a subset of a chunk, and only the NZ bank "
-                    "can (the checkpoint gather writes whole group blocks).")
+                    "can (the checkpoint gather writes whole group blocks)."
+                )
             if self.num_resident_experts <= 0:
                 raise ValueError(
                     "kt_offload_config.stream_resident_from_hbm with num_resident_experts=0 would "
-                    "skip nothing; it is on by mistake.")
+                    "skip nothing; it is on by mistake."
+                )
         if self.stream_layer_probe_bytes < 0:
             raise ValueError("kt_offload_config.stream_layer_probe_bytes must be >= 0.")
         if self.zerocopy_reserve_gib < 0:
@@ -408,7 +425,8 @@ class KTOffloadConfig:
         if self.zerocopy_streaming_node is not None and self.zerocopy_streaming_node < 0:
             raise ValueError(
                 f"kt_offload_config.zerocopy_streaming_node={self.zerocopy_streaming_node} "
-                "must be a node id >= 0 (None derives it from the nodes' free memory).")
+                "must be a node id >= 0 (None derives it from the nodes' free memory)."
+            )
         if self.zerocopy_node_fraction is not None:
             # An illegal split must not fall back to something reasonable: a
             # silent 50/50 would make an A/B compare two arms that placed their
@@ -417,10 +435,10 @@ class KTOffloadConfig:
             if len(f) != self.threadpool_count:
                 raise ValueError(
                     f"kt_offload_config.zerocopy_node_fraction lists {len(f)} fraction(s) but "
-                    f"threadpool_count is {self.threadpool_count}; it is one per TP part.")
+                    f"threadpool_count is {self.threadpool_count}; it is one per TP part."
+                )
             if any(v < 0.0 or v > 1.0 for v in f):
-                raise ValueError(
-                    f"kt_offload_config.zerocopy_node_fraction={f} has a value outside [0, 1].")
+                raise ValueError(f"kt_offload_config.zerocopy_node_fraction={f} has a value outside [0, 1].")
         return self
 
     def _refuse_without_zerocopy_support(self) -> None:
@@ -438,27 +456,31 @@ class KTOffloadConfig:
             return
         try:
             import kt_kernel
-        except Exception as exc:                             # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             raise ValueError(
                 "kt_offload_config.zerocopy_w13: kt_kernel is not importable "
                 f"({type(exc).__name__}: {exc}), so whether this build supports zero-copy "
-                "weights cannot be established.") from exc
+                "weights cannot be established."
+            ) from exc
         import glob
         import os
+
         pkg = os.path.dirname(getattr(kt_kernel, "__file__", "") or "")
         sos = glob.glob(os.path.join(pkg, "kt_kernel_ext*.so")) if pkg else []
         if not sos:
             raise ValueError(
                 "kt_offload_config.zerocopy_w13: no kt_kernel_ext*.so next to "
                 f"{getattr(kt_kernel, '__file__', '?')}, so the build cannot be probed. "
-                "Refusing rather than assuming the switch works.")
+                "Refusing rather than assuming the switch works."
+            )
         try:
             with open(sos[0], "rb") as f:
                 blob = f.read()
         except OSError as exc:
             raise ValueError(
                 f"kt_offload_config.zerocopy_w13: cannot read {sos[0]} ({exc}) to establish "
-                "whether it supports zero-copy weights.") from exc
+                "whether it supports zero-copy weights."
+            ) from exc
         missing = [n for n in (b"KT_ZEROCOPY_WEIGHTS", b"KT_ZEROCOPY_SCOPE") if n not in blob]
         if missing:
             raise ValueError(
@@ -469,7 +491,8 @@ class KTOffloadConfig:
                 "Refusing rather than falling back, because the fallback is silent: kt would "
                 "take the copy path, hold a full private copy of w13, and the run would look "
                 "identical except for ~2/3 more anonymous memory than the pre-flight account "
-                "granted -- which surfaces later as an OOM with nothing pointing back here.")
+                "granted -- which surfaces later as an OOM with nothing pointing back here."
+            )
 
     def _refuse_without_full_set_load(self) -> None:
         """``dynamic_resident`` needs kt to hold CPU weights for EVERY expert.
@@ -485,12 +508,13 @@ class KTOffloadConfig:
             return
         try:
             from kt_kernel.utils import amx
-        except Exception as exc:                             # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             raise ValueError(
                 "kt_offload_config.dynamic_resident: kt_kernel.utils.amx is not importable "
                 f"({type(exc).__name__}: {exc}), so whether kt loads every expert's CPU weights "
                 "cannot be established. The swap-in has nowhere to demote a resident expert to "
-                "unless it does.") from exc
+                "unless it does."
+            ) from exc
         probe = getattr(amx, "_fullset_load_requested", None)
         if probe is None:
             raise ValueError(
@@ -501,13 +525,15 @@ class KTOffloadConfig:
                 "Refusing rather than falling back, because the fallback is silent: kt would keep the "
                 "CPU subset, every resident expert would stay pinned, the folded swap-in would commit "
                 "nothing -- indistinguishable from 'the heat said no change', so a run taken that way "
-                "reports 'dynamic hot experts give no gain' and is wrong.")
+                "reports 'dynamic hot experts give no gain' and is wrong."
+            )
         if not probe():
             raise ValueError(
                 "kt_offload_config.dynamic_resident needs KT_FULLSET_LOAD=1: with the CPU expert "
                 "subset (amx.py:_cpu_expert_subset_enabled) a resident expert has no CPU BufferB, so "
                 "it cannot be demoted, the policy has zero free slots and the fold is a silent no-op "
-                ".")
+                "."
+            )
 
     def _refuse_batched_dynamic_resident(self, vllm_config: Any) -> None:
         """``dynamic_resident`` runs at ``max_num_seqs == 1``, and nowhere else.
@@ -531,7 +557,8 @@ class KTOffloadConfig:
             raise ValueError(
                 "kt_offload_config.dynamic_resident needs scheduler_config.max_num_seqs to check that this "
                 "is a one-sequence-at-a-time server, and the config handed to the validator has no "
-                "scheduler_config. Refusing rather than assuming the batch size.")
+                "scheduler_config. Refusing rather than assuming the batch size."
+            )
         if int(max_num_seqs) != 1:
             raise ValueError(
                 f"kt_offload_config.dynamic_resident requires max_num_seqs=1; this server is configured for "
@@ -541,7 +568,8 @@ class KTOffloadConfig:
                 "each other out, so the set that would be made resident is the batch's flat average rather "
                 "than any request's hot set. Nothing is computed incorrectly at a larger batch; the feature "
                 "simply has no defined moment to act and nothing to act on. Serve with --max-num-seqs 1, or "
-                "turn dynamic_resident off (stream_prefill on its own has no such limit).")
+                "turn dynamic_resident off (stream_prefill on its own has no such limit)."
+            )
 
     def _validate_preconditions(self, vllm_config: Any) -> None:
         """Parallel/runtime settings the M1 implementation depends on."""
@@ -602,7 +630,8 @@ class KTOffloadConfig:
             raise ValueError(
                 "kt_offload_config.dynamic_resident needs stream_prefill: the swap-in is folded into the "
                 "streaming prefill pass and there is no other path that makes an expert "
-                "resident.")
+                "resident."
+            )
         self._refuse_batched_dynamic_resident(vllm_config)
         self._refuse_without_full_set_load()
         self._refuse_without_zerocopy_support()
@@ -618,7 +647,8 @@ class KTOffloadConfig:
             if self.stream_prefill_min_tokens <= 0:
                 raise ValueError(
                     "kt_offload_config.stream_prefill needs stream_prefill_min_tokens > 0; the "
-                    "threshold is what keeps a streamed forward out of a captured size.")
+                    "threshold is what keeps a streamed forward out of a captured size."
+                )
         pc = vllm_config.parallel_config
         sizes = {
             "tensor_parallel_size": pc.tensor_parallel_size,

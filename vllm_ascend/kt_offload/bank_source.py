@@ -27,8 +27,10 @@ checks there would cost more than the layout saves, and ``aclrtMemcpy`` has no
 ``srcMax`` to fall back on. So :func:`bank_build.validate_segments` runs once
 per (chunk shape) and the copy loop carries no checks at all.
 """
+
 from __future__ import annotations
 
+import contextlib
 import mmap
 import os
 import threading
@@ -84,10 +86,18 @@ class BankChunkLayout:
 
     __slots__ = ("layer", "experts", "groups", "nbytes", "produced")
 
-    def __init__(self, layer: int, experts: tuple[int, ...], groups: dict[str, tuple[int, int]],
-                 nbytes: int, produced: tuple[int, ...] | None = None):
-        self.layer = layer; self.experts = experts
-        self.groups = groups; self.nbytes = nbytes
+    def __init__(
+        self,
+        layer: int,
+        experts: tuple[int, ...],
+        groups: dict[str, tuple[int, int]],
+        nbytes: int,
+        produced: tuple[int, ...] | None = None,
+    ):
+        self.layer = layer
+        self.experts = experts
+        self.groups = groups
+        self.nbytes = nbytes
         #: 🔴 The slots a SUBSET gather filled, or the whole chunk. ``experts``
         #: stays the whole chunk on purpose: it fixes the staging geometry (the
         #: group-major bases and the view sizes below), and deriving that from a
@@ -98,7 +108,7 @@ class BankChunkLayout:
     def views(self, staging: torch.Tensor) -> dict[str, torch.Tensor]:
         flat = staging.view(-1)
         c = len(self.experts)
-        return {g: flat[off:off + c * rec].view(c, rec) for g, (off, rec) in self.groups.items()}
+        return {g: flat[off : off + c * rec].view(c, rec) for g, (off, rec) in self.groups.items()}
 
     def produced_slots(self) -> tuple[int, ...]:
         """Positions within the chunk that this gather filled, ascending."""
@@ -120,8 +130,7 @@ class BankCoverage:
 
     __slots__ = ("requested_tensors", "produced_tensors", "produced_bytes", "triples")
 
-    def __init__(self, requested_tensors: int, produced_tensors: int, produced_bytes: int,
-                 triples: set):
+    def __init__(self, requested_tensors: int, produced_tensors: int, produced_bytes: int, triples: set):
         self.requested_tensors = requested_tensors
         self.produced_tensors = produced_tensors
         self.produced_bytes = produced_bytes
@@ -138,7 +147,8 @@ class BankGatherResult:
     __slots__ = ("layout", "coverage")
 
     def __init__(self, layout: BankChunkLayout, coverage: BankCoverage):
-        self.layout = layout; self.coverage = coverage
+        self.layout = layout
+        self.coverage = coverage
 
 
 class _Strided:
@@ -157,27 +167,31 @@ class _Strided:
     assignment -- 4 calls per expert instead of 643, a 160x cut in interpreter
     work, with the copying itself done by memcpy inside numpy.
     """
+
     __slots__ = ("src_offset", "dst_offset", "nruns", "run", "dst_stride")
 
     def __init__(self, src_offset: int, dst_offset: int, nruns: int, run: int, dst_stride: int):
-        self.src_offset = src_offset; self.dst_offset = dst_offset
-        self.nruns = nruns; self.run = run; self.dst_stride = dst_stride
+        self.src_offset = src_offset
+        self.dst_offset = dst_offset
+        self.nruns = nruns
+        self.run = run
+        self.dst_stride = dst_stride
 
 
 def _copy_strided(dst: Any, src: Any, plans: Sequence[_Strided], cpu: int | None = None) -> None:
     """Run a slice of the strided plan. No bounds checks: the table was validated."""
     if cpu is not None:
-        try:
+        # Placement is a performance property, not correctness.
+        with contextlib.suppress(OSError):
             os.sched_setaffinity(0, {cpu})
-        except OSError:
-            pass          # placement is a performance property, not correctness
     for p in plans:
         if p.nruns == 1:
-            dst[p.dst_offset:p.dst_offset + p.run] = src[p.src_offset:p.src_offset + p.run]
+            dst[p.dst_offset : p.dst_offset + p.run] = src[p.src_offset : p.src_offset + p.run]
             continue
-        d = dst[p.dst_offset:p.dst_offset + p.nruns * p.dst_stride]
-        d.reshape(p.nruns, p.dst_stride)[:, :p.run] = \
-            src[p.src_offset:p.src_offset + p.nruns * p.run].reshape(p.nruns, p.run)
+        d = dst[p.dst_offset : p.dst_offset + p.nruns * p.dst_stride]
+        d.reshape(p.nruns, p.dst_stride)[:, : p.run] = src[p.src_offset : p.src_offset + p.nruns * p.run].reshape(
+            p.nruns, p.run
+        )
 
 
 class BankSource:
@@ -188,20 +202,26 @@ class BankSource:
     #: would stream the whole chunk and then H2D only part of it.
     supports_subset_gather = True
 
-    def __init__(self, bank_dir: str, *, layout: BankLayout | None = None,
-                 num_experts: int | None = None,
-                 copy_threads: int = MIN_LOADER_THREADS,
-                 pin_cpus: bool = True):
+    def __init__(
+        self,
+        bank_dir: str,
+        *,
+        layout: BankLayout | None = None,
+        num_experts: int | None = None,
+        copy_threads: int = MIN_LOADER_THREADS,
+        pin_cpus: bool = True,
+    ):
         self.bank_dir = bank_dir
         man = load_manifest(bank_dir)
         self.manifest = man
-        self.layout = (layout or BankLayout(**{
-            k: v for k, v in man["layout"].items() if k in BankLayout.__dataclass_fields__
-        })).check()
+        self.layout = (
+            layout or BankLayout(**{k: v for k, v in man["layout"].items() if k in BankLayout.__dataclass_fields__})
+        ).check()
         if num_experts is not None and int(num_experts) != self.layout.num_experts:
             raise BankSourceError(
                 f"the bank was built for {self.layout.num_experts} experts, the model has "
-                f"{num_experts}; a bank is not reusable across expert counts")
+                f"{num_experts}; a bank is not reusable across expert counts"
+            )
         self.num_experts = self.layout.num_experts
         self.built_layers = {int(k) for k in man["layers"]}
         self._maps: dict[int, tuple[mmap.mmap, int]] = {}
@@ -221,6 +241,7 @@ class BankSource:
         # cannot live in one process -- so the campaign needs a way to set it
         # per server start without editing code between arms.
         from vllm_ascend import envs  # noqa: PLC0415 - avoids a module-level cycle
+
         env = (envs.VLLM_ASCEND_DSV41_KT_LOADER_THREADS or "").strip()
         if env:
             try:
@@ -228,27 +249,36 @@ class BankSource:
             except ValueError:
                 raise BankSourceError(
                     f"VLLM_ASCEND_DSV41_KT_LOADER_THREADS={env!r} is not an integer; a loader "
-                    "thread count that cannot be read must not silently mean the default") from None
+                    "thread count that cannot be read must not silently mean the default"
+                ) from None
             if want < 1:
-                raise BankSourceError(
-                    f"VLLM_ASCEND_DSV41_KT_LOADER_THREADS={want} must be >= 1")
-            logger.info("kt_offload bank_source: loader threads %d -> %d "
-                        "(VLLM_ASCEND_DSV41_KT_LOADER_THREADS)", int(copy_threads), want)
+                raise BankSourceError(f"VLLM_ASCEND_DSV41_KT_LOADER_THREADS={want} must be >= 1")
+            logger.info(
+                "kt_offload bank_source: loader threads %d -> %d (VLLM_ASCEND_DSV41_KT_LOADER_THREADS)",
+                int(copy_threads),
+                want,
+            )
             copy_threads = want
         self.copy_threads = max(1, int(copy_threads))
         self._cpus: list[int] = []
         if self.copy_threads > 1:
             self._cpus = one_per_l3_cpus(self.copy_threads)
-            check_loader_placement(self._cpus, min_threads=min(self.copy_threads,
-                                                               MIN_LOADER_THREADS))
+            check_loader_placement(self._cpus, min_threads=min(self.copy_threads, MIN_LOADER_THREADS))
         self._pin_cpus = bool(pin_cpus) and bool(self._cpus)
         self._pool: ThreadPoolExecutor | None = None
-        logger.info("kt_offload bank_source: %s, %d layer(s), %d experts, %d B/expert",
-                    bank_dir, len(self.built_layers), self.num_experts,
-                    self.layout.bytes_per_expert)
+        logger.info(
+            "kt_offload bank_source: %s, %d layer(s), %d experts, %d B/expert",
+            bank_dir,
+            len(self.built_layers),
+            self.num_experts,
+            self.layout.bytes_per_expert,
+        )
         if self._cpus:
-            logger.info("kt_offload bank_source: %d loader thread(s) on cpus %s "
-                        "(one per L3/CCD domain)", self.copy_threads, self._cpus)
+            logger.info(
+                "kt_offload bank_source: %d loader thread(s) on cpus %s (one per L3/CCD domain)",
+                self.copy_threads,
+                self._cpus,
+            )
 
     # -- staging geometry -------------------------------------------------
     def dst_base(self, count: int) -> tuple[dict[str, int], int]:
@@ -265,8 +295,9 @@ class BankSource:
             off += count * self.layout.device_record(name)
         return base, off
 
-    def _result(self, layer: int, experts: tuple[int, ...], produced: tuple[int, ...],
-                plans: Sequence[Any], nbytes: int) -> BankGatherResult:
+    def _result(
+        self, layer: int, experts: tuple[int, ...], produced: tuple[int, ...], plans: Sequence[Any], nbytes: int
+    ) -> BankGatherResult:
         """One gather's layout + counts.
 
         🔴 Two different expert tuples, and they are not interchangeable.
@@ -279,12 +310,14 @@ class BankSource:
         same shape and cannot mistake a subset gather for a whole one.
         """
         triples = {(layer, e, proj) for e in produced for proj in ("w1", "w2", "w3")}
-        cov = BankCoverage(requested_tensors=len(plans), produced_tensors=len(plans),
-                           produced_bytes=nbytes, triples=triples)
+        cov = BankCoverage(
+            requested_tensors=len(plans), produced_tensors=len(plans), produced_bytes=nbytes, triples=triples
+        )
         return BankGatherResult(self.chunk_layout(layer, experts, produced), cov)
 
-    def chunk_layout(self, layer: int, experts: tuple[int, ...],
-                     produced: tuple[int, ...] | None = None) -> BankChunkLayout:
+    def chunk_layout(
+        self, layer: int, experts: tuple[int, ...], produced: tuple[int, ...] | None = None
+    ) -> BankChunkLayout:
         """The staging layout for the WHOLE chunk; ``produced`` only names the
         slots a subset gather filled (it does not change a single offset)."""
         base, nbytes = self.dst_base(len(experts))
@@ -305,23 +338,32 @@ class BankSource:
         moved = sum(p.nruns * p.run for p in plans)
         # With a subset the staging is still sized for the whole chunk; what the
         # plan must move is the subset's share of it, exactly.
-        want = nbytes if only is None else sum(
-            self.layout.device_record(t) for t in ("w13", "w2", "w13_scale", "w2_scale")) * len(only)
+        want = (
+            nbytes
+            if only is None
+            else sum(self.layout.device_record(t) for t in ("w13", "w2", "w13_scale", "w2_scale")) * len(only)
+        )
         if moved != want:
             which = "the staging is" if only is None else f"the {len(only)}-slot subset needs"
             raise BankSourceError(
-                f"strided plan moves {moved} B but {which} {want} B; the plan and the validated "
-                "segment table disagree")
+                f"strided plan moves {moved} B but {which} {want} B; the plan and the validated segment table disagree"
+            )
         if only is None:
-            logger.info("kt_offload bank_source: %d-expert chunk -- %d segments collapsed to "
-                        "%d strided copies, %s", len(experts), len(segs), len(plans), rep)
+            logger.info(
+                "kt_offload bank_source: %d-expert chunk -- %d segments collapsed to %d strided copies, %s",
+                len(experts),
+                len(segs),
+                len(plans),
+                rep,
+            )
         got = (plans, base, nbytes)
         self._tables[key] = got
         return got
 
     # -- layer files ------------------------------------------------------
-    def _strided_plan(self, experts: tuple[int, ...], base: dict[str, int],
-                      only: frozenset[int] | None = None) -> list[_Strided]:
+    def _strided_plan(
+        self, experts: tuple[int, ...], base: dict[str, int], only: frozenset[int] | None = None
+    ) -> list[_Strided]:
         """The segment table expressed as bulk strided copies, part-major.
 
         ``only`` restricts the plan to those SLOT indices (not expert ids). The
@@ -341,14 +383,18 @@ class BankSource:
             if only is not None and slot not in only:
                 continue
             for lane, name in enumerate(W13_SECTIONS):
-                out.append(_Strided(
-                    L.expert_offset(name, e),
-                    base["w13"] + slot * L.device_record("w13") + lane * run,
-                    ng, run, slab))
+                out.append(
+                    _Strided(
+                        L.expert_offset(name, e),
+                        base["w13"] + slot * L.device_record("w13") + lane * run,
+                        ng,
+                        run,
+                        slab,
+                    )
+                )
             for name in ("w2", "w13_scale", "w2_scale"):
                 rec = L.section_record(name)
-                out.append(_Strided(L.expert_offset(name, e), base[name] + slot * rec,
-                                    1, rec, rec))
+                out.append(_Strided(L.expert_offset(name, e), base[name] + slot * rec, 1, rec, rec))
         return out
 
     def _layer_map(self, layer: int) -> tuple[mmap.mmap, int]:
@@ -363,12 +409,12 @@ class BankSource:
                 raise BankSourceError(
                     f"layer {layer} is not in the bank ({sorted(self.built_layers)[:4]}...); "
                     "a partially built bank must not be served -- the missing layers would "
-                    "read as whatever the staging held last")
+                    "read as whatever the staging held last"
+                )
             path = layer_path(self.bank_dir, layer)
             size = os.path.getsize(path)
             if size != self.layout.layer_bytes:
-                raise BankSourceError(
-                    f"layer {layer} file is {size} B, the layout says {self.layout.layer_bytes}")
+                raise BankSourceError(f"layer {layer} file is {size} B, the layout says {self.layout.layer_bytes}")
             fd = os.open(path, os.O_RDONLY)
             try:
                 # r--s: read-only SHARED. kt throws on PRIVATE+WRITABLE, and a
@@ -396,8 +442,9 @@ class BankSource:
         return got
 
     # -- the seam ---------------------------------------------------------
-    def gather(self, layer: int, experts: Sequence[int], staging: torch.Tensor,
-               only_slots: Sequence[int] | None = None) -> BankGatherResult:
+    def gather(
+        self, layer: int, experts: Sequence[int], staging: torch.Tensor, only_slots: Sequence[int] | None = None
+    ) -> BankGatherResult:
         """Fill ``staging`` with ``experts`` of ``layer`` in device NZ layout.
 
         ``only_slots`` fills just those positions of the chunk and leaves the
@@ -415,8 +462,7 @@ class BankSource:
         if len(set(experts)) != len(experts):
             raise BankSourceError(f"layer {layer}: duplicate expert ids {experts}")
         if staging.dtype != torch.uint8 or staging.device.type != "cpu" or not staging.is_contiguous():
-            raise TypeError(f"staging must be a contiguous CPU uint8 tensor, got "
-                            f"{staging.dtype} on {staging.device}")
+            raise TypeError(f"staging must be a contiguous CPU uint8 tensor, got {staging.dtype} on {staging.device}")
         only = None
         if only_slots is not None:
             only = frozenset(int(s) for s in only_slots)
@@ -424,18 +470,19 @@ class BankSource:
             if bad:
                 raise BankSourceError(
                     f"only_slots {bad} fall outside the {len(experts)}-slot chunk; a slot index is "
-                    "a position in this chunk, not an expert id")
+                    "a position in this chunk, not an expert id"
+                )
             if not only:
                 raise BankSourceError(
                     "only_slots is empty: a gather that fills nothing is a zero-coverage call, and "
-                    "the caller would then H2D whatever the staging held last")
+                    "the caller would then H2D whatever the staging held last"
+                )
         plans, _, nbytes = self._table(experts, only)
         if staging.numel() < nbytes:
             raise BankSourceError(f"staging holds {staging.numel()} B, chunk needs {nbytes} B")
         src = self._layer_array(layer)
         view = staging.view(-1).numpy()
-        produced = tuple(experts) if only is None else tuple(
-            e for i, e in enumerate(experts) if i in only)
+        produced = tuple(experts) if only is None else tuple(e for i, e in enumerate(experts) if i in only)
         moved = sum(p.nruns * p.run for p in plans)
         if self.copy_threads == 1:
             _copy_strided(view, src, plans)
@@ -446,17 +493,18 @@ class BankSource:
         # interleaved stream by 1.4-1.6%).
         n, t = len(plans), self.copy_threads
         bounds = [(i * n // t, (i + 1) * n // t) for i in range(t)]
-        futs = [self._executor().submit(_copy_strided, view, src, plans[a:b],
-                                        self._cpus[i] if self._pin_cpus else None)
-                for i, (a, b) in enumerate(bounds) if a < b]
+        futs = [
+            self._executor().submit(_copy_strided, view, src, plans[a:b], self._cpus[i] if self._pin_cpus else None)
+            for i, (a, b) in enumerate(bounds)
+            if a < b
+        ]
         for f in futs:
             f.result()
         return self._result(layer, tuple(experts), produced, plans, moved)
 
     def _executor(self) -> ThreadPoolExecutor:
         if self._pool is None:
-            self._pool = ThreadPoolExecutor(max_workers=self.copy_threads,
-                                            thread_name_prefix="kt_bank")
+            self._pool = ThreadPoolExecutor(max_workers=self.copy_threads, thread_name_prefix="kt_bank")
         return self._pool
 
     def close(self) -> None:

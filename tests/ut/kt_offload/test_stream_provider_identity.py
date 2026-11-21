@@ -17,6 +17,7 @@ was handed, and any wrapping happens in ``setup_streaming`` before anything is
 installed. The ten stream_layer unit tests could not catch this because they
 drive stubs and never go through the installer.
 """
+
 import types
 
 import pytest

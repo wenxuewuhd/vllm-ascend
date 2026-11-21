@@ -39,10 +39,10 @@ possible, but two rows may share one, and the multiplicity is information).
 
 from __future__ import annotations
 
-import re
 import struct
 import threading
 
+import regex as re
 import torch
 from vllm.logger import logger
 
@@ -58,6 +58,7 @@ FLUSH_EVERY = 2048
 
 def _path() -> str:
     from vllm_ascend import envs  # noqa: PLC0415 - avoids a module-level cycle
+
     return (envs.VLLM_ASCEND_DSV41_ROUTING_TRACE or "").strip()
 
 
@@ -81,10 +82,16 @@ def _open():
     global _FH
     if _FH is None:
         p = _path()
-        _FH = open(p, "wb", buffering=0)
+        # noqa SIM115: deliberately long-lived. The trace file stays open for
+        # the life of the process and is closed by close(); a context manager
+        # here would shut it after the first write.
+        _FH = open(p, "wb", buffering=0)  # noqa: SIM115
         _FH.write(HEADER.pack(MAGIC, VERSION, _N_LAYERS, _N_EXPERTS))
-        logger.info("kt_offload routing trace: writing %s (graph capture must be OFF for this to "
-                    "see anything; a traced run is NOT a timing run)", p)
+        logger.info(
+            "kt_offload routing trace: writing %s (graph capture must be OFF for this to "
+            "see anything; a traced run is NOT a timing run)",
+            p,
+        )
     return _FH
 
 
@@ -135,8 +142,12 @@ def close() -> None:
         if _FH is not None:
             _FH.close()
             _FH = None
-        logger.info("kt_offload routing trace: %d calls over %d forwards, skipped %s",
-                    _CALLS, _SEQ, dict(sorted(_SKIPPED.items())))
+        logger.info(
+            "kt_offload routing trace: %d calls over %d forwards, skipped %s",
+            _CALLS,
+            _SEQ,
+            dict(sorted(_SKIPPED.items())),
+        )
 
 
 if ENABLED:

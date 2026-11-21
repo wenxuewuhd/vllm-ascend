@@ -6,12 +6,20 @@ interpret rather than an error.
 
 import pytest
 
+
 # dynamic_resident needs kt to actually hold every expert's CPU weights; a kt
 # build without KT_FULLSET_LOAD ignores the export, silently, and reads "no gain"
 def _dyn_cfg(**kw):
     from vllm_ascend.kt_offload.config import KTOffloadConfig
-    base = dict(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
-                overlap_side_stream=False, stream_prefill=True, dynamic_resident=True)
+
+    base = dict(
+        enabled=True,
+        cpuinfer_threads=8,
+        num_resident_experts=100,
+        overlap_side_stream=False,
+        stream_prefill=True,
+        dynamic_resident=True,
+    )
     base.update(kw)
     return KTOffloadConfig(**base)
 
@@ -27,6 +35,7 @@ def _with_amx(monkeypatch, module):
     """Make ``from kt_kernel.utils import amx`` inside the method yield *module*."""
     import sys
     import types
+
     pkg = types.ModuleType("kt_kernel")
     utils = types.ModuleType("kt_kernel.utils")
     utils.amx = module
@@ -45,7 +54,7 @@ def test_full_set_load_off_is_refused(monkeypatch):
 
 def test_full_set_load_on_is_accepted(monkeypatch):
     _with_amx(monkeypatch, _FakeAmx(answer=True))
-    _dyn_cfg()._refuse_without_full_set_load()          # must not raise
+    _dyn_cfg()._refuse_without_full_set_load()  # must not raise
 
 
 def test_a_kt_build_without_the_switch_is_refused(monkeypatch):
@@ -59,6 +68,7 @@ def test_a_kt_build_without_the_switch_is_refused(monkeypatch):
 
 def test_an_unimportable_kt_is_refused(monkeypatch):
     import builtins
+
     real_import = builtins.__import__
 
     def boom(name, *a, **kw):
@@ -82,8 +92,10 @@ def test_the_check_stands_down_when_dynamic_resident_is_off(monkeypatch):
 # ignored without a word and the run silently takes the copy path
 def _zc_cfg(**kw):
     from vllm_ascend.kt_offload.config import KTOffloadConfig
-    base = dict(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
-                overlap_side_stream=False, zerocopy_w13=True)
+
+    base = dict(
+        enabled=True, cpuinfer_threads=8, num_resident_experts=100, overlap_side_stream=False, zerocopy_w13=True
+    )
     base.update(kw)
     return KTOffloadConfig(**base)
 
@@ -96,6 +108,7 @@ def _with_kt_ext(monkeypatch, tmp_path, blob: bytes | None):
     """
     import sys
     import types
+
     pkg_dir = tmp_path / "kt_kernel"
     pkg_dir.mkdir()
     if blob is not None:
@@ -110,9 +123,10 @@ _NOISE = b"\x7fELF" + bytes(4096)
 
 
 def test_a_build_carrying_both_switch_names_is_accepted(monkeypatch, tmp_path):
-    _with_kt_ext(monkeypatch, tmp_path,
-                 _NOISE + b"KT_ZEROCOPY_WEIGHTS\x00" + _NOISE + b"KT_ZEROCOPY_SCOPE\x00" + _NOISE)
-    _zc_cfg()._refuse_without_zerocopy_support()          # must not raise
+    _with_kt_ext(
+        monkeypatch, tmp_path, _NOISE + b"KT_ZEROCOPY_WEIGHTS\x00" + _NOISE + b"KT_ZEROCOPY_SCOPE\x00" + _NOISE
+    )
+    _zc_cfg()._refuse_without_zerocopy_support()  # must not raise
 
 
 @pytest.mark.parametrize(
@@ -136,15 +150,16 @@ def test_a_build_that_cannot_support_zerocopy_is_refused(monkeypatch, tmp_path, 
 
 def test_no_kt_at_all_is_refused(monkeypatch):
     import sys
-    monkeypatch.setitem(sys.modules, "kt_kernel", None)    # import yields None -> attribute fails
+
+    monkeypatch.setitem(sys.modules, "kt_kernel", None)  # import yields None -> attribute fails
     with pytest.raises(ValueError):
         _zc_cfg()._refuse_without_zerocopy_support()
 
 
 def test_the_check_is_skipped_when_the_switch_is_off(monkeypatch, tmp_path):
     """Off must cost nothing -- otherwise every unrelated run needs a new kt."""
-    _with_kt_ext(monkeypatch, tmp_path, _NOISE)            # a build WITHOUT the names
-    _zc_cfg(zerocopy_w13=False)._refuse_without_zerocopy_support()   # must not raise
+    _with_kt_ext(monkeypatch, tmp_path, _NOISE)  # a build WITHOUT the names
+    _zc_cfg(zerocopy_w13=False)._refuse_without_zerocopy_support()  # must not raise
 
 
 def test_the_probe_reads_the_build_not_the_environment(monkeypatch, tmp_path):
@@ -163,8 +178,10 @@ def test_the_probe_reads_the_build_not_the_environment(monkeypatch, tmp_path):
 # 50/50 would let two arms place their pages differently
 def _frac_cfg(**kw):
     from vllm_ascend.kt_offload.config import KTOffloadConfig
-    base = dict(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
-                overlap_side_stream=False, threadpool_count=2)
+
+    base = dict(
+        enabled=True, cpuinfer_threads=8, num_resident_experts=100, overlap_side_stream=False, threadpool_count=2
+    )
     base.update(kw)
     return KTOffloadConfig(**base)
 
@@ -214,6 +231,7 @@ def test_negative_reserve_is_refused():
     with pytest.raises(ValueError, match="zerocopy_reserve_gib"):
         _frac_cfg(zerocopy_reserve_gib=-1.0)
 
+
 def test_stream_resident_from_hbm_needs_stream_prefill_and_the_bank():
     """Each precondition is a different silent wrong answer if it is missing.
 
@@ -226,10 +244,16 @@ def test_stream_resident_from_hbm_needs_stream_prefill_and_the_bank():
     """
     from vllm_ascend.kt_offload.config import KTOffloadConfig
 
-    base = dict(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
-                overlap_side_stream=False, stream_prefill=True,
-                bank_dir="/dev/shm/dsv41_nz_bank", stream_resident_from_hbm=True)
-    KTOffloadConfig(**base)                      # the combination that is allowed
+    base = dict(
+        enabled=True,
+        cpuinfer_threads=8,
+        num_resident_experts=100,
+        overlap_side_stream=False,
+        stream_prefill=True,
+        bank_dir="/dev/shm/dsv41_nz_bank",
+        stream_resident_from_hbm=True,
+    )
+    KTOffloadConfig(**base)  # the combination that is allowed
 
     with pytest.raises(ValueError, match="needs stream_prefill"):
         KTOffloadConfig(**{**base, "stream_prefill": False})
@@ -258,8 +282,7 @@ def test_stream_resident_from_hbm_stays_off_by_default_because_it_has_preconditi
     """
     from vllm_ascend.kt_offload.config import KTOffloadConfig
 
-    base = dict(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
-                overlap_side_stream=False)
+    base = dict(enabled=True, cpuinfer_threads=8, num_resident_experts=100, overlap_side_stream=False)
     assert KTOffloadConfig(**base).stream_resident_from_hbm is False
     with pytest.raises(ValueError, match="needs bank_dir"):
         KTOffloadConfig(**base, stream_prefill=True, stream_resident_from_hbm=True)
@@ -277,9 +300,16 @@ def test_kt_reads_bank_refuses_scope_w13():
     """
     from vllm_ascend.kt_offload.config import KTOffloadConfig
 
-    base = dict(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
-                overlap_side_stream=False, stream_prefill=True,
-                bank_dir="/dev/shm/dsv41_nz_bank", zerocopy_w13=True, kt_reads_bank=True)
+    base = dict(
+        enabled=True,
+        cpuinfer_threads=8,
+        num_resident_experts=100,
+        overlap_side_stream=False,
+        stream_prefill=True,
+        bank_dir="/dev/shm/dsv41_nz_bank",
+        zerocopy_w13=True,
+        kt_reads_bank=True,
+    )
     KTOffloadConfig(**base, zerocopy_scope="all")
     with pytest.raises(ValueError, match="needs zerocopy_scope='all'"):
         KTOffloadConfig(**base, zerocopy_scope="w13")

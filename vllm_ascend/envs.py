@@ -283,7 +283,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # takes the piecewise torch.compile + plain ACLGraph path that no DSV4.1
     # accuracy or soak number covers. Set it only to run that path on purpose.
     "VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE": lambda: os.getenv(
-        "VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE", "0"),
+        "VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE", "0"
+    ),
     # DeepSeek-V4.1 MoE offload (M0c): output directory for the per-layer
     # routed-expert frequency counter (vllm_ascend/kt_offload/expert_counter.py).
     # Empty (default) = off. Diagnostic only. Does NOT require --enforce-eager

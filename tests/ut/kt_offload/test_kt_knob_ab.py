@@ -75,15 +75,16 @@ def _wait_for(pred, timeout: float = 2.0):
         if pred():
             return
         time.sleep(0.01)
-    raise AssertionError("condition not reached within %.1f s" % timeout)
+    raise AssertionError(f"condition not reached within {timeout:.1f} s")
 
 
 def test_parse_accepts_one_line_of_every_knob():
-    assert kb.parse("nz_prefetch_groups=16 nz_prefetch_groups_short=-1 nz_prefetch_hint=2 "
-                    "nz_prefetch_legacy_stride=1") == {
+    assert kb.parse(
+        "nz_prefetch_groups=16 nz_prefetch_groups_short=-1 nz_prefetch_hint=2 nz_prefetch_legacy_stride=1"
+    ) == {
         "nz_prefetch_groups": 16,
-        "nz_prefetch_groups_short": -1,   # -1 = follow the long-row distance
-        "nz_prefetch_hint": 2,            # NTA
+        "nz_prefetch_groups_short": -1,  # -1 = follow the long-row distance
+        "nz_prefetch_hint": 2,  # NTA
         "nz_prefetch_legacy_stride": True,
     }
 
@@ -94,12 +95,15 @@ def test_parse_ignores_comments_and_blank_input():
     assert kb.parse("nz_prefetch_groups=0 # the no-prefetch arm") == {"nz_prefetch_groups": 0}
 
 
-@pytest.mark.parametrize("text", [
-    "nz_prefetch_groups",                 # not key=value
-    "prefetch=8",                         # unknown knob: a typo must not be a silent no-op
-    "nz_prefetch_groups=eight",
-    "nz_prefetch_legacy_stride=yes",      # only 0/1, so "on" cannot mean "off"
-])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "nz_prefetch_groups",  # not key=value
+        "prefetch=8",  # unknown knob: a typo must not be a silent no-op
+        "nz_prefetch_groups=eight",
+        "nz_prefetch_legacy_stride=yes",  # only 0/1, so "on" cannot mean "off"
+    ],
+)
 def test_parse_refuses_what_it_cannot_read(text):
     with pytest.raises(ValueError):
         kb.parse(text)

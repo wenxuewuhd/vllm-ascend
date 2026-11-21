@@ -432,9 +432,7 @@ def test_l3_domain_of_reads_the_real_topology():
 def _fake_topology(monkeypatch, *, cores_per_ccd=8, logical=128):
     """8-core CCDs and SMT pairs cpu N / cpu N+logical, like the real host."""
     monkeypatch.setattr(bank_build, "l3_domain_of", lambda cpu: ((cpu % logical) // cores_per_ccd) * cores_per_ccd)
-    monkeypatch.setattr(
-        bank_build, "smt_siblings_of", lambda cpu: frozenset({cpu % logical, cpu % logical + logical})
-    )
+    monkeypatch.setattr(bank_build, "smt_siblings_of", lambda cpu: frozenset({cpu % logical, cpu % logical + logical}))
 
 
 def test_prefetch_placement_accepts_idle_cores_on_one_ccd(monkeypatch):
@@ -482,7 +480,7 @@ def test_prefetch_placement_without_kt_cpus_still_checks_the_pool(monkeypatch):
 
 
 def test_smt_siblings_reads_the_real_topology():
-    """Not monkeypatched: a guard built on unparseable sysfs is no guard."""
+    """Not monkeypatched: a guard built on unparsable sysfs is no guard."""
     sibs = bank_build.smt_siblings_of(0)
     assert 0 in sibs
     assert all(isinstance(c, int) for c in sibs)
