@@ -48,8 +48,6 @@ from dataclasses import dataclass
 
 from vllm.logger import logger
 
-from vllm_ascend.kt_offload import nz_geometry
-
 #: ``w13`` is stored per TP part, ``w2`` whole (see the module docstring).
 W13_SECTIONS = ("w13_gate_p0", "w13_gate_p1", "w13_up_p0", "w13_up_p1")
 MADV_NOHUGEPAGE = 15
@@ -72,10 +70,6 @@ class PartWeights:
     w13_k: int
     w2_n: int
     w2_k: int
-
-    def group_stride_bytes(self) -> tuple[int, int]:
-        """(w13, w2) dense strides, i.e. what ``group_stride()*16`` must equal."""
-        return self.w13_n * nz_geometry.NZ_C0, self.w2_n * nz_geometry.NZ_C0
 
 
 #: posix_fadvise(2)

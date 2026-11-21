@@ -555,7 +555,6 @@ class ResidentFold:
         on_write: Callable[[str, str], None] | None = None,
         live_objects: Callable[[int], Mapping[str, Any]] | None = None,
         window_source: Callable[[], prefill_window.PrefillWindow | None] = prefill_window.require,
-        nz_barrier: str = "device",
     ):
         self.provider = provider
         self.policy = policy or TopKHeatPolicy()
@@ -670,10 +669,6 @@ class ResidentFold:
         self._nz = bool(provider.nz_device)
         self._nz_bytes: dict[str, int] = {}
         self._nz_slot: Any | None = None
-        self._nz_barrier = str(nz_barrier)
-        if self._nz_barrier not in ("device", "stream", "none"):
-            raise FoldError(f"nz_barrier={nz_barrier!r}: one of 'device', 'stream', 'none'")
-        self._barrier_waits = 0
         self._needs_barrier = False
         if self._nz:
             self._enable_nz_staging()
@@ -751,11 +746,11 @@ class ResidentFold:
             )
         logger.info(
             "kt_offload fold: NZ staging -- weights filled by raw D2D at %s B/slot, scales still ND; "
-            "no per-layer cast; freed %d B (%.3f GiB) of ND weight staging; barrier=%s",
+            "no per-layer cast; freed %d B (%.3f GiB) of ND weight staging; "
+            "barrier=device synchronize",
             dict(nz_bytes),
             freed,
             freed / float(1 << 30),
-            self._nz_barrier,
         )
 
     # -- state ------------------------------------------------------------
@@ -1135,18 +1130,14 @@ class ResidentFold:
         measured as 12/100 wrong slots on the H2D path, and it would be silent:
         every byte count, every address and every coverage check still agrees.
 
-        A device synchronize is the default because it is the one barrier that
-        unambiguously flushes the queue as well as the stream. ``"stream"`` is
-        the cheaper candidate and ``"none"`` exists to drive the failure on card
-        as a positive control; neither is the default until one is measured.
+        A device synchronize, because it is the one barrier that unambiguously
+        flushes the queue as well as the stream. A three-way knob once offered
+        ``"stream"`` (cheaper, never measured) and ``"none"`` (whose declared
+        purpose was to drive the failure on card as a positive control, i.e. to
+        make the product compute wrong answers); both were deleted on 2026-11-21
+        as nothing set them.
         """
-        if self._nz_barrier == "none":
-            return
-        if self._nz_barrier == "stream":
-            torch.npu.current_stream().synchronize()
-        else:
-            torch.npu.synchronize()
-        self._barrier_waits += 1
+        torch.npu.synchronize()
 
     def _staging_moved(self, expected: Mapping[str, int]) -> list[str]:
         """Staging buffers whose address is no longer the one recorded. One place, two callers.

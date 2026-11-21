@@ -153,20 +153,6 @@ class KTOffloadConfig:
     # cache coexist. The -93.6 GiB only arrives once kt reads the same bank
     # (stage 3), which lets the checkpoint mapping go.
     bank_dir: str = ""
-    # How the fold orders a commit's read of its NZ staging against the NEXT
-    # layer's writes to it. Only the bank path has the problem: in NZ mode the
-    # staging is filled by raw ACL copies, which go to the stream immediately,
-    # while the commit reads it through torch_npu, which goes through the
-    # host-side task queue -- so the next layer's writes can be submitted first
-    # and the commit reads bytes that have already been replaced. Silently:
-    # every byte count, address and coverage check still agrees.
-    #
-    # "device" (default) is the one barrier that unambiguously flushes queue and
-    # stream both; "stream" is the cheaper candidate, not the default until it
-    # is measured; "none" removes it, to drive the failure on card as a positive
-    # control. One wait per folded layer, on the one forward per request that
-    # commits.
-    fold_nz_barrier: str = "device"
     # Stage 3: let kt consume the SAME NZ bank the NPU streams from, in place,
     # instead of reading the checkpoint. That is what removes the duplicate --
     # ~269 GiB on this model, because the checkpoint's expert pages have to stay
@@ -324,14 +310,6 @@ class KTOffloadConfig:
             raise ValueError(
                 "kt_offload_config.zerocopy_scope only means anything with "
                 "zerocopy_w13=true; with zero-copy off kt copies everything."
-            )
-        if self.fold_nz_barrier not in ("device", "stream", "none"):
-            raise ValueError("kt_offload_config.fold_nz_barrier must be 'device', 'stream' or 'none'.")
-        if self.fold_nz_barrier == "none" and not self.bank_dir:
-            raise ValueError(
-                "kt_offload_config.fold_nz_barrier='none' only means anything with bank_dir; "
-                "it removes the ordering between a commit's read of the fold staging and the "
-                "next layer's raw writes to it, and exists to drive that failure on card."
             )
         if self.bank_dir and not self.stream_prefill:
             raise ValueError(

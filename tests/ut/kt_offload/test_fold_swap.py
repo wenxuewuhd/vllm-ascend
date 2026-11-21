@@ -2086,9 +2086,10 @@ def test_a_prefill_that_folded_and_never_committed_is_loud_too(ckpt, plat, tmp_p
 # is the ASYNCHRONY -- the host-side task queue that lets a raw copy overtake a
 # torch op is why ``_nz_barrier_wait`` exists, and nothing here can make a
 # synchronous memmove race. So the barrier's effect is asserted only as "the wait
-# happens, once per folded layer, and the knob can remove it"; that it is
-# sufficient is an on-card question, with ``fold_nz_barrier='none'`` as the
-# positive control.
+# happens, once per folded layer"; that it is SUFFICIENT is an on-card question.
+# A `fold_nz_barrier='none'` knob used to serve as the positive control for that
+# question and was deleted on 2026-11-21 -- an arm whose declared purpose is to
+# make the product compute wrong answers does not belong in a shipping config.
 # ---------------------------------------------------------------------------
 
 import ctypes  # noqa: E402  (the NZ section's own dependency)
@@ -2483,25 +2484,10 @@ def test_nz_mode_barrier_waits_once_per_folded_layer(ckpt, plat, tmp_path, acl_f
     w = nz_world(ckpt, plat, tmp_path, layers=(0, 1))
     assert npu_rt["device"] == 0
     w.stream(layer=0, hot=HOT[0])
-    assert (npu_rt["device"], w.fold._barrier_waits) == (0, 0), "nothing to order the first layer against"
+    assert npu_rt["device"] == 0, "nothing to order the first layer against"
     w.stream(layer=1, hot=HOT[1])
-    assert (npu_rt["device"], w.fold._barrier_waits) == (1, 1)
-    assert npu_rt["stream"] == 0, "the default barrier is the device one"
-
-
-@pytest.mark.parametrize("barrier, want", [("device", (1, 0)), ("stream", (0, 1)), ("none", (0, 0))])
-def test_the_nz_barrier_knob_selects_a_real_barrier(ckpt, plat, tmp_path, acl_fake, npu_rt, barrier, want):
-    """``none`` exists to drive the failure on card; it must really remove the wait."""
-    w = nz_world(ckpt, plat, tmp_path, layers=(0, 1), nz_barrier=barrier)
-    w.stream(layer=0, hot=HOT[0])
-    w.stream(layer=1, hot=HOT[1])
-    assert (npu_rt["device"], npu_rt["stream"]) == want
-    assert w.fold._barrier_waits == (0 if barrier == "none" else 1)
-
-
-def test_the_fold_refuses_an_unknown_barrier(ckpt, plat, tmp_path, acl_fake, npu_rt):
-    with pytest.raises(FoldError, match="nz_barrier"):
-        nz_world(ckpt, plat, tmp_path, nz_barrier="sometimes")
+    assert npu_rt["device"] == 1, "one device synchronize before the second layer stages"
+    assert npu_rt["stream"] == 0, "it is the device barrier, not a stream one"
 
 
 def test_served_nz_and_served_nd_each_refuse_the_other_mode(ckpt, plat, tmp_path, acl_fake, npu_rt):

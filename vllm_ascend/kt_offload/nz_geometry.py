@@ -107,25 +107,6 @@ class NZGeometryMismatch(RuntimeError):
     """CANN's NZ byte geometry is not the one this version assumes. Do not start."""
 
 
-# ---------------------------------------------------------------------------
-# The formula
-# ---------------------------------------------------------------------------
-
-
-def nz_offset(e: int, n: int, kb: int, N: int, Kb: int, c0: int = NZ_C0) -> int:
-    """Byte offset in the NZ buffer of the ND byte at ``(e, n, kb)``.
-
-    The formula itself, scalar and dependency-free, so it can be quoted in a
-    review or a test without importing numpy semantics. ``Kb`` must be a multiple
-    of ``c0``; ``e`` indexes the expert-major concatenation (verified for E > 1).
-    """
-    if Kb % c0:
-        raise ValueError(f"Kb={Kb} is not a multiple of C0={c0}: the closed-form NZ offset does not apply")
-    if not (0 <= n < N and 0 <= kb < Kb):
-        raise ValueError(f"(n={n}, kb={kb}) outside [{N}, {Kb}]")
-    return e * (N * Kb) + (kb // c0) * (N * c0) + n * c0 + (kb % c0)
-
-
 def nz_storage_bytes(num_experts: int, N: int, Kb: int) -> int:
     """Expected NZ storage size: the layout is dense, no padding."""
     return int(num_experts) * int(N) * int(Kb)
@@ -182,37 +163,10 @@ def _mix_bytes(count: int, salt: int) -> np.ndarray:
 
 
 @dataclass(frozen=True)
-class _Scratch:
-    """Per-slice working buffers, allocated once and reused by every slice.
-
-    ``intp`` for the two index arrays because that is what ``np.take`` wants; a
-    narrower dtype only makes it convert, measured no faster.
-    """
-
-    idx: np.ndarray
-    lo: np.ndarray
-    hi: np.ndarray
-    a: np.ndarray
-    b: np.ndarray
-    want: np.ndarray
-
-    @classmethod
-    def of(cls, size: int) -> _Scratch:
-        return cls(
-            np.empty(size, dtype=np.int64),
-            np.empty(size, dtype=np.intp),
-            np.empty(size, dtype=np.intp),
-            np.empty(size, dtype=np.uint8),
-            np.empty(size, dtype=np.uint8),
-            np.empty(size, dtype=np.uint8),
-        )
-
-
-@dataclass(frozen=True)
 class _Content:
     """The two mix tables, built once per case.
 
-    Holding them rather than rebuilding them is what makes the chunked path
+    Holding them rather than rebuilding them is what made a chunked upload path
     affordable: filling ``LOW`` is a splitmix64 over 65536 uint64s (~1.3 ms), and
     the self-check asks for content 464 times.
     """
@@ -230,31 +184,13 @@ class _Content:
 
         Because the content is ``LOW[o % 65536] ^ HIGH[o // 65536]``, it is
         RANDOM ACCESS: any subset of offsets can be evaluated without
-        materialising the rest. A non-separable hash would force the chunked
-        comparison to build the whole 22 MiB array to read one slice out of it,
-        which is the allocation the chunking exists to avoid.
+        materialising the rest. That property is what a chunked comparison
+        needed; that arm is gone, but the property costs nothing to keep.
         """
         o = offsets.astype(np.uint64, copy=False)
         lo = (o & np.uint64(_CONTENT_BLOCK - 1)).astype(np.intp)
         hi = (o >> np.uint64(16)).astype(np.intp)
         return self.low[lo] ^ self.high[hi]
-
-    def at_into(self, base: np.ndarray, shift: int, scratch: _Scratch) -> np.ndarray:
-        """:meth:`at` for ``base + shift``, allocating nothing.
-
-        Same bytes as ``at(base + shift)``; the difference is that every
-        intermediate goes into a preallocated buffer. The naive form allocates
-        six arrays the size of a slice per call, and the self-check makes 464
-        calls: 1900 allocations of ~600 KB, which cost 7.5 ms of the 40 ms the
-        expectation took. Everything here is ``out=``.
-        """
-        np.add(base, shift, out=scratch.idx)
-        np.bitwise_and(scratch.idx, _CONTENT_BLOCK - 1, out=scratch.lo)
-        np.right_shift(scratch.idx, 16, out=scratch.hi)
-        np.take(self.low, scratch.lo, out=scratch.a)
-        np.take(self.high, scratch.hi, out=scratch.b)
-        np.bitwise_xor(scratch.a, scratch.b, out=scratch.want)
-        return scratch.want
 
     def whole(self, total: int) -> np.ndarray:
         """All ``total`` bytes at once, as one broadcast XOR."""
@@ -262,55 +198,6 @@ class _Content:
         # The first n of a C-contiguous buffer is itself contiguous, so this is
         # a view: the tail of the last block is simply not used.
         return buf[:total]
-
-
-def deterministic_nd(num_experts: int, N: int, Kb: int, salt: int = 0) -> np.ndarray:
-    """``[E, N, Kb]`` uint8 whose every byte is a pure function of its ND offset.
-
-    The whole array at once. The start-up path does NOT use this -- it goes
-    through :class:`_Content` a slice at a time -- but the formula is stated here
-    and a unit test can compare the two.
-
-    Deliberately not random: a mismatch has to be reproducible from the shapes
-    alone, with no seed to carry around in a bug report.
-
-    The function is ``byte(o) = LOW[o % 65536] ^ HIGH[o // 65536]``, each table
-    filled with splitmix64 of its index. Two properties it has to have, and one
-    it has to be:
-
-    * **not periodic in 256.** A bare ``(o * 0x9E3779B97F4A7C15) & 0xFF`` keeps
-      only the low 8 bits of ``o``, so the content repeats every 256 bytes and a
-      wrong permutation that happens to displace bytes by a multiple of 256 reads
-      as a pass. Here a displacement inside a block changes ``LOW``, and one of a
-      whole number of blocks changes ``HIGH``: no displacement at all preserves
-      the pair.
-    * **``byte(0) != 0``.** Otherwise a readback of a buffer the card never wrote
-      agrees with the expectation at byte 0, and the first-mismatch report points
-      somewhere else. Hence the ``+ 1`` inside the mix and the pinned high salt.
-    * **cheap.** Running splitmix64 over all 35 M offsets costs 168 ms -- uint64
-      intermediates, several passes, 8x the output in memory traffic, and it
-      dominated the whole self-check. The split makes it one broadcast XOR of a
-      64 KiB table by a 540-byte table, i.e. one pass over the output in uint8,
-      and the mix itself runs on 65 k elements instead of 35 M.
-
-    What the split costs, stated plainly: the content is separable, so a
-    displacement by an exact multiple of 65536 is all-or-nothing per block pair
-    -- it hides *a whole block* iff ``HIGH[h] == HIGH[h+d]``, with probability
-    1/256. It never hides the mismatch, because the verdict needs only one
-    differing byte among 360 blocks (all of them colliding has probability
-    256**-360); it can only move which offset gets reported first. For any
-    displacement that is NOT a multiple of 65536, ``LOW`` differs and there is no
-    such effect. Measured on the real w13 shape: P(byte(o) == byte(o+d)) is
-    0.0036 at d=16, 0.0045 at d=256, 0.0034 at d=4096 -- all at the 1/256 a
-    random byte string would give.
-    """
-    n = nz_storage_bytes(num_experts, N, Kb)
-    return _Content.for_size(n, salt).whole(n).reshape(num_experts, N, Kb)
-
-
-# ---------------------------------------------------------------------------
-# Reading the NZ bytes back
-# ---------------------------------------------------------------------------
 
 
 def device_bytes(t: Any) -> np.ndarray:
@@ -443,23 +330,6 @@ def production_post_load(module: Any, quant_method: Any = None) -> None:
     AscendW4A8MXFPDSDynamicFusedMoEMethod.process_weights_after_loading(None, module)
 
 
-def production_cast(nd: Any) -> Any:
-    """The cast on its own, for callers that cannot build a module.
-
-    A MIRROR of the one line in ``process_weights_after_loading``, kept because
-    the lighter form is occasionally useful; :func:`production_post_load` is the
-    one the self-check uses, because a mirror that drifts tests nothing.
-    """
-    import torch_npu  # noqa: PLC0415 - lazy: registers torch.npu, absent off-card
-
-    return torch_npu.npu_format_cast(
-        nd.view(torch.uint8),
-        NZ_CAST_FORMAT,
-        customize_dtype=torch.float8_e4m3fn,
-        input_dtype=torch_npu.float4_e2m1fn_x2,
-    )
-
-
 def _npu_format(t: Any) -> int | None:
     """``get_npu_format``, reported not enforced.
 
@@ -501,40 +371,21 @@ class _SelfCheckModule:
 # Chunked upload and comparison
 # ---------------------------------------------------------------------------
 
+
 #: Target size of one host staging chunk for the ND upload, bytes. The slice the
 #: comparison works on is ``N * C0`` (72 KiB for w13, 80 KiB for w2), so this is
 #: the same order: the peak host allocation of the whole self-check is a handful
 #: of these, not the 22 MiB of a whole weight.
-_UPLOAD_CHUNK_BYTES = 1 << 17
-
-
-def _upload_nd(case: Case, content: _Content, device: Any, *, chunked: bool = False) -> Any:
+def _upload_nd(case: Case, content: _Content, device: Any) -> Any:
     """The case's ND bytes on the device.
 
-    Default: build the whole ``[E, N, Kb]`` array on the host and copy it in one
-    H2D -- a 22 MiB host allocation per case. ``chunked=True`` fills the
-    (contiguous) device buffer from 128 KiB host staging chunks instead, so the
-    peak is about a megabyte. Same bytes either way.
-
-    This takes ``chunked`` from :func:`verify_nz_geometry` rather than deciding
-    for itself, deliberately: upload and compare win or lose for the SAME reason
-    (whether a large fresh allocation is cheap on this host right now), so
-    splitting the decision would just produce a mixture that is best at
-    nothing.
+    Build the whole ``[E, N, Kb]`` array on the host and copy it in one H2D --
+    a 22 MiB host allocation per case. A chunked variant that filled the device
+    buffer from 128 KiB staging chunks was deleted on 2026-11-21: nothing ever
+    asked for it.
     """
     total = nz_storage_bytes(case.num_experts, case.N, case.Kb)
-    if not chunked:
-        return torch.from_numpy(content.whole(total).reshape(case.shape)).to(device)
-    dev = torch.empty((case.num_experts, case.N, case.Kb), dtype=torch.uint8, device=device)
-    flat = dev.view(-1)
-    rows = max(1, _UPLOAD_CHUNK_BYTES // case.Kb)
-    step = rows * case.Kb
-    for start in range(0, total, step):
-        stop = min(start + step, total)
-        chunk = content.at(np.arange(start, stop, dtype=np.uint64))
-        flat[start:stop].copy_(torch.from_numpy(chunk))
-    torch.npu.synchronize()
-    return dev
+    return torch.from_numpy(content.whole(total).reshape(case.shape)).to(device)
 
 
 @dataclass
@@ -547,20 +398,18 @@ class _Mismatch:
     total: int
 
 
-def _compare_nz(
-    out: Any, case: Case, content: _Content, permute: Callable[..., np.ndarray] | None, *, chunked: bool = False
-) -> _Mismatch | None:
+def _compare_nz(out: Any, case: Case, content: _Content, permute: Callable[..., np.ndarray] | None) -> _Mismatch | None:
     """Compare every NZ byte of ``out`` against the formula.
 
     Two implementations, same verdict and same reported numbers (checked by
     diffing the failure messages of four wrong formulas, byte for byte):
 
-    * ``chunked=False`` (default): permute the whole ND buffer on the host, read
-      the whole NZ buffer back in one D2H, one ``np.array_equal``.
-    * ``chunked=True``: :func:`_compare_chunked`, a gidx slice at a time.
+    Permute the whole ND buffer on the host, read the whole NZ buffer back in
+    one D2H, one ``np.array_equal``. A second implementation that walked a gidx
+    slice at a time was deleted on 2026-11-21: nothing ever passed
+    ``chunked=True``, and its own docstring recorded it as 5.5x slower than this
+    on a healthy host.
     """
-    if chunked:
-        return _compare_chunked(out, case, content, permute)
     total = nz_storage_bytes(case.num_experts, case.N, case.Kb)
     nd = content.whole(total).reshape(case.shape)
     want = (permute or permute_nd_to_nz)(nd, case.num_experts, case.N, case.Kb)
@@ -572,81 +421,6 @@ def _compare_nz(
     return _Mismatch(first, int(want[first]), int(got[first]), int(diff.size))
 
 
-def _compare_chunked(
-    out: Any, case: Case, content: _Content, permute: Callable[..., np.ndarray] | None
-) -> _Mismatch | None:
-    """Compare every NZ byte against the formula, one gidx slice at a time.
-
-    A gidx slice is ``buf[e][g]``: ``N * C0`` bytes, contiguous in the NZ buffer
-    at ``e*(N*Kb) + g*(N*C0)``. Iterating ``e`` then ``g`` then the byte inside
-    the slice walks the NZ buffer in increasing global offset, which is why the
-    first disagreement found is the first one globally.
-
-    Coverage is NOT reduced: all 35 389 440 bytes are read back and compared, in
-    464 slices. What shrinks is the peak allocation -- an ``N*C0`` readback buffer
-    plus a :class:`_Scratch` of the same length, about 2 MB per case, reused by
-    every slice, instead of three arrays the size of the whole weight. Measured
-    host peak for the whole self-check: 4.2 MiB, against 79 MiB whole-buffer.
-
-    It is NOT the default: paired against the whole-buffer path on a healthy
-    host it is 5.5x slower (129.9 ms vs 23.4 ms, median of 14 pairs). What it
-    buys is insensitivity to the host -- a flat 129-139 ms whether
-    ``/proc/pressure/memory`` ``full avg10`` is 0.00 or 2.8, where whole-buffer
-    spans 23-1520 ms. See :func:`verify_nz_geometry`. It is also the form that
-    proves the whole-buffer path's arithmetic: the two agree byte for byte,
-    including the reported offsets.
-
-    Sampling would have been cheaper still and was rejected: it is blind to
-    exactly the failures worth fearing (a single wrong gidx, an edge block, the
-    tail, padding appearing at the end).
-
-    ``permute`` is the test injection point. When given, the expectation comes
-    from that whole-buffer function instead of from :meth:`_Content.at`, so a
-    deliberately wrong formula can be fed in -- but the comparison, the offset
-    arithmetic and the reporting below are the SAME code either way, which is
-    what makes "chunking changed no observable behaviour" checkable.
-    """
-    c0 = NZ_C0
-    slice_bytes = case.N * c0
-    per_expert = case.N * case.Kb
-    got = np.empty(slice_bytes, dtype=np.uint8)
-    # ND linear offset of each byte of a slice, relative to the expert and to
-    # g*c0: byte (n, r) of slice (e, g) came from ND (e, n, g*c0 + r), i.e.
-    # e*per_expert + n*Kb + g*c0 + r. This is nz_offset inverted.
-    base = (np.arange(case.N, dtype=np.int64)[:, None] * case.Kb + np.arange(c0, dtype=np.int64)[None, :]).reshape(-1)
-
-    expect_whole = None
-    if permute is not None:
-        nd = content.whole(per_expert * case.num_experts).reshape(case.shape)
-        expect_whole = permute(nd, case.num_experts, case.N, case.Kb)
-
-    scratch = _Scratch.of(slice_bytes)
-    ptr = storage_ptr(out)
-    torch.npu.synchronize()
-    found: _Mismatch | None = None
-    for e in range(case.num_experts):
-        for g in range(case.Kb // c0):
-            off = e * per_expert + g * (case.N * c0)
-            _d2h_into(ptr, got, off)
-            if expect_whole is None:
-                want = content.at_into(base, e * per_expert + g * c0, scratch)
-            else:
-                want = expect_whole[off : off + slice_bytes]
-            if np.array_equal(got, want):
-                continue
-            diff = np.flatnonzero(got != want)
-            if found is None:
-                i = int(diff[0])
-                found = _Mismatch(off + i, int(want[i]), int(got[i]), 0)
-            found.total += int(diff.size)
-    return found
-
-
-# ---------------------------------------------------------------------------
-# The self-check
-# ---------------------------------------------------------------------------
-
-
 def verify_nz_geometry(
     device: Any = None,
     *,
@@ -655,45 +429,15 @@ def verify_nz_geometry(
     post_load: Callable[..., None] | None = None,
     permute: Callable[..., np.ndarray] | None = None,
     group_size: int = SELFCHECK_GROUP_SIZE,
-    chunked: bool = False,
 ) -> dict[str, Any]:
     """Cast a known two-expert tensor through production and compare NZ bytes.
 
     Every one of the 35 389 440 bytes is compared, either way.
 
-    ``chunked`` picks how. ``False`` (default) permutes the whole ND buffer on
-    the host, reads the whole NZ buffer back in one D2H and does one
-    ``np.array_equal``; ``True`` walks a gidx slice at a time.
-
-    ===========  ==============  ==============  =====================
-    path         peak host       D2H round trips host allocs per call
-    ===========  ==============  ==============  =====================
-    whole        90 MiB          1               ~3 x 22 MiB
-    chunked      4.2 MiB         464             0 (scratch reused)
-    ===========  ==============  ==============  =====================
-
-    Timing was settled by a PAIRED measurement -- both paths alternating inside
-    one process, both orders, 7 pairs each -- because cross-process medians on
-    this machine measure the machine: the same whole-buffer code was 62 ms in one
-    session and 962 ms in another. Paired, with ``/proc/pressure/memory``
-    ``full avg10`` logged per rep:
-
-    * at ``full avg10 = 0.00``: whole 22.6-23.8 ms (median 23.4), chunked
-      129.2-134.2 ms (median 129.9). Whole wins every one of 14 pairs, 5.5x.
-    * at ``full avg10 ~ 2.8`` (another job churning a 583 GiB page cache,
-      ``MemFree`` 20 GiB of 755), back to back in one process: whole 1520 ms,
-      chunked 139 ms. Chunked wins, 11x.
-
-    So the two are not really competing on compute. Chunked costs a flat
-    129-139 ms in BOTH regimes -- it reuses a small scratch and never asks for
-    new pages. Whole-buffer spans 23 ms to 1520 ms, a 65x spread, entirely
-    because its three ~22 MiB allocations are nearly free when pages are
-    available and brutal under reclaim.
-
-    Whole-buffer is the default: on a healthy host it is 5.5x faster, and a
-    start-up guard that runs once per process can absorb the bad case. Pass
-    ``chunked=True`` when host memory is scarce or when a predictable cost
-    matters more than the best case -- it is the same check, and the verdict and
+    The whole ND buffer is permuted on the host and compared in one D2H. A
+    chunked variant and its timing write-up were deleted on 2026-11-21: it was
+    a benchmark arm that lost (5.5x slower on a healthy host, by its own
+    measurement) and nothing ever selected it.
     every reported number are identical, which is checked rather than assumed by
     diffing the failure messages of four wrong formulas byte for byte across both
     paths.
@@ -728,7 +472,7 @@ def verify_nz_geometry(
     # you ever slice).
     tensors: dict[str, Any] = {}
     for c in cases:
-        tensors[c.param] = _upload_nd(c, content[c.name], device, chunked=chunked)
+        tensors[c.param] = _upload_nd(c, content[c.name], device)
     # The hook also rewrites the two scales (reshape + transpose of the SAME
     # storage, no cast); they must be present and their k must be even, or the
     # production function raises before reaching the weights.
@@ -748,7 +492,7 @@ def verify_nz_geometry(
     runner(module, quant_method)
     torch.npu.synchronize()
 
-    report: dict[str, Any] = {"cases": [], "group_size": group_size, "path": "chunked" if chunked else "whole"}
+    report: dict[str, Any] = {"cases": [], "group_size": group_size}
     for c in cases:
         out = getattr(module, c.param).data
         want_bytes = nz_storage_bytes(c.num_experts, c.N, c.Kb)
@@ -762,7 +506,7 @@ def verify_nz_geometry(
                 "CANN 的 NZ 几何与本版本假设不符，拒绝启动。 "
                 "(CANN's NZ geometry does not match this build's assumption; refusing to start.)"
             )
-        bad = _compare_nz(out, c, content[c.name], permute, chunked=chunked)
+        bad = _compare_nz(out, c, content[c.name], permute)
         if bad is not None:
             e, rest = divmod(bad.first, c.N * c.Kb)
             gidx, rest2 = divmod(rest, c.N * NZ_C0)
@@ -828,12 +572,6 @@ def verify_nz_geometry_once(device: Any = None, **kw: Any) -> dict[str, Any]:
         # so this line appearing means the geometry was checked AND matched.
         log_pass(_VERIFIED)
     return _VERIFIED
-
-
-def reset_verified() -> None:
-    """Forget the cached verdict (tests only)."""
-    global _VERIFIED
-    _VERIFIED = None
 
 
 #: Config switches that make the CPU kernel and the NPU read the SAME NZ bytes,

@@ -173,9 +173,6 @@ class ChunkShimLayer(torch.nn.Module):
         self.expert_ids = tuple(int(e) for e in expert_ids)
         self.local_num_experts = slot.num_slots
 
-    def extra_repr(self) -> str:  # pragma: no cover - debugging aid
-        return f"slots={self.slot.num_slots}, expert_ids={self.expert_ids}"
-
 
 def build_chunk_layer(
     slot: ChunkSlot, *, expert_ids: Sequence[int], resident_layer: torch.nn.Module | None = None
@@ -388,11 +385,6 @@ class ChunkRun:
     tokens: int
     live_routes: int
     experts_hit: tuple[int, ...]
-
-    @property
-    def cold_experts(self) -> tuple[int, ...]:
-        hit = set(self.experts_hit)
-        return tuple(e for e in self.expert_ids if e not in hit)
 
 
 def build_chunk_experts_input(

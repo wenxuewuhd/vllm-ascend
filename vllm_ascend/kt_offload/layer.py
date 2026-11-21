@@ -2251,9 +2251,14 @@ def install_stream_provider(provider, *, layers=None) -> dict[int, KTLayerOffloa
         from vllm_ascend import envs  # noqa: PLC0415 - avoids a module-level cycle
 
         rt._stream_prefetch = None if envs.VLLM_ASCEND_DSV41_KT_PREFETCH == "0" else getattr(provider, "prefetch", None)
+    # One line, not forty: every layer takes the SAME provider, so the answer is
+    # the same for all of them and the log used to repeat it once per layer.
+    if offloads:
+        _any = next(iter(offloads.values()))
         logger.info(
-            "kt_offload stream: chunk lookahead %s (depth 1, %s)",
-            "ON" if rt._stream_prefetch is not None else "OFF",
+            "kt_offload stream: chunk lookahead %s on %d layer(s) (depth 1, %s)",
+            "ON" if _any._stream_prefetch is not None else "OFF",
+            len(offloads),
             "provider.prefetch" if hasattr(provider, "prefetch") else "no provider support",
         )
     return offloads
@@ -2306,15 +2311,6 @@ def install_resident_fold(provider, *, layers=None, step_source=None, **fold_kw)
             f"kt_offload: the MoE layers disagree on stream_prefill_min_tokens ({sorted(thresholds)}); one "
             "fold serves every layer and its commit point is decided by that number"
         )
-    # Same rule as the threshold above: one number, off the layers' own cfg, read
-    # nowhere else. Only the bank (NZ) path uses it -- see fold_nz_barrier.
-    barriers = {str(rt.cfg.fold_nz_barrier) for rt in offloads.values()}
-    if len(barriers) != 1:
-        raise RuntimeError(
-            f"kt_offload: the MoE layers disagree on fold_nz_barrier ({sorted(barriers)}); one fold stages "
-            "every layer into one buffer, so one of them would be ordered and the others not"
-        )
-    fold_kw.setdefault("nz_barrier", barriers.pop())
     fold = ResidentFold(
         placements,
         targets,
