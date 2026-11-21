@@ -143,61 +143,25 @@ def permute_nd_to_nz(nd_bytes: np.ndarray, num_experts: int, N: int, Kb: int, c0
 # ---------------------------------------------------------------------------
 
 
-#: Offsets are split into (high, low) around this, see :func:`deterministic_nd`.
-_CONTENT_BLOCK = 1 << 16
-
-#: Separates the two mix tables, so the low and high halves of an offset are not
-#: run through the same function. The value is arbitrary; it is pinned because
-#: ``0x5DEECE66 | 1`` keeps ``deterministic_nd(...)[0] != 0`` (see below).
-_CONTENT_HIGH_SALT = 0x5DEECE67
-
-
-def _mix_bytes(count: int, salt: int) -> np.ndarray:
-    """``count`` bytes, byte i = splitmix64(i + salt + 1) & 0xFF."""
-    idx = np.arange(count, dtype=np.uint64) + np.uint64(salt) + np.uint64(1)
-    h = idx * np.uint64(0x9E3779B97F4A7C15)
+#: Deterministic synthetic bytes for the self-check's ND side. splitmix64 of the
+#: byte index, so the pattern is reproducible across runs and machines and has no
+#: structure that could accidentally agree with a wrong permutation.
+#:
+#: 🔴 This used to be a SEPARABLE hash -- two mix tables XORed, low and high
+#: halves of the offset -- so that any subset of offsets could be evaluated
+#: without materialising the rest. That property existed for one caller: the
+#: chunked comparison, which read a gidx slice at a time. That arm was deleted on
+#: 2026-11-21 as an unused benchmark arm that had lost its own measurement, and
+#: with it the only use of `at()`. What is left needs whole buffers only, so the
+#: separable form is gone too: ~45 lines, two arrays, a pinned salt and a
+#: docstring about random access that nothing wanted.
+def _content_bytes(total: int) -> np.ndarray:
+    """``total`` bytes, byte i = splitmix64(i + 1) & 0xFF."""
+    h = (np.arange(total, dtype=np.uint64) + np.uint64(1)) * np.uint64(0x9E3779B97F4A7C15)
     h ^= h >> np.uint64(30)
     h *= np.uint64(0xBF58476D1CE4E5B9)
     h ^= h >> np.uint64(27)
     return (h & np.uint64(0xFF)).astype(np.uint8)
-
-
-@dataclass(frozen=True)
-class _Content:
-    """The two mix tables, built once per case.
-
-    Holding them rather than rebuilding them is what made a chunked upload path
-    affordable: filling ``LOW`` is a splitmix64 over 65536 uint64s (~1.3 ms), and
-    the self-check asks for content 464 times.
-    """
-
-    low: np.ndarray
-    high: np.ndarray
-
-    @classmethod
-    def for_size(cls, total: int, salt: int = 0) -> _Content:
-        blocks = -(-total // _CONTENT_BLOCK)
-        return cls(_mix_bytes(_CONTENT_BLOCK, salt), _mix_bytes(blocks, salt + _CONTENT_HIGH_SALT))
-
-    def at(self, offsets: np.ndarray) -> np.ndarray:
-        """Content bytes at arbitrary ND offsets -- the whole point of the split.
-
-        Because the content is ``LOW[o % 65536] ^ HIGH[o // 65536]``, it is
-        RANDOM ACCESS: any subset of offsets can be evaluated without
-        materialising the rest. That property is what a chunked comparison
-        needed; that arm is gone, but the property costs nothing to keep.
-        """
-        o = offsets.astype(np.uint64, copy=False)
-        lo = (o & np.uint64(_CONTENT_BLOCK - 1)).astype(np.intp)
-        hi = (o >> np.uint64(16)).astype(np.intp)
-        return self.low[lo] ^ self.high[hi]
-
-    def whole(self, total: int) -> np.ndarray:
-        """All ``total`` bytes at once, as one broadcast XOR."""
-        buf = (self.high[:, None] ^ self.low[None, :]).reshape(-1)
-        # The first n of a C-contiguous buffer is itself contiguous, so this is
-        # a view: the tail of the last block is simply not used.
-        return buf[:total]
 
 
 def device_bytes(t: Any) -> np.ndarray:
@@ -376,7 +340,7 @@ class _SelfCheckModule:
 #: comparison works on is ``N * C0`` (72 KiB for w13, 80 KiB for w2), so this is
 #: the same order: the peak host allocation of the whole self-check is a handful
 #: of these, not the 22 MiB of a whole weight.
-def _upload_nd(case: Case, content: _Content, device: Any) -> Any:
+def _upload_nd(case: Case, content: np.ndarray, device: Any) -> Any:
     """The case's ND bytes on the device.
 
     Build the whole ``[E, N, Kb]`` array on the host and copy it in one H2D --
@@ -385,7 +349,7 @@ def _upload_nd(case: Case, content: _Content, device: Any) -> Any:
     asked for it.
     """
     total = nz_storage_bytes(case.num_experts, case.N, case.Kb)
-    return torch.from_numpy(content.whole(total).reshape(case.shape)).to(device)
+    return torch.from_numpy(content[:total].reshape(case.shape)).to(device)
 
 
 @dataclass
@@ -398,7 +362,9 @@ class _Mismatch:
     total: int
 
 
-def _compare_nz(out: Any, case: Case, content: _Content, permute: Callable[..., np.ndarray] | None) -> _Mismatch | None:
+def _compare_nz(
+    out: Any, case: Case, content: np.ndarray, permute: Callable[..., np.ndarray] | None
+) -> _Mismatch | None:
     """Compare every NZ byte of ``out`` against the formula.
 
     Two implementations, same verdict and same reported numbers (checked by
@@ -411,7 +377,7 @@ def _compare_nz(out: Any, case: Case, content: _Content, permute: Callable[..., 
     on a healthy host.
     """
     total = nz_storage_bytes(case.num_experts, case.N, case.Kb)
-    nd = content.whole(total).reshape(case.shape)
+    nd = content[:total].reshape(case.shape)
     want = (permute or permute_nd_to_nz)(nd, case.num_experts, case.N, case.Kb)
     got = device_bytes(out)
     if np.array_equal(got, want):
@@ -465,7 +431,7 @@ def verify_nz_geometry(
         device = torch.device("npu", torch.npu.current_device())
 
     t0 = time.perf_counter()
-    content = {c.name: _Content.for_size(nz_storage_bytes(c.num_experts, c.N, c.Kb)) for c in cases}
+    content = {c.name: _content_bytes(nz_storage_bytes(c.num_experts, c.N, c.Kb)) for c in cases}
     # Fresh allocations, so nothing here is an offset slice of someone else's
     # storage: an already contiguous ``nd[i:i+c].contiguous()`` is a no-op and
     # the cast then fails with ``setStorage out of bounds`` (use ``.clone()`` if
