@@ -478,3 +478,92 @@ slightly better TPOT. It does not: 24.12 vs 24.08 ms, inside the floor. The
 end-to-end runs that appeared to show `now` 8-39% *better* at TPOT were the
 same page-cache artifact. **The layout cost is real in the kernel and invisible
 in the product**, because the CPU MoE is not the decode bottleneck.
+
+## What a four-agent review changed (2026-11-21)
+
+Four adversarial reviews ran over this branch and the kernel half: the streaming
+prefetch path, the bank path, a minimality audit, and the AMX kernel. Every
+finding below was re-verified here before being acted on, and two of the reviews'
+claims were rejected.
+
+### Two defects outranked everything else, and both were in this work
+
+**The lookahead crashed any server with `stream_layer_buffer=true`.**
+`layer.py` put `prefetch_for` into `run_kwargs` unconditionally and then chose
+`run_streamed_layer_buffered`, which does not accept it. Verified by
+introspection rather than by reading:
+
+```text
+only run_streamed_layer accepts: ['expert_tokens_num_type', 'prefetch_for']
+only buffered accepts:          ['provider']
+```
+
+`TypeError` on the first streamed prefill, inside the MoE forward, while the
+start-up log said `chunk lookahead ON`. Stage 1 is **deleted** rather than
+patched: it contributed nothing to the 8.88 s figure (that run has the switch
+unset and logs zero calls into the buffered runner), it had never run end to
+end, and turning it on cost HBM instead of saving it -- the fold keeps its own
+1.75 GiB staging, so the card would hold ~10 GiB of an 11.41 GiB budget.
+
+**The NZ geometry guard never ran in the shipped configuration.**
+`NZ_DEPENDENT_SWITCHES` held only `("stream_layer_buffer",)`, while the route
+that has the CPU kernel read these bytes in place is `kt_reads_bank`. The logs of
+the measurement above prove it:
+
+```text
+nz_geometry: self-check off   x40
+PASS lines:                     0
+```
+
+895 lines written for one route's silent failure mode, not protecting that
+route. The tuple is now `("bank_dir", "kt_reads_bank")`.
+
+### 🔴 The 8.64% kernel figure was measured against a control this work changed
+
+The ND walk had `constexpr int prefetch_groups = 40` with a
+`g + pfd < group_count` guard, so on the down projection (36 groups) it never
+prefetched and on gate/up (72) it prefetched at 40. That had become
+`min(40, group_count/4)` -- 9 and 18 -- while two comments a few lines away still
+read "the ND arm is what the control measurements use. An unmeasured change to
+the control is not a free change." Restored to the literal 40. **The 8.64% is
+now NZ against the ND arm that shipped before this work**, which is what it was
+always claimed to be.
+
+### Verified after all of it
+
+`7/7 streaming prompts token-identical => PASS`, against the same stage-3
+reference capture as before, with the kernel rebuilt: ND restored, the
+`g_unroll` / `pf_dedup` / `legacy_stride` knobs deleted, `g_dispatch` down from
+7 instantiations to 2, and the n-outer chain down to R=4. The build tag moved
+with the code -- `ND_MIN40` to `ND40` -- because a tag that misdescribes the
+binary is worse than no tag.
+
+### Rejected
+
+* "`_tables` costs ~33 s of table building per request." The 69.4 ms per new
+  subset key and the unbounded growth are real, but 33 s cannot hide inside an
+  8.88 s TTFT, and the fold commits its hot set **once** per server, so the key
+  set stabilises. Kept as the leading explanation for something previously
+  unexplained: the first request of a server costs 21.33 s against 8.88 s
+  steady state.
+* "Delete `VLLM_ASCEND_DSV41_KT_LOADER_THREADS` as a pure A/B lever." A second
+  review found that `wiring.py` passes `copy_threads=16` and `one_per_l3_cpus`
+  **raises** on a host with fewer than 16 L3 domains, so lowering this is the
+  only way to start the server there. It ships; its documentation, which named a
+  default production never uses, is fixed.
+
+### 🔴 Breaking: five config fields were removed
+
+`stream_layer_buffer`, `stream_layer_sync_scope`, `stream_layer_probe_bytes`,
+`debug_time_chunks`, `debug_hold_hbm_bytes`. `KTOffloadConfig` rejects unknown
+keys, so **a deployment whose JSON still sets any of them will not start**:
+
+```text
+pydantic_core.ValidationError: 1 validation error for VllmConfig
+kt_offload_config.debug_time_chunks
+  Unexpected keyword argument [input_value=True]
+```
+
+That is not hypothetical -- it is how the first regression run failed, because
+29 of this project's own configs set `debug_time_chunks` and `REPRODUCING.md`
+printed it in a recipe described as "the full stack, verbatim".

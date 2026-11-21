@@ -43,7 +43,7 @@ bash measure/kt_rebuild.sh        # ~95 s; refuses to run while a server is up
 Verify — the script prints it, and the number must be 1:
 
 ```text
-KT_PREFETCH_NZ16_SHORT4_NTA_RB8_GOUTERON_ND_MIN40_OVER_G4_STRIDED occurrences in the .so: 1
+KT_PREFETCH_NZ16_SHORT4_NTA_RB8_GOUTERON_ND40_G4_STRIDED occurrences in the .so: 1
 === KT_REBUILD_DONE
 ```
 
@@ -81,7 +81,7 @@ than failing six minutes into a server start.
   "cpuinfer_threads": 96, "threadpool_count": 2, "numa_nodes": [0, 1],
   "packed_transfer": false, "stream_prefill": true, "dynamic_resident": true,
   "zerocopy_w13": true, "zerocopy_node_fraction": [1.0, 1.0],
-  "zerocopy_streaming_node": 1, "debug_time_chunks": true,
+  "zerocopy_streaming_node": 1,
   "bank_dir": "/dev/shm/dsv41_nz_bank", "zerocopy_scope": "all",
   "kt_reads_bank": true, "stream_resident_from_hbm": true,
   "stream_prefill_min_tokens": 64
