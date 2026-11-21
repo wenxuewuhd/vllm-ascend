@@ -41,9 +41,7 @@ silently produces wrong numbers or lost locality if it does not hold:
 
 from __future__ import annotations
 
-import contextlib
 import ctypes
-import json
 import mmap
 import os
 from dataclasses import dataclass
@@ -112,63 +110,29 @@ def drop_checkpoint_expert_cache(weight_path: str) -> tuple[int, int]:
         return (0, 0)
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     libc.posix_fadvise.argtypes = [ctypes.c_int, ctypes.c_long, ctypes.c_long, ctypes.c_int]
-
-    def _resident(paths) -> int:
-        tot = 0
-        for path in paths:
-            with contextlib.suppress(OSError):
-                tot += _resident_bytes(path)
-        return tot
-
-    before = _resident(shards)
+    asked = 0
     for path in shards:
         fd = os.open(path, os.O_RDONLY)
         try:
             libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
+            asked += os.fstat(fd).st_size
         finally:
             os.close(fd)
-    after = _resident(shards)
+    # 🔴 This used to report resident bytes before and after, from an mincore
+    # sweep over all ~476 GiB in 8 GiB chunks -- TWICE, summed byte by byte in a
+    # Python generator (~125M iterations a pass), with a munmap that had no
+    # argtypes and so failed with EINVAL on every shard over 2 GiB, leaking
+    # address space. All of it for one log line whose return value the single
+    # caller discards. The 267.3 -> 0.0 GiB figure in MEASURED.md came from that
+    # instrumented build; measure/ holds the standalone script to retake it.
     logger.info(
-        "kt_offload: dropped the checkpoint's clean page cache over %d shard(s): "
-        "%.1f -> %.1f GiB resident (%.1f GiB released). kt and streaming prefill both "
-        "read the bank now, so nothing re-reads these during serving.",
+        "kt_offload: asked the kernel to drop the clean page cache of %d checkpoint "
+        "shard(s), %.1f GiB of file. kt and streaming prefill both read the bank now, "
+        "so nothing re-reads these during serving.",
         len(shards),
-        before / float(1 << 30),
-        after / float(1 << 30),
-        (before - after) / float(1 << 30),
+        asked / float(1 << 30),
     )
-    return (before, after)
-
-
-def _resident_bytes(path: str) -> int:
-    """Resident page-cache bytes of a file, via mincore over a read-only map."""
-    sz = os.path.getsize(path)
-    if sz == 0:
-        return 0
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    libc.mmap.restype = ctypes.c_void_p
-    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
-    libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
-    page = os.sysconf("SC_PAGE_SIZE")
-    fd = os.open(path, os.O_RDONLY)
-    resident = 0
-    try:
-        step = 8 << 30
-        off = 0
-        while off < sz:
-            n = min(step, sz - off)
-            addr = libc.mmap(None, n, mmap.PROT_READ, mmap.MAP_SHARED, fd, off)
-            if addr is None or ctypes.c_long(addr).value == -1:
-                return resident
-            npages = (n + page - 1) // page
-            vec = ctypes.create_string_buffer(npages)
-            if libc.mincore(ctypes.c_void_p(addr), n, vec) == 0:
-                resident += sum(1 for b in vec.raw[:npages] if b & 1) * page
-            libc.munmap(ctypes.c_void_p(addr), n)
-            off += n
-    finally:
-        os.close(fd)
-    return resident
+    return (asked, 0)
 
 
 @dataclass(frozen=True)
@@ -290,8 +254,22 @@ class KtBankSource:
         path = os.path.join(self.bank_dir, "manifest.json")
         if not os.path.exists(path):
             raise BankKtSourceError(f"no manifest at {path}: {bank_dir} is not a bank")
-        with open(path) as fh:
-            self.manifest = json.load(fh)
+        # 🔴 Through bank_build.load_manifest, which checks BANK_FORMAT. This
+        # consumer read the file directly until 2026-11-21 and so accepted a bank
+        # written by a DIFFERENT format revision -- and it is the one consumer with
+        # no independent check behind it: _check_geometry validates record sizes
+        # and page alignment only, so any future revision that keeps the record
+        # sizes while changing C0, the within-section order or the fractal order
+        # would pass, and kt would then read correctly-sized, wrongly-ordered
+        # bytes IN PLACE, with no exception and no cast to catch it. The NPU side
+        # (BankSource) always checked; this side looked tested because
+        # test_bank_build.py asserts the gate refuses an old tag.
+        from vllm_ascend.kt_offload import bank_build  # noqa: PLC0415 - avoids a cycle
+
+        try:
+            self.manifest = bank_build.load_manifest(self.bank_dir)
+        except Exception as exc:
+            raise BankKtSourceError(f"{self.bank_dir}: {exc}") from exc
         d = self.manifest["derived"]
         self.sections = {k: tuple(v) for k, v in d["sections"].items()}
         self.bytes_per_expert = int(d["bytes_per_expert"])
@@ -340,6 +318,28 @@ class KtBankSource:
             part = rec // self.tp_count
             if off % self.page or part % self.page:
                 bad.append(f"w2: offset {off} / per-part {part} is not page aligned ({self.page} B)")
+        # 🔴 Every section offset above comes from the manifest and is turned into
+        # a RAW POINTER that goes to kt's C++ as nz_bank_ptrs and is dereferenced
+        # with no length. Nothing checked that a section actually FITS in the
+        # layer until 2026-11-21: shifting derived.sections["w2"][0] by 256 KiB
+        # (still page aligned, record unchanged) passed every test above and put
+        # the last expert's down_ptr 237,568 B past the end of the mapping --
+        # SIGSEGV if lucky, an adjacent mapping read as expert weights if not.
+        # These two loops are the bound and the overlap.
+        spans = []
+        for name, (off, rec) in sorted(self.sections.items()):
+            end = off + self.num_experts * rec
+            if off < 0 or end > self.layer_bytes:
+                bad.append(
+                    f"{name}: [{off}, {end}) does not fit the layer's {self.layer_bytes} B "
+                    f"({self.num_experts} experts x {rec} B) -- a raw pointer would leave the mapping"
+                )
+            else:
+                spans.append((off, end, name))
+        spans.sort()
+        for (a0, a1, an), (b0, _b1, bn) in zip(spans, spans[1:]):
+            if b0 < a1:
+                bad.append(f"sections {an} [{a0}, {a1}) and {bn} overlap from {b0}")
         if bad:
             raise BankKtSourceError(f"{self.bank_dir} cannot be consumed in place by kt:\n  " + "\n  ".join(bad))
         logger.info(

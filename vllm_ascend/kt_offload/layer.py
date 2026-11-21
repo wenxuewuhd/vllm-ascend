@@ -144,6 +144,12 @@ def bind_routed_experts_args(init_fn, args: tuple, kwargs: dict) -> dict[str, An
 #: file offset before kt reads them, and kt's pin/migrate would run over it.
 #: Bank sources kt holds raw pointers into. Never evicted -- see the comment at
 #: the only insertion site. Keyed by bank dir, so all 40 layers share one.
+class _NzGuardLogged:
+    """Whether the "self-check off" line has been said once this process."""
+
+    said = False
+
+
 _KT_BANK_SOURCES: dict[str, Any] = {}
 
 KT_ZEROCOPY_ENV: dict[str, str] = {
@@ -521,16 +527,21 @@ class KTLayerOffload:
         # try/except -- a mismatch must stop the engine coming up, because the route that
         # depends on it would not raise, it would compute wrong numbers. See the module
         # docstring. OFF unless a switch that shares NZ bytes with kt is on.
+        # One line per PROCESS, not per layer: this ran 40 times before
+        # 2026-11-21, and 40 copies of "self-check off" is how a guard that was
+        # not protecting the shipped route stayed invisible in the logs.
         _nz_on = nz_geometry.check_enabled(self.cfg)
-        logger.info(
-            "kt_offload nz_geometry: self-check %s (stream_layer_buffer=%s, verify_nz_geometry=%s) "
-            "-- a route that shares NZ bytes with kt cannot disable its own guard",
-            "ENABLED" if _nz_on else "off",
-            bool(getattr(self.cfg, "stream_layer_buffer", False)),
-            bool(getattr(self.cfg, "verify_nz_geometry", False)),
-        )
         if _nz_on:
             nz_geometry.verify_nz_geometry_once(quant_method=layer.quant_method)
+        elif not _NzGuardLogged.said:
+            _NzGuardLogged.said = True
+            logger.info(
+                "kt_offload nz_geometry: self-check off (bank_dir=%s, kt_reads_bank=%s, "
+                "verify_nz_geometry=%s) -- no route that shares NZ bytes with kt is on",
+                bool(getattr(self.cfg, "bank_dir", "")),
+                bool(getattr(self.cfg, "kt_reads_bank", False)),
+                bool(getattr(self.cfg, "verify_nz_geometry", False)),
+            )
 
         quant_method = layer.quant_method
         original = quant_method.process_weights_after_loading
@@ -1118,15 +1129,6 @@ class KTLayerOffload:
 
         _install_capture_probe(KTMoEWrapper)
 
-        # Measurement scaffolding, off unless VLLM_ASCEND_DSV41_KT_KNOB_FILE is
-        # set: lets ONE server process hold both arms of a kernel-knob A/B,
-        # because a cross-process comparison on this host is worthless. Started
-        # here because this is the first point in the worker where kt is known
-        # to be importable, and it is a no-op after the first layer.
-        from vllm_ascend.kt_offload import kt_knob_ab
-
-        kt_knob_ab.start_if_configured()
-
         # Stage 3: hand kt the SAME bank the NPU streams from, so the expert
         # bytes exist once. The geometry is ours and is asserted against the
         # manifest in bank_kt_source._check_geometry; kt only forwards these.
@@ -1235,7 +1237,7 @@ class KTLayerOffload:
             # other direction (a captured size that is big enough to stream).
             return None
 
-        from vllm_ascend.kt_offload import stream_chain, stream_io, stream_layer, stream_prefill
+        from vllm_ascend.kt_offload import stream_chain, stream_io, stream_prefill
 
         stream_prefill.assert_eager_only(
             num_tokens,
@@ -1270,8 +1272,8 @@ class KTLayerOffload:
             quant_method=stream_io.moe_scheme(layer.quant_method, *stream_chain.SCHEME_ATTRS),
             plan=plan,
             slot_for=self._stream_slot_provider,
-            # Depth-1 lookahead. None when the provider has no prefetch (stage-1
-            # shims), in which case the loop stays serial as before.
+            # Depth-1 lookahead. None when the provider has no prefetch, in which
+            # case the loop stays serial as before.
             prefetch_for=getattr(self, "_stream_prefetch", None),
             hidden_states=hidden_states,
             topk_ids=topk_ids,
@@ -1284,14 +1286,7 @@ class KTLayerOffload:
             expected_expert_ids=expected_ids,
             strict=True,
         )
-        # Stage 1: same kwargs, different accumulation. ``run_streamed_layer_buffered``
-        # mirrors the signature on purpose so this is a one-line choice; it is
-        # bitwise equal to the per-chunk form (measured on card, maxabsdiff 0).
-        if self.cfg.stream_layer_buffer:
-            run_kwargs["provider"] = self._stream_provider
-            runner = stream_layer.run_streamed_layer_buffered
-        else:
-            runner = stream_chain.run_streamed_layer
+        runner = stream_chain.run_streamed_layer
         fold = self._fold_for_this_forward()
         if fold is None:
             result = runner(**run_kwargs)

@@ -235,11 +235,13 @@ class BankSource:
         # four threads costs 12-14% of prefill staging, and threads packed into one
         # CCD drop the host leg from 66 to 26 GiB/s. Neither shows up in a
         # correctness test. ``one_per_l3_cpus`` is the measured-best placement.
-        # Measurement override, declared in envs.py. The streaming read leg is
-        # ~94% of the staging loop's wall clock, the thread count is fixed when
-        # this object is built, and the two arms of "how many threads" therefore
-        # cannot live in one process -- so the campaign needs a way to set it
-        # per server start without editing code between arms.
+        # Override, declared in envs.py. Two uses, and the second is why it
+        # ships: the thread count is fixed when this object is built, so an A/B
+        # over it needs one server start per arm; AND production asks for 16
+        # threads one per L3 domain, which one_per_l3_cpus REFUSES on a host
+        # with fewer than 16 domains, so lowering this is the only way to start
+        # at all there. Note it also weakens the placement contract below:
+        # min_threads becomes min(this, MIN_LOADER_THREADS).
         from vllm_ascend import envs  # noqa: PLC0415 - avoids a module-level cycle
 
         env = (envs.VLLM_ASCEND_DSV41_KT_LOADER_THREADS or "").strip()

@@ -183,17 +183,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE": lambda: int(os.getenv("VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE") or 0),
     # DeepSeek-V4.1 kt offload: how many threads gather streamed expert chunks
     # out of the NZ bank into the pinned staging. Empty (default) keeps what the
-    # caller passed, which is bank_source.MIN_LOADER_THREADS = 4. The count is
-    # fixed when the source is built, so an A/B over it needs one server start
-    # per arm -- this is that lever. Non-sensitive.
+    # caller passed, which in production is 16 (wiring.py); the 4 in
+    # bank_source.MIN_LOADER_THREADS is only the floor for a caller that passes
+    # nothing.
+    # 🔴 This is an OPERATIONAL escape hatch, not only a measurement lever:
+    # production asks for 16 threads one per L3 domain, and one_per_l3_cpus
+    # RAISES LoaderPlacementError on a host that has fewer than 16 distinct
+    # domains. Lowering this is then the only way to start the server at all.
+    # Non-sensitive.
     "VLLM_ASCEND_DSV41_KT_LOADER_THREADS": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_LOADER_THREADS", ""),
-    # DeepSeek-V4.1 kt offload, MEASUREMENT ONLY: path of a file whose contents
-    # ("nz_prefetch_groups=8 nz_prefetch_legacy_stride=0") are applied to kt's
-    # MXFP4 kernel knobs by a watcher thread while the server runs, so both arms
-    # of an A/B live in one process (a cross-process timing comparison on this
-    # host has differed 15x). Default "" = no thread, no effect. Non-sensitive.
-    # See vllm_ascend/kt_offload/kt_knob_ab.py.
-    "VLLM_ASCEND_DSV41_KT_KNOB_FILE": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_KNOB_FILE", ""),
     # DeepSeek-V4.1 kt offload: set to "0" to stop the streaming chain from
     # starting the NEXT chunk's host gather while the current chunk computes.
     # Default (unset) keeps the lookahead ON, which is the shipped behaviour and
@@ -202,12 +200,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # pre-2026-11-18 serial path and exists so the two can be A/B'd in one
     # binary. Non-sensitive. See vllm_ascend/kt_offload/stream_chain.py.
     "VLLM_ASCEND_DSV41_KT_PREFETCH": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_PREFETCH", ""),
-    # DeepSeek-V4.1 kt offload, MEASUREMENT ONLY: absolute path of a file to
-    # append per-layer expert routing to, for deciding which experts are worth
-    # keeping resident. Empty (default) disables the trace entirely, including
-    # its per-token bookkeeping. Non-sensitive (it records expert ids, not
-    # tokens). See vllm_ascend/kt_offload/routing_trace.py.
-    "VLLM_ASCEND_DSV41_ROUTING_TRACE": lambda: os.getenv("VLLM_ASCEND_DSV41_ROUTING_TRACE", ""),
     # DeepSeek-V4.1 Engram storage: "ram" (default, legacy staged files)
     # or "ssd" (ordinary file-backed mmap; requires a verified manifest).
     # Non-sensitive; this selects backing storage, not the gather/compute path.

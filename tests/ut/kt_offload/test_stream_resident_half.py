@@ -23,6 +23,8 @@ bookkeeping that would silently break it:
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 import torch
 
@@ -395,31 +397,45 @@ class _SubsetSource:
     supports_subset_gather = True
 
 
-def _key_from_prefetch(p, chunk_index, ids):
-    """The key `prefetch` would build, without starting a gather."""
-    stream_pos, res_pos = p._split_chunk(ids)
-    if res_pos:
-        sub = p._check_subset(chunk_index, ids, stream_pos) if stream_pos else ()
-    else:
-        sub = p._check_subset(chunk_index, ids, None)
-    return p._key(chunk_index, ids, sub)
+def _key_the_method_builds(p, method, chunk_index, ids):
+    """The key the REAL method computes, captured from ``_key`` itself.
 
+    🔴 This replaces two hand-copies of the derivation that were compared against
+    each other. Both copies were the same six lines, so the assertion was
+    f(x) == f(x): breaking ``slot_for``'s real derivation left both tests green.
+    Here the key comes out of the production method, so a divergence fails.
 
-def _key_from_slot_for(p, chunk_index, ids):
-    """The key `slot_for` builds, by the same lines it uses."""
-    stream_pos, res_pos = p._split_chunk(ids)
-    if res_pos:
-        sub = p._check_subset(chunk_index, ids, stream_pos) if stream_pos else ()
-    else:
-        sub = p._check_subset(chunk_index, ids, None)
-    return p._key(chunk_index, ids, sub)
+    The bare fixture has no thread pool or device buffers, so the method raises
+    once it gets past the key -- which is after ``_key`` has been called, and all
+    this test is about.
+    """
+    seen = []
+    real_key = type(p)._key
+
+    def spy(self, ci, i, sub):
+        k = real_key(self, ci, i, sub)
+        seen.append(k)
+        return k
+
+    p._key = spy.__get__(p, type(p))
+    try:
+        # The machinery past _key (pool, device buffers) is not under test.
+        with contextlib.suppress(Exception):
+            method(p, chunk_index, ids)
+    finally:
+        del p._key
+    assert seen, f"{method.__name__} never built a key"
+    return seen[0]
 
 
 def test_prefetch_and_slot_for_agree_with_no_residency():
     p = _prov()
     p._layer = 3
     p.source = _SubsetSource()
-    assert _key_from_prefetch(p, 1, (0, 1, 2, 3)) == _key_from_slot_for(p, 1, (0, 1, 2, 3))
+    ids = (0, 1, 2, 3)
+    kp = _key_the_method_builds(p, StreamSlotProvider.prefetch, 1, ids)
+    ks = _key_the_method_builds(p, StreamSlotProvider.slot_for, 1, ids)
+    assert kp == ks, f"prefetch keyed {kp!r}, slot_for keyed {ks!r}"
 
 
 def test_prefetch_derives_the_streamed_subset_not_the_whole_chunk():
@@ -430,12 +446,12 @@ def test_prefetch_derives_the_streamed_subset_not_the_whole_chunk():
     p.source = _SubsetSource()
     p.set_resident(_Resident(2), [-1, 0, -1, 1])  # logical 1 and 3 are resident
     ids = (0, 1, 2, 3)
-    stream_pos, res_pos = p._split_chunk(ids)
-    assert (stream_pos, res_pos) == ((0, 2), (1, 3))
-    key = _key_from_prefetch(p, 1, ids)
-    assert key == _key_from_slot_for(p, 1, ids)
-    assert key[3] == (0, 2), f"the key must carry the streamed subset, got {key[3]!r}"
-    assert key != p._key(1, ids, None), "the whole-chunk key would be a prefetch miss"
+    assert p._split_chunk(ids) == ((0, 2), (1, 3))
+    kp = _key_the_method_builds(p, StreamSlotProvider.prefetch, 1, ids)
+    ks = _key_the_method_builds(p, StreamSlotProvider.slot_for, 1, ids)
+    assert kp == ks, f"prefetch keyed {kp!r}, slot_for keyed {ks!r}"
+    assert kp[3] == (0, 2), f"the key must carry the streamed subset, got {kp[3]!r}"
+    assert kp != p._key(1, ids, None), "the whole-chunk key would be a prefetch miss"
 
 
 def test_prefetch_declines_a_fully_resident_chunk():

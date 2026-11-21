@@ -34,7 +34,6 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.kt_offload import expert_counter as _expert_counter
-from vllm_ascend.kt_offload import routing_trace as _routing_trace
 from vllm_ascend.kt_offload.layer import create_layer_offload
 from vllm_ascend.lora.fused_moe import sync_lora_context
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
@@ -608,12 +607,6 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             # Logical ids, before log2phy / mix_placement / the profile-run
             # randomisation (counted only when that flag is off).
             _expert_counter.record(self, topk_ids, enable_force_load_balance)
-        if _routing_trace.ENABLED:
-            # Same ids, but the per-step SET rather than a histogram: stage 4's
-            # gain is gated on temporal locality, which frequencies cannot
-            # express. Separate module so expert_counter's denominators are not
-            # touched. See routing_trace.py for why it needs capture OFF.
-            _routing_trace.record(self, topk_ids, enable_force_load_balance)
         if self.log2phy is not None:
             topk_ids = self.log2phy[topk_ids]
 

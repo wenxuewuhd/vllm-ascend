@@ -46,7 +46,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import torch
 from vllm.logger import logger
 
 from vllm_ascend.kt_offload.layer import (
@@ -64,9 +63,6 @@ from vllm_ascend.kt_offload.numa_placement import (
 )
 from vllm_ascend.kt_offload.stream_io import StreamSlotProvider
 from vllm_ascend.kt_offload.weight_source import WeightSource
-
-#: Diagnostic allocations kept alive for the process lifetime (debug_hold_hbm_bytes).
-_DEBUG_HBM_HOLDS: list = []
 
 
 @dataclass(frozen=True)
@@ -242,46 +238,15 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
         # the per-chunk cast is skipped.
         provider.enable_nz_device()
 
-    # Diagnostics (both default off), set up before anything is installed so
-    # that an OFF arm can be made to carry the same allocation as an ON arm.
-    from vllm_ascend.kt_offload import stream_chain as _sc
-
-    _sc.set_chunk_timing(bool(getattr(cfg, "debug_time_chunks", False)))
-    _dummy_hbm = None
-    _hold = int(getattr(cfg, "debug_hold_hbm_bytes", 0) or 0)
-    if _hold > 0:
-        # Reproduce "one large block held for the process lifetime" WITHOUT any
-        # stage-1 code path. Removing the fold's 1.75 GiB did not move the
-        # regression, so headroom is refuted -- but the 6.75 GiB layer buffer was
-        # present in every ON arm of both campaigns, and fragmentation is not
-        # headroom. This separates "holding it" from "using it".
-        _dummy_hbm = torch.empty(_hold, dtype=torch.uint8, device=device)
-        logger.info(
-            "kt_offload: DIAGNOSTIC holding %d B (%.3f GiB) of HBM for the process lifetime",
-            _hold,
-            _hold / float(1 << 30),
-        )
-
-    # Stage 1 (default off): accumulate every chunk's cast output into ONE
-    # whole-layer NZ buffer instead of dropping it. The wrap MUST happen here
-    # rather than inside install_stream_provider: from here on, exactly one
+    # 🔴 If a provider wrapper is ever added here, it MUST be wrapped at this
+    # point and not inside install_stream_provider: from here on exactly one
     # object is "the provider", and _assert_installed, the fold and
     # StreamingWiring all have to be handed that same object. Wrapping inside
     # the installer left the caller holding the unwrapped provider, so the
     # layers held the wrapper, the fold was built against the inner object, and
     # _assert_installed's identity check refused the start-up with "layer 0 did
-    # not take the streaming provider". LayerSlotProvider is a transparent
-    # proxy (__getattr__ -> inner) for set_layer / served_nd / layer / device /
-    # close, so everything downstream keeps working unchanged.
-    if bool(getattr(cfg, "stream_layer_buffer", False)):
-        from vllm_ascend.kt_offload import stream_layer
-
-        provider = stream_layer.install_layer_buffer(
-            provider,
-            sync_scope=str(getattr(cfg, "stream_layer_sync_scope", "device")),
-            num_experts=num_experts,
-            probe_bytes=int(getattr(cfg, "stream_layer_probe_bytes", stream_layer.DEFAULT_PROBE_BYTES)),
-        )
+    # not take the streaming provider". test_stream_provider_identity.py guards
+    # this.
 
     fold = None
     try:
@@ -306,12 +271,6 @@ def setup_streaming(vllm_config, *, ascend_config=None, layers=None) -> Streamin
         weight_path,
         "installed" if fold is not None else "off (dynamic_resident=false)",
     )
-    if _dummy_hbm is not None:
-        # StreamingWiring is frozen, and a local would be freed on return -- the
-        # diagnostic would then silently measure nothing. Hold a module-level
-        # reference for the process lifetime, which is exactly what is being
-        # reproduced.
-        _DEBUG_HBM_HOLDS.append(_dummy_hbm)
     # 🔴 Last step, and only with kt_reads_bank: by now kt has loaded (it read
     # the checkpoint for the SCALES, which it converts and cannot alias, and
     # that faulted in all ~269 GiB of expert bytes) and the streaming provider

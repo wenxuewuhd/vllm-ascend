@@ -57,8 +57,10 @@ def tiny_bank(tmp_path):
 
 
 def test_default_is_the_min_loader_thread_count(tiny_bank, monkeypatch):
-    # Documents the value that was in force through stage 3, so a change to it
-    # is a visible change to this test rather than a silent change to TTFT.
+    # The FLOOR for a caller that passes nothing -- not what production uses.
+    # 🔴 wiring.py passes copy_threads=16, so this 4 is not the shipped value and
+    # must not be read as one; the guard that matters for production is
+    # test_stream_io.py::test_copy_threads_is_refused_when_it_would_be_ignored.
     monkeypatch.delenv("VLLM_ASCEND_DSV41_KT_LOADER_THREADS", raising=False)
     src = bank_source.BankSource(tiny_bank, num_experts=TINY.num_experts)
     try:

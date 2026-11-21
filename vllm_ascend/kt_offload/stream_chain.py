@@ -43,7 +43,6 @@ converts the list with ``cumsum_group_list(..., 0)`` and lets
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -432,77 +431,7 @@ def build_chunk_experts_input(
     )
 
 
-# -- diagnostic chunk timing (default off) ----------------------------------
-# Both runners -- run_streamed_layer (switch off) and run_streamed_layer_buffered
-# (switch on) -- call run_chunk, so timing it here measures BOTH arms with the
-# same code. Events are recorded per chunk but READ once per forward: reading an
-# event forces a synchronise, and a per-chunk synchronise is one of the very
-# things under suspicion, so measuring it that way would create what it measures.
-_TIME_CHUNKS = False
-_CHUNK_EVENTS: list = []
-_CHUNK_MS: list = []
-#: Sample 1 chunk in this many. Each live event is a runtime resource, and an
-#: unbounded backlog risks exhausting the event pool mid-campaign; a sampled
-#: distribution answers "is the ON arm's GEMM slower" just as well.
-_TIME_EVERY = 4
-_CHUNK_SEEN = 0
-#: Drain once this many events are pending. At 1-in-4 sampling this is ~960
-#: chunks of wall time, so the oldest events are long complete and the
-#: synchronise inside drain is a no-op rather than a stall we would be measuring.
-_DRAIN_AT = 240
-
-
-def set_chunk_timing(on: bool) -> None:
-    global _TIME_CHUNKS
-    _TIME_CHUNKS = bool(on)
-
-
-def drain_chunk_timing() -> list:
-    """Resolve pending events and return the per-chunk milliseconds."""
-    global _CHUNK_EVENTS, _CHUNK_MS
-    if _CHUNK_EVENTS:
-        torch.npu.synchronize()
-        for a, b in _CHUNK_EVENTS:
-            with contextlib.suppress(Exception):
-                _CHUNK_MS.append(a.elapsed_time(b))
-        _CHUNK_EVENTS = []
-    out, _CHUNK_MS = _CHUNK_MS, []
-    return out
-
-
-def run_chunk(**kw) -> ChunkRun:
-    """Timing shim around :func:`_run_chunk_impl`; identical when timing is off."""
-    if not _TIME_CHUNKS:
-        return _run_chunk_impl(**kw)
-    global _CHUNK_SEEN
-    _CHUNK_SEEN += 1
-    if _CHUNK_SEEN % _TIME_EVERY:
-        return _run_chunk_impl(**kw)
-    a, b = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-    a.record()
-    out = _run_chunk_impl(**kw)
-    b.record()
-    _CHUNK_EVENTS.append((a, b))
-    # Drain only once the backlog is ~2 forwards old (480 chunks each). By then
-    # the oldest events are long complete, so the synchronise inside drain is a
-    # no-op rather than a stall we would then be measuring.
-    if len(_CHUNK_EVENTS) >= _DRAIN_AT:
-        ms = drain_chunk_timing()
-        if ms:
-            ms_sorted = sorted(ms)
-            logger.info(
-                "kt_offload chunk timing: n=%d  p50 %.3f ms  p90 %.3f  min %.3f  max %.3f  sum %.1f ms",
-                len(ms_sorted),
-                ms_sorted[len(ms_sorted) // 2],
-                ms_sorted[int(len(ms_sorted) * 0.9)],
-                ms_sorted[0],
-                ms_sorted[-1],
-                sum(ms_sorted),
-            )
-    return out
-
-
-def _run_chunk_impl(
+def run_chunk(
     *,
     quant_method,
     slot: ChunkSlot,
@@ -745,7 +674,29 @@ def run_streamed_layer(
         if prefetch_for is not None and k + 1 < plan.num_chunks:
             # plan.chunks[k+1] is the ids directly; building k+1's tables here
             # would allocate device tensors a chunk early for nothing.
-            prefetch_for(k + 1, plan.chunks[k + 1])
+            #
+            # 🔴 Guarded because the docstring above promises it: the lookahead is
+            # PURELY an optimisation, so it must not be able to fail a layer whose
+            # compute would otherwise succeed. Every branch on which `prefetch`
+            # raises is mirrored in `slot_for`, which runs a few lines below and
+            # raises there with the right chunk in the message -- so swallowing
+            # here loses no error, it only stops an optimisation from deciding the
+            # layer's fate. Called bare until 2026-11-21.
+            # 🔴 The index is evaluated OUTSIDE the guard on purpose. plan.chunks
+            # is our own bookkeeping: an out-of-range read here is a bug in this
+            # loop, not a provider that declined, and swallowing it would hide an
+            # off-by-one in the guard above -- as it did when this was written, so
+            # that a mutation of `k + 1 < plan.num_chunks` passed the tests.
+            next_ids = plan.chunks[k + 1]
+            try:
+                prefetch_for(k + 1, next_ids)
+            except Exception as exc:  # noqa: BLE001 - optimisation only; slot_for re-raises
+                logger.warning(
+                    "kt_offload stream: lookahead for chunk %d declined with %s: %s; continuing serially",
+                    k + 1,
+                    type(exc).__name__,
+                    exc,
+                )
         run = run_chunk(
             quant_method=quant_method,
             slot=slot,

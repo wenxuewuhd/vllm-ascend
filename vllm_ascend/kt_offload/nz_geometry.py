@@ -19,7 +19,7 @@ production" and "the process did not come up".
 
 **Who pays**: whoever depends on the geometry, and nobody else. The check is OFF
 unless a switch that actually shares NZ bytes with the CPU kernel is on (today
-``stream_layer_buffer``; the shared-NZ route's own switch when it lands). A
+``bank_dir`` and ``kt_reads_bank``). A
 default-on check would hand every deployment -- including the ones that never
 share a byte -- a start-up dependency on this cast hook: a CANN release that
 changed the geometry would stop engines that did not need the guarantee. On the
@@ -838,10 +838,20 @@ def reset_verified() -> None:
 
 #: Config switches that make the CPU kernel and the NPU read the SAME NZ bytes,
 #: and therefore depend on this geometry being right. Any one of them on forces
-#: the self-check on. ``stream_layer_buffer`` is the one that exists today;
-#: shared-NZ's own switch replaces/joins it when it lands, and adding it here is
-#: the whole change -- there is no second place to update.
-NZ_DEPENDENT_SWITCHES = ("stream_layer_buffer",)
+#: the self-check on.
+#:
+#: 🔴 This tuple held only ``stream_layer_buffer`` until 2026-11-21, while the
+#: route that actually has kt read these bytes in place is ``kt_reads_bank``.
+#: So in the shipped configuration -- ``bank_dir`` + ``kt_reads_bank``, no
+#: ``stream_layer_buffer`` -- ``check_enabled`` returned False and this guard
+#: NEVER RAN: the logs of the 2026-11-21 measurement say
+#: ``nz_geometry: self-check off`` forty times and carry no PASS line. The guard
+#: was written for exactly that route's silent failure mode and was the one thing
+#: not protecting it. Both switches below are bare-NZ routes:
+#:   * ``bank_dir``      -- streaming writes host-permuted bytes into an
+#:                          NZ-tagged buffer and ``npu_format_cast`` no longer runs;
+#:   * ``kt_reads_bank`` -- the CPU kernel reads those same bytes in place.
+NZ_DEPENDENT_SWITCHES = ("bank_dir", "kt_reads_bank")
 
 
 def log_pass(report: Mapping[str, Any]) -> None:

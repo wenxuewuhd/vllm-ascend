@@ -1024,10 +1024,17 @@ class StreamSlotProvider:
             pending = next((h for h in self._host if h.pending == key), None)
         if pending is not None:
             # .result() re-raises the worker's exception instead of handing back a
-            # half-filled buffer.
-            pending.future.result()
-            with self._lock:
-                pending.future, pending.pending = None, None
+            # half-filled buffer -- but the buffer must be RELEASED either way.
+            # 🔴 Clearing after a bare .result() leaked the buffer on every failed
+            # prefetch: `future` stayed set, prefetch()'s target scan then found no
+            # free buffer, and the lookahead returned False for the rest of the
+            # process with no log line -- a silent revert to the serial path this
+            # change exists to remove.
+            try:
+                pending.future.result()
+            finally:
+                with self._lock:
+                    pending.future, pending.pending = None, None
             if pending.key != key or pending.gather is None:
                 raise StreamIOError(f"prefetch for {key} finished without filling its buffer")
             return pending
@@ -1039,19 +1046,41 @@ class StreamSlotProvider:
             target = next((h for h in self._host if h.future is None), None)
         if target is None:
             target = self._host[key[1] % len(self._host)]
-            target.future.result()
-            with self._lock:
-                target.future, target.pending = None, None
+            # Same release-on-failure rule as above.
+            try:
+                target.future.result()
+            finally:
+                with self._lock:
+                    target.future, target.pending = None, None
         self._fill(target, key)
         return target
 
     def _drain_prefetch(self) -> None:
+        """Abandon any in-flight prefetch. Never raises.
+
+        🔴 This used to re-raise. ``set_layer`` calls it first, so a prefetch that
+        failed on layer L surfaced as an exception against layer L+1 -- a crash
+        naming a layer and chunk that are not the ones that failed. The bytes of
+        an abandoned prefetch are discarded by definition, and a gather that is
+        really broken raises again, correctly attributed, the moment ``slot_for``
+        asks for those bytes synchronously. So the right thing here is to WARN and
+        swallow.
+        """
         for h in self._host:
-            if h.future is not None:
-                try:
-                    h.future.result()
-                finally:
-                    h.future, h.pending = None, None
+            if h.future is None:
+                continue
+            try:
+                h.future.result()
+            except BaseException as exc:  # noqa: BLE001 - reported, then abandoned
+                logger.warning(
+                    "kt_offload stream: abandoned prefetch for %s failed (%s: %s); "
+                    "the chunk will be gathered synchronously instead",
+                    h.pending,
+                    type(exc).__name__,
+                    exc,
+                )
+            finally:
+                h.future, h.pending = None, None
 
     def _check_record_bytes(self, layout: ChunkLayout, num_experts: int) -> None:
         """The checkpoint's per-expert record must be what the parameter holds.

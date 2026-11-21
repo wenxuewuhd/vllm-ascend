@@ -120,7 +120,6 @@ MIN_LOADER_THREADS = 4
 #: Upper bound on the decode prefetch pool. Measured with kt at full tilt: 8 threads
 #: took 9 more points off kt than 4 did, and 4 already deliver 17.3 GiB/s against the
 #: 4.7 GiB/s a 4-expert-per-step prefetch needs.
-MAX_PREFETCH_THREADS = 4
 
 _NUM_LAYERS_FALLBACK = 40
 _L3_SHARED_CPU_LIST = "/sys/devices/system/cpu/cpu{cpu}/cache/index3/shared_cpu_list"
@@ -669,80 +668,6 @@ def l3_domain_of(cpu: int) -> int:
     return min(_read_cpu_list(_L3_SHARED_CPU_LIST.format(cpu=cpu), cpu, "L3 domain"))
 
 
-def smt_siblings_of(cpu: int) -> frozenset[int]:
-    """Every logical cpu sharing ``cpu``'s physical core, including ``cpu`` itself."""
-    return frozenset(_read_cpu_list(_THREAD_SIBLINGS.format(cpu=cpu), cpu, "thread siblings"))
-
-
-def check_prefetch_placement(
-    cpus: Sequence[int],
-    *,
-    kt_cpus: Sequence[int] | None = None,
-    max_threads: int = MAX_PREFETCH_THREADS,
-) -> dict[str, Any]:
-    """Refuse a decode prefetch placement, by the rules that hold while kt is running.
-
-    This is a *different* contract from :func:`check_loader_placement`, because it
-    applies in a different phase. Streaming prefill does not use the CPU MoE at all,
-    so the prefill loader is measured on an otherwise idle machine, where spreading
-    threads across L3 domains is what matters (66 vs 26 GiB/s). The decode prefetch
-    runs while kt is at full tilt, and there the measurements say something else:
-
-    * Which L3 domain the threads sit in stops mattering -- one CCD, two CCDs and four
-      CCDs came out within 3.4 points of each other, inside that grid's noise floor.
-      Bandwidth contention masks the L3 effect; the harm tracks how much bandwidth the
-      prefetch actually takes, not how its cache footprint overlaps kt's.
-    * Two things matter enormously, and they are the only large effects measured:
-      SMT siblings of kt's cores cost kt **-59%**, and sharing a physical core with a
-      kt worker costs **-57%**. Against ~-23% for idle cores on any CCD.
-    * More threads is worse: 8 prefetch threads took 9 more points off kt than 4.
-
-    So this check rejects SMT siblings and kt's own cores, caps the thread count, and
-    deliberately does *not* require distinct L3 domains.
-    """
-    cpus = tuple(int(c) for c in cpus)
-    if not cpus:
-        raise LoaderPlacementError("the decode prefetch pool is empty")
-    if len(set(cpus)) != len(cpus):
-        raise LoaderPlacementError(f"prefetch cpu list has duplicates: {cpus}")
-    if len(cpus) > max_threads:
-        raise LoaderPlacementError(
-            f"the decode prefetch pool is {len(cpus)} threads, more than {max_threads}: 8 threads took "
-            "9 more points off kt than 4, and 4 already deliver ~17 GiB/s against the ~4.7 GiB/s a "
-            "4-expert-per-step prefetch needs"
-        )
-    # No two prefetch threads may share a physical core either -- SMT contention inside
-    # the pool buys nothing and the pool is small enough to always avoid it.
-    for i, a in enumerate(cpus):
-        sibs = smt_siblings_of(a)
-        for b in cpus[i + 1 :]:
-            if b in sibs:
-                raise LoaderPlacementError(
-                    f"prefetch cpus {a} and {b} are SMT siblings of one physical core; use distinct physical cores"
-                )
-    if kt_cpus is not None:
-        kt = {int(c) for c in kt_cpus}
-        clash = sorted(set(cpus) & kt)
-        if clash:
-            raise LoaderPlacementError(
-                f"prefetch cpus {clash} are also kt worker cpus; sharing a physical core with a kt "
-                "worker measured -57% on kt throughput, the worst placement tested"
-            )
-        for c in cpus:
-            sib_clash = sorted(smt_siblings_of(c) & kt)
-            if sib_clash:
-                raise LoaderPlacementError(
-                    f"prefetch cpu {c} is an SMT sibling of kt worker cpu(s) {sib_clash}; that measured "
-                    "-59% on kt throughput, the single worst placement tested"
-                )
-    return {
-        "cpus": cpus,
-        "threads": len(cpus),
-        "l3_domains": sorted({l3_domain_of(c) for c in cpus}),
-        "physical_cores": sorted({min(smt_siblings_of(c)) for c in cpus}),
-    }
-
-
 def check_loader_placement(cpus: Sequence[int], *, min_threads: int = MIN_LOADER_THREADS) -> dict[str, Any]:
     """Refuse a loader placement the layout's guarantees were not measured at.
 
@@ -756,7 +681,7 @@ def check_loader_placement(cpus: Sequence[int], *, min_threads: int = MIN_LOADER
 
     The decode prefetch pool runs in the opposite regime -- kt at full tilt -- where
     the L3 spread stops mattering and two other rules take over. Use
-    :func:`check_prefetch_placement` for that pool, not this function.
+    a pool of its own would need a check of its own.
     """
     cpus = tuple(int(c) for c in cpus)
     if len(set(cpus)) != len(cpus):

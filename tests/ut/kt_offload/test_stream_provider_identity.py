@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression test for the provider-identity contract.
 
-The stage-1 patch originally wrapped the streaming provider INSIDE
+A patch once wrapped the streaming provider INSIDE
 ``install_stream_provider``. The wrapper went onto every layer, but the caller
 kept the unwrapped object, so:
 
@@ -20,8 +20,6 @@ drive stubs and never go through the installer.
 
 import types
 
-import pytest
-
 from vllm_ascend.kt_offload.layer import install_stream_provider
 
 
@@ -37,12 +35,8 @@ class _FakeProvider:
         pass
 
 
-def _fake_layer(stream_layer_buffer, layer_idx=0):
-    cfg = types.SimpleNamespace(
-        stream_layer_buffer=stream_layer_buffer,
-        stream_layer_probe_bytes=256,
-        stream_prefill=True,
-    )
+def _fake_layer(layer_idx=0):
+    cfg = types.SimpleNamespace(stream_prefill=True)
     rt = types.SimpleNamespace(
         cfg=cfg,
         placement=types.SimpleNamespace(num_experts=384),
@@ -56,15 +50,14 @@ def _fake_layer(stream_layer_buffer, layer_idx=0):
     return rt
 
 
-@pytest.mark.parametrize("switch", [False, True])
-def test_installer_does_not_replace_the_provider(switch):
+def test_installer_does_not_replace_the_provider():
     """Every layer must hold the very object passed in -- identity, not equality.
 
-    This must hold with the switch ON too: stage 1's wrapping belongs to
-    ``setup_streaming``, which owns the single-provider contract.
+    Any wrapping belongs to ``setup_streaming``, which owns the single-provider
+    contract; the installer itself must never substitute an object.
     """
     provider = _FakeProvider()
-    layers = [_fake_layer(switch, 0), _fake_layer(switch, 1)]
+    layers = [_fake_layer(0), _fake_layer(1)]
     install_stream_provider(provider, layers=layers)
     for rt in layers:
         assert rt._stream_provider is provider, (
