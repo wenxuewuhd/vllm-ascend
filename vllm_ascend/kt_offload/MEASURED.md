@@ -394,3 +394,61 @@ pressure `base` may be paying major faults per decode step. That would make
 "cannot be reclaimed" a real advantage of the bank, separate from speed. It is
 **not established**: it needs fault counters, and the quiet re-run will say
 whether the gap survives without memory pressure.
+
+## The headline: TTFT 2.66x, TPOT unchanged (2026-11-21)
+
+Paired on one host, one card, prompt 4096, gen 512, 10 requests per arm,
+`max_num_seqs=1`, each arm in the host-memory state it would really have:
+
+| | base (no bank, checkpoint source) | **now (full stack)** | |
+|---|---|---|---|
+| TTFT p50 | 23.62 s | **8.88 s** | **0.376x, 2.66x faster** |
+| TPOT p50 | 24.12 ms | **24.08 ms** | **0.998x -- unchanged** |
+
+```
+base ttft [22.79 22.98 23.02 23.53 23.61 23.63 23.77 23.77 24.05 24.10]
+now  ttft [ 8.53  8.58  8.61  8.76  8.81  8.95  8.99  9.03  9.16  9.20]
+base tpot [23.50 23.81 23.93 24.00 24.12 24.12 24.12 24.14 24.20 24.29]
+now  tpot [23.81 23.87 23.92 23.92 24.01 24.14 24.18 24.26 24.30 28.35]
+```
+
+TPOT's two samples overlap almost completely; 0.2% is far inside the
++-12..14% two-server-start floor, so it reads as unchanged. `base` here
+reproduces `README.md:314`'s documented 22.20 s baseline, which is what makes
+the pair trustworthy.
+
+Arm identity, from the deterministic counters (no noise floor):
+
+```
+base:  chunk lookahead OFF   layout=ND  walk=row-outer    acquire 2.36s (94%, 28.4 GiB/s)
+now:   chunk lookahead ON    layout=NZ  walk=GROUP-outer  acquire 0.08s (31%, 838.8 GiB/s)
+       HOST MOVED 49.7 of 67.2 GiB (74.0%)
+```
+
+Reproduction from nothing: `measure/REPRO_ttft8.8_tpot24.md`.
+
+### 🔴 Retraction: every earlier now/base ratio was invalid
+
+0.260x, 0.233x, 0.145x, 0.144x, 0.136x, 0.133x and the "-26.9%/-30.5% TPOT"
+beside them are **withdrawn**. The `base` arm had been measured while the
+**bank was still resident**. `base` reads the 476 GiB checkpoint through its
+page cache; the bank is 269 GiB of tmpfs, which **cannot be reclaimed**, so the
+checkpoint could not stay cached and base's gather went partly to disk:
+
+| base | bank resident | bank deleted |
+|---|---|---|
+| acquire | 4.1 / 6.2 / 20.6 GiB/s | 27.0 / 26.4 / 28.4 GiB/s |
+| TTFT p50 | 60.79 / 68.08 / 76.65 s | **23.62 s** |
+
+A fair pair therefore needs **two runs** -- `ARMS=base` with the bank deleted,
+then rebuild it and `ARMS=now` -- because the arms' memory needs are
+incompatible. Host load was not the main variable: the fair base run sat at
+loadavg 14.5-27.7.
+
+### The NZ layout's 8.64% does not reach end-to-end TPOT
+
+The kernel bench measures ND beating NZ by 8.64%, so `base` should show the
+slightly better TPOT. It does not: 24.12 vs 24.08 ms, inside the floor. The
+end-to-end runs that appeared to show `now` 8-39% *better* at TPOT were the
+same page-cache artifact. **The layout cost is real in the kernel and invisible
+in the product**, because the CPU MoE is not the decode bottleneck.
