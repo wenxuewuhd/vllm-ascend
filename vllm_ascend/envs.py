@@ -181,9 +181,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # per request by 4. Ascend's own V4.0 path already runs SWA at
     # DSV4_BLOCK_SIZES[128][0][1] = 128 on the same backend.
     "VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE": lambda: int(os.getenv("VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE") or 0),
-    # DeepSeek-V4.1 Engram storage: "ram" (default, legacy staged files)
-    # or "ssd" (ordinary file-backed mmap; requires a verified manifest).
-    # Non-sensitive; this selects backing storage, not the gather/compute path.
     # DeepSeek-V4.1 kt offload: how many threads gather streamed expert chunks
     # out of the NZ bank into the pinned staging. Empty (default) keeps what the
     # caller passed, which is bank_source.MIN_LOADER_THREADS = 4. The count is
@@ -197,6 +194,23 @@ env_variables: dict[str, Callable[[], Any]] = {
     # host has differed 15x). Default "" = no thread, no effect. Non-sensitive.
     # See vllm_ascend/kt_offload/kt_knob_ab.py.
     "VLLM_ASCEND_DSV41_KT_KNOB_FILE": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_KNOB_FILE", ""),
+    # DeepSeek-V4.1 kt offload: set to "0" to stop the streaming chain from
+    # starting the NEXT chunk's host gather while the current chunk computes.
+    # Default (unset) keeps the lookahead ON, which is the shipped behaviour and
+    # the single largest TTFT change in this work -- the acquire leg falls from
+    # 3.57 s to 0.10-0.19 s at identical bytes moved. "0" restores the
+    # pre-2026-11-18 serial path and exists so the two can be A/B'd in one
+    # binary. Non-sensitive. See vllm_ascend/kt_offload/stream_chain.py.
+    "VLLM_ASCEND_DSV41_KT_PREFETCH": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_PREFETCH", ""),
+    # DeepSeek-V4.1 kt offload, MEASUREMENT ONLY: absolute path of a file to
+    # append per-layer expert routing to, for deciding which experts are worth
+    # keeping resident. Empty (default) disables the trace entirely, including
+    # its per-token bookkeeping. Non-sensitive (it records expert ids, not
+    # tokens). See vllm_ascend/kt_offload/routing_trace.py.
+    "VLLM_ASCEND_DSV41_ROUTING_TRACE": lambda: os.getenv("VLLM_ASCEND_DSV41_ROUTING_TRACE", ""),
+    # DeepSeek-V4.1 Engram storage: "ram" (default, legacy staged files)
+    # or "ssd" (ordinary file-backed mmap; requires a verified manifest).
+    # Non-sensitive; this selects backing storage, not the gather/compute path.
     "VLLM_ASCEND_DSV41_ENGRAM_BACKEND": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_BACKEND", "ram"),
     # Absolute table directory. Empty (default) uses /dev/shm/engram_stage
     # for "ram"; "ssd" requires an explicit directory. Non-sensitive.

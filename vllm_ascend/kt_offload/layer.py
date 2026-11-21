@@ -2227,8 +2227,8 @@ def install_stream_provider(provider, *, layers=None) -> dict[int, KTLayerOffloa
         # 🔴 An OFF switch, so the serial behaviour stays reachable in the same
         # binary and the lookahead can be A/B'd instead of argued about.
         # VLLM_ASCEND_DSV41_KT_PREFETCH=0 restores the pre-2026-11-18 path.
-        import os as _os  # noqa: PLC0415 - local to keep the import graph flat
-        rt._stream_prefetch = (None if _os.environ.get("VLLM_ASCEND_DSV41_KT_PREFETCH") == "0"
+        from vllm_ascend import envs  # noqa: PLC0415 - avoids a module-level cycle
+        rt._stream_prefetch = (None if envs.VLLM_ASCEND_DSV41_KT_PREFETCH == "0"
                                else getattr(provider, "prefetch", None))
         logger.info("kt_offload stream: chunk lookahead %s (depth 1, %s)",
                     "ON" if rt._stream_prefetch is not None else "OFF",

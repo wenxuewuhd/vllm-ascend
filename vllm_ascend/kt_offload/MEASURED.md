@@ -15,11 +15,18 @@ are marked as such.
 |---|---|---|---|
 | **Host working set** | 558.8 GiB | **288.8 GiB** (−270.0) | `dropped the checkpoint's clean page cache over 48 shard(s): 267.3 -> 0.0 GiB`, `numa_placement: planned=70502400 resident_at_census=70502400` |
 | **HBM** | — | **−2.175 GiB**, plus −12.3 GiB of KV budget | sampler peak |
-| **TTFT @p=4096** | 🔴 see below | **streaming should be OFF** | 2026-11-18: not streaming is **2.0–10.7× faster** at every length measured, and there is no crossover |
-| **TPOT** | — | 🔴 **NOT MEASURABLE on this host** | four instruments, each with a null pair: floors ±12.8…14.3% against an effect of ~4%. Every TPOT number this project ever quoted is retracted. The cost's MECHANISM and its KERNEL-level size are known — see below |
+| **TTFT @p=4096** | 23.62 s | **8.88 s** (2.66× faster) | 2026-11-21, paired on one host, each arm in the host-memory state it would really have; `chunk lookahead ON`, `layout=NZ walk=GROUP-outer` |
+| **TPOT** | 24.12 ms | **24.08 ms** — unchanged | 2026-11-21, same paired run at gen 512. 0.2% is far inside the ±12…14% two-server floor. 🔴 Earlier TPOT numbers remain retracted; this is the first one with a fair base arm |
 | **Correctness** | — | **7/7 prompts token-identical**, at every step | `measure/eqdiff.py` against the stage-3 capture |
 
-The TTFT figure is two changes:
+The TTFT figure is three changes, largest first:
+
+* **the chunk lookahead** (`stream_chain.py`, `stream_io.py`): the streaming
+  chain now starts the next chunk's host gather while the current chunk
+  computes. `provider.prefetch()` existed, was tested, and had **no production
+  caller**. The acquire leg falls **3.57 s → 0.10–0.19 s at identical bytes
+  moved**; `VLLM_ASCEND_DSV41_KT_PREFETCH=0` restores the serial path in the
+  same binary. The server says `chunk lookahead ON (depth 1, provider.prefetch)`.
 
 * **loader threads 4 → 16** (`wiring.py`): the streaming read leg is ~94% of the
   staging loop, and it was running on `MIN_LOADER_THREADS` where the checkpoint
@@ -243,6 +250,25 @@ one**, 0 of 40 paired rounds slower, p=1.8e-12.
 ---
 
 ## 🔴🔴 2026-11-18: streaming prefill should not run, and the bank is still worth it
+
+> ### ⚠️ AMENDED 2026-11-21 — the 2.03x below predates the chunk lookahead
+>
+> This section's recommendation rests on `streamg` costing 2.03x `nostream` at
+> prompt 4096 (15.47 s vs 7.62 s). **That gap was measured before the chunk
+> lookahead existed.** With the lookahead on, the same streaming configuration
+> measures **8.88 s** -- so the gap to `nostream`'s 7.62 s is about **1.17x**,
+> not 2.03x, and the headline figure of this file is now a *streaming* number.
+>
+> **What this does and does not change.** `nostream` is probably still the
+> faster path at this prompt length; the margin has gone from decisive to
+> narrow, which is a different recommendation. The comparison has not been
+> re-run since the lookahead landed, so **the 2.03x is obsolete and the
+> re-measurement is owed** -- `measure/chain_cross.sh` with the lookahead on,
+> and with the bank's page-cache effect controlled for (see the retraction at
+> the end of this file).
+>
+> Read everything below as the state of knowledge on 2026-11-18.
+
 
 `measure/chain_cross.sh`, three requests per cell, no overlapping ranges:
 

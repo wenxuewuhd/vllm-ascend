@@ -39,7 +39,6 @@ possible, but two rows may share one, and the multiplicity is information).
 
 from __future__ import annotations
 
-import os
 import re
 import struct
 import threading
@@ -58,7 +57,8 @@ FLUSH_EVERY = 2048
 
 
 def _path() -> str:
-    return os.environ.get("VLLM_ASCEND_DSV41_ROUTING_TRACE", "").strip()
+    from vllm_ascend import envs  # noqa: PLC0415 - avoids a module-level cycle
+    return (envs.VLLM_ASCEND_DSV41_ROUTING_TRACE or "").strip()
 
 
 ENABLED = bool(_path())

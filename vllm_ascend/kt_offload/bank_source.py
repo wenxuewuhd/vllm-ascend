@@ -220,7 +220,8 @@ class BankSource:
         # this object is built, and the two arms of "how many threads" therefore
         # cannot live in one process -- so the campaign needs a way to set it
         # per server start without editing code between arms.
-        env = os.environ.get("VLLM_ASCEND_DSV41_KT_LOADER_THREADS", "").strip()
+        from vllm_ascend import envs  # noqa: PLC0415 - avoids a module-level cycle
+        env = (envs.VLLM_ASCEND_DSV41_KT_LOADER_THREADS or "").strip()
         if env:
             try:
                 want = int(env)
