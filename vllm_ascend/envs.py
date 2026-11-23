@@ -181,6 +181,25 @@ env_variables: dict[str, Callable[[], Any]] = {
     # per request by 4. Ascend's own V4.0 path already runs SWA at
     # DSV4_BLOCK_SIZES[128][0][1] = 128 on the same backend.
     "VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE": lambda: int(os.getenv("VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE") or 0),
+    # DeepSeek-V4.1 kt offload: how many threads gather streamed expert chunks
+    # out of the NZ bank into the pinned staging. Empty (default) keeps what the
+    # caller passed, which in production is 16 (wiring.py); the 4 in
+    # bank_source.MIN_LOADER_THREADS is only the floor for a caller that passes
+    # nothing.
+    # 🔴 This is an OPERATIONAL escape hatch, not only a measurement lever:
+    # production asks for 16 threads one per L3 domain, and one_per_l3_cpus
+    # RAISES LoaderPlacementError on a host that has fewer than 16 distinct
+    # domains. Lowering this is then the only way to start the server at all.
+    # Non-sensitive.
+    "VLLM_ASCEND_DSV41_KT_LOADER_THREADS": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_LOADER_THREADS", ""),
+    # DeepSeek-V4.1 kt offload: set to "0" to stop the streaming chain from
+    # starting the NEXT chunk's host gather while the current chunk computes.
+    # Default (unset) keeps the lookahead ON, which is the shipped behaviour and
+    # the single largest TTFT change in this work -- the acquire leg falls from
+    # 3.57 s to 0.10-0.19 s at identical bytes moved. "0" restores the
+    # pre-2026-11-18 serial path and exists so the two can be A/B'd in one
+    # binary. Non-sensitive. See vllm_ascend/kt_offload/stream_chain.py.
+    "VLLM_ASCEND_DSV41_KT_PREFETCH": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_PREFETCH", ""),
     # DeepSeek-V4.1 Engram storage: "ram" (default, legacy staged files)
     # or "ssd" (ordinary file-backed mmap; requires a verified manifest).
     # Non-sensitive; this selects backing storage, not the gather/compute path.
@@ -256,7 +275,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # takes the piecewise torch.compile + plain ACLGraph path that no DSV4.1
     # accuracy or soak number covers. Set it only to run that path on purpose.
     "VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE": lambda: os.getenv(
-        "VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE", "0"),
+        "VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE", "0"
+    ),
     # DeepSeek-V4.1 MoE offload (M0c): output directory for the per-layer
     # routed-expert frequency counter (vllm_ascend/kt_offload/expert_counter.py).
     # Empty (default) = off. Diagnostic only. Does NOT require --enforce-eager

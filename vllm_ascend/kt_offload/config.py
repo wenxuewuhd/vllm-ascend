@@ -101,6 +101,87 @@ class KTOffloadConfig:
     # deliberately BELOW that crossover so the mechanism can be exercised; a
     # production setting belongs above it.
     stream_prefill_min_tokens: int = 512
+    # Streaming prefill moves all 384 experts of all 40 layers on EVERY request
+    # -- 268.9 GiB, the whole bank -- including the ~num_resident_experts that
+    # are already in HBM. With this on, a chunk's resident members are neither
+    # gathered nor H2D'd: their layer-buffer slots are filled by a
+    # device-to-device copy out of the resident parameter, which holds the same
+    # bytes. 26% of the streamed bytes at num_resident_experts=100, on the leg
+    # the server's staging report puts at ~94% of the staging loop.
+    #
+    # 🔴 Done this way round PRECISELY so the output stays bit-identical: the
+    # fill goes into the provider's own chunk buffer, so every consumer still
+    # sees a COMPLETE chunk and the partition, the slot tables and the fp32
+    # accumulation order are untouched -- only the provenance of some slots'
+    # bytes changes. Streaming the offloaded set alone and computing the
+    # resident half separately would be less code and WOULD change the rounding
+    # (see measure/PLAN_G_stream_only_offloaded.md).
+    #
+    # 🔴 DEFAULT OFF, and it must stay off: this switch carries PRECONDITIONS
+    # (bank_dir, stream_prefill), so defaulting it on makes every config that
+    # does not meet them fail validation -- 20 of this repo's own config tests
+    # did, immediately, when it was tried. A switch with preconditions is opted
+    # into by the deployment config, not by the dataclass.
+    #
+    # The measured recommendation is to TURN IT ON wherever the preconditions
+    # hold (measure/s3_g.json does):
+    #   correctness  7/7 prompts token-identical to stage 3, both rounds
+    #   mechanism    "HOST MOVED 49.7 of 67.2 GiB (74.0%), 1000 slot(s) filled
+    #                from HBM instead" -- 198.9 GiB per request instead of 268.9
+    #   TTFT         steady state 13.79 -> 12.19 s at p=4096 (-11.6%), nine
+    #                requests per arm with NO overlap between the two ranges
+    #                (off 13.51-14.44, on 11.77-12.53)
+    #   TPOT         unchanged, as it must be: nothing in decode streams
+    # 🔴 Known and NOT explained: the first two requests of a server's life cost
+    # ~4 s more than without it. The staging counters refute both obvious
+    # causes -- the reports before and after the jump have the SAME fill shape
+    # (whole=0, mixed=120, ~3000 D2D calls, 17.5 GiB) and differ 4x in
+    # ms/chunk. It coincides with the fold re-learning the hot set. Set this to
+    # False to get the stage-3 path back.
+    stream_resident_from_hbm: bool = False
+    # Stage 2 (default off): serve the prefill staging out of a prebuilt NZ bank
+    # in /dev/shm instead of gathering from the checkpoint. Set to the bank
+    # directory, e.g. "/dev/shm/dsv41_nz_bank"; empty keeps the checkpoint path.
+    #
+    # What it changes: the bank already holds device-layout FRACTAL_NZ bytes, so
+    # the 192 scattered per-chunk segments that select + concatenate + reorder
+    # become contiguous runs, AND the per-chunk device cast disappears (the
+    # staging arrives already permuted). Measured host-read leg, paired and
+    # alternating: 220.6 -> 104.2 ms per layer, -52.4% against a 1.2% null floor.
+    #
+    # 🔴 On its own this RAISES host memory: the bank and the checkpoint page
+    # cache coexist. The -93.6 GiB only arrives once kt reads the same bank
+    # (stage 3), which lets the checkpoint mapping go.
+    bank_dir: str = ""
+    # Stage 3: let kt consume the SAME NZ bank the NPU streams from, in place,
+    # instead of reading the checkpoint. That is what removes the duplicate --
+    # ~269 GiB on this model, because the checkpoint's expert pages have to stay
+    # resident today purely for kt's zero-copy w13.
+    #
+    # Requires bank_dir and zerocopy_w13. MXFP4 only: no other kt backend knows
+    # the FRACTAL_NZ geometry, and handing one these pointers would have it read
+    # the bytes as row-major and compute wrong numbers silently (kt refuses).
+    #
+    # 🔴 It costs TPOT. The design measured the kernel-level cost at
+    # -5.1..-5.6% and planned to repay it with stage 4 (decode prefetch); the
+    # routing trace taken 2026-11-15 refutes stage 4 as designed (a demand LRU
+    # loses to a static frequency set at every cap >= 64, and the miss rate is
+    # 4x the transfer budget), so the cost is PERMANENT. The trade is one copy
+    # instead of two for roughly +5% TPOT.
+    kt_reads_bank: bool = False
+    # Start-up self-check of CANN's FRACTAL_NZ byte geometry (kt_offload/nz_geometry.py):
+    # cast a two-expert tensor at the REAL w13/w2 shapes and compare the NZ bytes against
+    # the formula this build assumes. Once per process, ~60 ms.
+    #
+    # OFF by default, and FORCED ON by bank_dir or kt_reads_bank -- any route that has kt read
+    # the same NZ bytes the NPU reads depends on that geometry, which CANN does not
+    # document and we reverse-engineered. A CANN release that changed C0 or the fractal
+    # order would not raise there: it would compute wrong numbers, quietly. Setting this
+    # false does NOT disable the check while such a route is on -- a route must not be
+    # able to switch off its own guard.
+    #
+    # Read the effective value from nz_geometry.check_enabled(cfg), never from this field.
+    verify_nz_geometry: bool = False
     # Re-pick which experts stay resident from the heat of the prefill that just
     # streamed past. Needs the CPU side to hold weights for EVERY expert it might
     # swap in -- a miss is a wrong answer, not an error. The swap is FOLDED into
@@ -118,6 +199,23 @@ class KTOffloadConfig:
     #: placement can make it local -- zero-copying it too regressed kt compute
     #: badly, while w13 alone is free.
     zerocopy_w13: bool = False
+    # Which expert tensors kt consumes IN PLACE from the checkpoint mapping.
+    #   "w13" (default) gate/up only. w13 is a contiguous row block per TP part,
+    #          so its pages place 100% node-local. w2/down is COPIED into kt's
+    #          own node-local memory: 84.4 GiB on this model.
+    #   "all"  w2/down in place too, which frees that 84.4 GiB -- at a locality
+    #          cost that is a property of the CHECKPOINT's layout, not of the
+    #          code: w2 is [hidden, full_inter/2] row-major and TP splits
+    #          `inter`, so each part owns a column slice of every row. With
+    #          full_inter/2 = 1024 B a row is a quarter of a page, so one page
+    #          carries BOTH parts' bytes and no per-page placement can beat
+    #          1/tp_count local. zerocopy_weights.hpp records -28.3% for it.
+    #
+    # 🔴 The penalty is the CHECKPOINT's, not w2's. A bank that stores w2 split
+    # per TP part makes each part's bytes contiguous and the penalty disappears
+    # -- which is what stage 3 is actually for. Until then this knob is the
+    # cheap way to MEASURE the 84.4 GiB instead of assuming it.
+    zerocopy_scope: str = "w13"
 
     #: Headroom to leave on each node when deriving where w13's pages go, GiB.
     #: The operator's JUDGEMENT; the split itself is derived from it.
@@ -166,16 +264,85 @@ class KTOffloadConfig:
         if self.resident_strategy == "explicit" and not self.resident_experts_path:
             raise ValueError("kt_offload_config.resident_strategy='explicit' needs resident_experts_path.")
         if self.stream_prefill_chunk_experts <= 0:
-            raise ValueError("kt_offload_config.stream_prefill_chunk_experts must be > 0 "
-                             "(0 would stream nothing and still cost a pass).")
+            raise ValueError(
+                "kt_offload_config.stream_prefill_chunk_experts must be > 0 "
+                "(0 would stream nothing and still cost a pass)."
+            )
         if self.stream_prefill_min_tokens <= 0:
             raise ValueError("kt_offload_config.stream_prefill_min_tokens must be > 0.")
+        # bank_dir + dynamic_resident WAS refused here: the fold copied its chosen
+        # experts out of the ND H2D landing buffers (stream_io.served_nd), which
+        # the bank path never writes, so it staged UNWRITTEN bytes into the
+        # resident set with no error -- just wrong experts from the next decode
+        # step on. The fold now reads NZ instead (fold_swap._stage_chunk_nz,
+        # fed by stream_io.served_nz, which refuses the mode it is not for), so
+        # the pair is allowed. What enforces it is no longer a config check: the
+        # fold asks the provider for its layout (``nz_device``) and both
+        # accessors refuse the other mode, which a config check could not do for
+        # a provider that is handed round.
+        if self.kt_reads_bank and not self.bank_dir:
+            raise ValueError("kt_offload_config.kt_reads_bank needs bank_dir: it points kt at the bank.")
+        if self.kt_reads_bank and not self.zerocopy_w13:
+            raise ValueError(
+                "kt_offload_config.kt_reads_bank needs zerocopy_w13: the bank is consumed IN PLACE, "
+                "and the copy path would memcpy NZ bytes into a row-major BufferB."
+            )
+        if self.kt_reads_bank and self.zerocopy_scope != "all":
+            # 🔴 Silent wrong answer, not a slowdown. Under KT_ZEROCOPY_SCOPE=w13
+            # kt STAGES w2 itself, and fp4-moe.hpp does that with an ND
+            # column-slice walk over `config.down_projs[0][expert]` -- index 0,
+            # not the TP part, and ND strides. The bank's w2 is FRACTAL_NZ and
+            # its pointers are per part, so that walk would read the wrong bytes
+            # and report nothing. (Found 2026-11-15 while looking for an arm
+            # that isolates w2's contribution to the TPOT regression; the
+            # combination had never been run.)
+            raise ValueError(
+                "kt_offload_config.kt_reads_bank needs zerocopy_scope='all': with 'w13' kt stages "
+                "w2 itself through an ND column walk, which cannot read the bank's NZ w2 -- it "
+                "would compute wrong numbers rather than fail."
+            )
+        if self.zerocopy_scope not in ("w13", "all"):
+            raise ValueError(
+                "kt_offload_config.zerocopy_scope must be 'w13' or 'all' "
+                "(the two scopes kt's KT_ZEROCOPY_SCOPE parser accepts)."
+            )
+        if self.zerocopy_scope != "w13" and not self.zerocopy_w13:
+            raise ValueError(
+                "kt_offload_config.zerocopy_scope only means anything with "
+                "zerocopy_w13=true; with zero-copy off kt copies everything."
+            )
+        if self.bank_dir and not self.stream_prefill:
+            raise ValueError(
+                "kt_offload_config.bank_dir needs stream_prefill: the bank only "
+                "replaces the source of the streamed chunks."
+            )
+        if self.stream_resident_from_hbm:
+            # Each precondition is a different silent-wrong-answer if missing.
+            # The fill happens in the provider's own chunk buffer, so the chunk
+            # the GEMM sees is complete either way.
+            if not self.stream_prefill:
+                raise ValueError(
+                    "kt_offload_config.stream_resident_from_hbm needs stream_prefill: it only "
+                    "changes where a streamed chunk's bytes come from."
+                )
+            if not self.bank_dir:
+                raise ValueError(
+                    "kt_offload_config.stream_resident_from_hbm needs bank_dir: skipping slots "
+                    "requires a source that can gather a subset of a chunk, and only the NZ bank "
+                    "can (the checkpoint gather writes whole group blocks)."
+                )
+            if self.num_resident_experts <= 0:
+                raise ValueError(
+                    "kt_offload_config.stream_resident_from_hbm with num_resident_experts=0 would "
+                    "skip nothing; it is on by mistake."
+                )
         if self.zerocopy_reserve_gib < 0:
             raise ValueError("kt_offload_config.zerocopy_reserve_gib must be >= 0.")
         if self.zerocopy_streaming_node is not None and self.zerocopy_streaming_node < 0:
             raise ValueError(
                 f"kt_offload_config.zerocopy_streaming_node={self.zerocopy_streaming_node} "
-                "must be a node id >= 0 (None derives it from the nodes' free memory).")
+                "must be a node id >= 0 (None derives it from the nodes' free memory)."
+            )
         if self.zerocopy_node_fraction is not None:
             # An illegal split must not fall back to something reasonable: a
             # silent 50/50 would make an A/B compare two arms that placed their
@@ -184,10 +351,10 @@ class KTOffloadConfig:
             if len(f) != self.threadpool_count:
                 raise ValueError(
                     f"kt_offload_config.zerocopy_node_fraction lists {len(f)} fraction(s) but "
-                    f"threadpool_count is {self.threadpool_count}; it is one per TP part.")
+                    f"threadpool_count is {self.threadpool_count}; it is one per TP part."
+                )
             if any(v < 0.0 or v > 1.0 for v in f):
-                raise ValueError(
-                    f"kt_offload_config.zerocopy_node_fraction={f} has a value outside [0, 1].")
+                raise ValueError(f"kt_offload_config.zerocopy_node_fraction={f} has a value outside [0, 1].")
         return self
 
     def _refuse_without_zerocopy_support(self) -> None:
@@ -205,27 +372,31 @@ class KTOffloadConfig:
             return
         try:
             import kt_kernel
-        except Exception as exc:                             # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             raise ValueError(
                 "kt_offload_config.zerocopy_w13: kt_kernel is not importable "
                 f"({type(exc).__name__}: {exc}), so whether this build supports zero-copy "
-                "weights cannot be established.") from exc
+                "weights cannot be established."
+            ) from exc
         import glob
         import os
+
         pkg = os.path.dirname(getattr(kt_kernel, "__file__", "") or "")
         sos = glob.glob(os.path.join(pkg, "kt_kernel_ext*.so")) if pkg else []
         if not sos:
             raise ValueError(
                 "kt_offload_config.zerocopy_w13: no kt_kernel_ext*.so next to "
                 f"{getattr(kt_kernel, '__file__', '?')}, so the build cannot be probed. "
-                "Refusing rather than assuming the switch works.")
+                "Refusing rather than assuming the switch works."
+            )
         try:
             with open(sos[0], "rb") as f:
                 blob = f.read()
         except OSError as exc:
             raise ValueError(
                 f"kt_offload_config.zerocopy_w13: cannot read {sos[0]} ({exc}) to establish "
-                "whether it supports zero-copy weights.") from exc
+                "whether it supports zero-copy weights."
+            ) from exc
         missing = [n for n in (b"KT_ZEROCOPY_WEIGHTS", b"KT_ZEROCOPY_SCOPE") if n not in blob]
         if missing:
             raise ValueError(
@@ -236,7 +407,8 @@ class KTOffloadConfig:
                 "Refusing rather than falling back, because the fallback is silent: kt would "
                 "take the copy path, hold a full private copy of w13, and the run would look "
                 "identical except for ~2/3 more anonymous memory than the pre-flight account "
-                "granted -- which surfaces later as an OOM with nothing pointing back here.")
+                "granted -- which surfaces later as an OOM with nothing pointing back here."
+            )
 
     def _refuse_without_full_set_load(self) -> None:
         """``dynamic_resident`` needs kt to hold CPU weights for EVERY expert.
@@ -252,12 +424,13 @@ class KTOffloadConfig:
             return
         try:
             from kt_kernel.utils import amx
-        except Exception as exc:                             # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             raise ValueError(
                 "kt_offload_config.dynamic_resident: kt_kernel.utils.amx is not importable "
                 f"({type(exc).__name__}: {exc}), so whether kt loads every expert's CPU weights "
                 "cannot be established. The swap-in has nowhere to demote a resident expert to "
-                "unless it does.") from exc
+                "unless it does."
+            ) from exc
         probe = getattr(amx, "_fullset_load_requested", None)
         if probe is None:
             raise ValueError(
@@ -268,13 +441,15 @@ class KTOffloadConfig:
                 "Refusing rather than falling back, because the fallback is silent: kt would keep the "
                 "CPU subset, every resident expert would stay pinned, the folded swap-in would commit "
                 "nothing -- indistinguishable from 'the heat said no change', so a run taken that way "
-                "reports 'dynamic hot experts give no gain' and is wrong.")
+                "reports 'dynamic hot experts give no gain' and is wrong."
+            )
         if not probe():
             raise ValueError(
                 "kt_offload_config.dynamic_resident needs KT_FULLSET_LOAD=1: with the CPU expert "
                 "subset (amx.py:_cpu_expert_subset_enabled) a resident expert has no CPU BufferB, so "
                 "it cannot be demoted, the policy has zero free slots and the fold is a silent no-op "
-                ".")
+                "."
+            )
 
     def _refuse_batched_dynamic_resident(self, vllm_config: Any) -> None:
         """``dynamic_resident`` runs at ``max_num_seqs == 1``, and nowhere else.
@@ -298,7 +473,8 @@ class KTOffloadConfig:
             raise ValueError(
                 "kt_offload_config.dynamic_resident needs scheduler_config.max_num_seqs to check that this "
                 "is a one-sequence-at-a-time server, and the config handed to the validator has no "
-                "scheduler_config. Refusing rather than assuming the batch size.")
+                "scheduler_config. Refusing rather than assuming the batch size."
+            )
         if int(max_num_seqs) != 1:
             raise ValueError(
                 f"kt_offload_config.dynamic_resident requires max_num_seqs=1; this server is configured for "
@@ -308,7 +484,8 @@ class KTOffloadConfig:
                 "each other out, so the set that would be made resident is the batch's flat average rather "
                 "than any request's hot set. Nothing is computed incorrectly at a larger batch; the feature "
                 "simply has no defined moment to act and nothing to act on. Serve with --max-num-seqs 1, or "
-                "turn dynamic_resident off (stream_prefill on its own has no such limit).")
+                "turn dynamic_resident off (stream_prefill on its own has no such limit)."
+            )
 
     def _validate_preconditions(self, vllm_config: Any) -> None:
         """Parallel/runtime settings the M1 implementation depends on."""
@@ -369,7 +546,8 @@ class KTOffloadConfig:
             raise ValueError(
                 "kt_offload_config.dynamic_resident needs stream_prefill: the swap-in is folded into the "
                 "streaming prefill pass and there is no other path that makes an expert "
-                "resident.")
+                "resident."
+            )
         self._refuse_batched_dynamic_resident(vllm_config)
         self._refuse_without_full_set_load()
         self._refuse_without_zerocopy_support()
@@ -385,7 +563,8 @@ class KTOffloadConfig:
             if self.stream_prefill_min_tokens <= 0:
                 raise ValueError(
                     "kt_offload_config.stream_prefill needs stream_prefill_min_tokens > 0; the "
-                    "threshold is what keeps a streamed forward out of a captured size.")
+                    "threshold is what keeps a streamed forward out of a captured size."
+                )
         pc = vllm_config.parallel_config
         sizes = {
             "tensor_parallel_size": pc.tensor_parallel_size,

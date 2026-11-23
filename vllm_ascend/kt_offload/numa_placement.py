@@ -213,7 +213,8 @@ def derive_fraction(
         raise ValueError(
             f"need_bytes_per_part must be > 0, got {need_bytes_per_part}. Without it there is "
             "no way to say whether a node can hold its part, and the only answer that does not "
-            "need it -- a normalised split -- is the bug this parameter exists to prevent.")
+            "need it -- a normalised split -- is the bug this parameter exists to prevent."
+        )
     node_ids = list(nodes) if nodes is not None else list(range(tp))
     if len(node_ids) != tp:
         raise ValueError(f"nodes lists {len(node_ids)} node(s) but tp is {tp}")
@@ -223,8 +224,12 @@ def derive_fraction(
     # The readings the ratio is derived FROM: a bare ratio in a log is
     # unfalsifiable a day later.
     for n in node_ids:
-        logger.info("kt numa_placement: %s reserve=%.1f GiB avail=%.1f GiB",
-                    mem[n], reserve_gib, mem[n].available(reserve) / GIB)
+        logger.info(
+            "kt numa_placement: %s reserve=%.1f GiB avail=%.1f GiB",
+            mem[n],
+            reserve_gib,
+            mem[n].available(reserve) / GIB,
+        )
 
     avail = [max(0, mem[n].available(reserve)) for n in node_ids]
     if sum(avail) <= 0:
@@ -341,10 +346,31 @@ class PlacementPlan:
         return dict(out)
 
     @property
+    def split_tensor_names(self) -> tuple[str, ...]:
+        """The tensors ``fraction`` actually divides, read off the segments.
+
+        🔴 Which tensors those are is a property of the SOURCE, not a constant:
+        the checkpoint splits w13 only (its w2 is a column slice of every row,
+        so a 4 KiB page carries both parts' bytes), while the NZ bank splits w2
+        too (TP divides down's k and in NZ the k-block index is outermost, so a
+        part is a contiguous, page-exclusive record). Reporting a hard-coded
+        "w13" made ``explain()`` claim w2 went whole to the streaming node while
+        the very number beside it -- 0.9412 = (w13 + w2)/total -- proved it had
+        been split.
+        """
+        return tuple(sorted({f"{s.proj}.{s.kind}" for s in self.segments if s.part is not None}))
+
+    @property
+    def whole_tensor_names(self) -> tuple[str, ...]:
+        """The tensors that go whole to ``streaming_node``; see above."""
+        return tuple(sorted({f"{s.proj}.{s.kind}" for s in self.segments if s.part is None}))
+
+    @property
     def split_share(self) -> float:
         """Fraction of the planned bytes that ``fraction`` actually governs.
 
-        ``fraction`` divides **w13 only**; ``w2`` and every ``.scale`` go whole
+        ``fraction`` divides the tensors ``split_tensor_names`` lists -- w13 for
+        the checkpoint, w13 **and w2** for the bank; whatever is left goes whole
         to ``streaming_node``. A node's share of *all* planned pages is
         therefore ``fraction[node] * split_share``, NOT ``fraction[node]``.
         """
@@ -356,29 +382,32 @@ class PlacementPlan:
         """The four percentages this module reports, each with its denominator.
 
         They are over four different populations: ``fraction[p]`` is a share
-        **of w13**, the plan's per-node percentages are over **all planned
-        pages** (``fraction[p] * split_share``). Comparing them directly reads
-        as a placement failure that does not exist.
+        **of the split tensors**, the plan's per-node percentages are over **all
+        planned pages** (``fraction[p] * split_share``). Comparing them directly
+        reads as a placement failure that does not exist.
         """
         by, n = self.planned_pages_by_node(), self.planned_pages
         rows = [
             f"  fraction          = {[round(f, 4) for f in self.fraction]}  "
             f"({self.fraction_source}) -- share OF W13 ONLY, per TP part",
-            f"  split_share       = {self.split_share:.4f} -- w13's share of the planned bytes; "
-            f"the rest ({1 - self.split_share:.4f}) is w2+scale and goes whole to "
+            f"  split_share       = {self.split_share:.4f} -- the share of the planned bytes "
+            f"`fraction` divides ({', '.join(self.split_tensor_names) or 'nothing'}); the rest "
+            f"({1 - self.split_share:.4f}) is "
+            f"{', '.join(self.whole_tensor_names) or 'nothing'} and goes whole to "
             f"node{self.streaming_node}",
-            "  plan, of ALL planned pages = "
-            + str({k: f"{100 * v / max(1, n):.2f}%" for k, v in sorted(by.items())}),
+            "  plan, of ALL planned pages = " + str({k: f"{100 * v / max(1, n):.2f}%" for k, v in sorted(by.items())}),
         ]
         for i, node in enumerate(self.part_nodes):
             if node != self.streaming_node:
                 rows.append(
                     f"    check: fraction[{i}] x split_share = {self.fraction[i]:.4f} x "
                     f"{self.split_share:.4f} = {100 * self.fraction[i] * self.split_share:.2f}% "
-                    f"= node{node}'s all-pages share above")
+                    f"= node{node}'s all-pages share above"
+                )
         rows.append(
             "  at runtime: landed/asked_for are OF THE FAULTED-IN SUBSET, and "
-            "FINAL is OF ALL RESIDENT PLANNED PAGES -- neither is comparable to `fraction`")
+            "FINAL is OF ALL RESIDENT PLANNED PAGES -- neither is comparable to `fraction`"
+        )
         return "plan denominators:\n" + "\n".join(rows)
 
     def planned_bytes_by_node(self) -> dict[int, int]:
@@ -506,11 +535,13 @@ def plan_placement(
     if fraction is None:
         # What one part must hold locally: the W13 bytes this plan covers,
         # split tp ways. Deriving without it is what pinned the split at 1/tp.
-        w13_bytes = sum(source.locate(layer, expert, proj, kind).nbytes
-                        for layer in layers for expert in experts
-                        for proj, kind in SPLIT_TENSORS)
-        frac = tuple(derive_fraction(reserve_gib, tp, nodes=nodes,
-                                     need_bytes_per_part=w13_bytes // tp))
+        w13_bytes = sum(
+            source.locate(layer, expert, proj, kind).nbytes
+            for layer in layers
+            for expert in experts
+            for proj, kind in tuple(getattr(source, "split_tensors", SPLIT_TENSORS))
+        )
+        frac = tuple(derive_fraction(reserve_gib, tp, nodes=nodes, need_bytes_per_part=w13_bytes // tp))
         source_kind = "derived"
     else:
         frac = validate_fraction(fraction, tp)
@@ -522,22 +553,60 @@ def plan_placement(
     # ratio is not landing it.
     logger.info(
         "kt numa_placement: fraction=%s (%s, OF W13 ONLY) part_nodes=%s streaming_node=%d",
-        [round(x, 4) for x in frac], source_kind, list(nodes), streaming_node,
+        [round(x, 4) for x in frac],
+        source_kind,
+        list(nodes),
+        streaming_node,
     )
+
+    # A source may own the question "which tensors split per TP part, and where
+    # is part p's byte range", because the answer is a property of its LAYOUT,
+    # not of this module. The checkpoint's answer is the default below; the NZ
+    # bank's is different in two ways, and both matter:
+    #   * its w13 parts are separate SECTIONS, so part p is not
+    #     `[p*nbytes/tp, ...)` of one span -- it is a different file offset;
+    #   * its w2 CAN be split, because TP divides down's k and in NZ the k-block
+    #     index is the outermost axis, so part p is a contiguous page-aligned
+    #     prefix. In the checkpoint w2 is a column slice of every row and cannot
+    #     be split at all, which is what the STREAMING_ONLY_TENSORS note below
+    #     is about. Do not read the bank's behaviour as contradicting it.
+    split_tensors = tuple(getattr(source, "split_tensors", SPLIT_TENSORS))
+    stream_only = tuple(t for t in (SPLIT_TENSORS + STREAMING_ONLY_TENSORS) if t not in split_tensors)
+    split_ranges = getattr(source, "split_ranges", None)
 
     segs: list[PlacementSegment] = []
     for layer in layers:
         for expert in experts:
-            for proj, kind in SPLIT_TENSORS:
-                span = source.locate(layer, expert, proj, kind)
-                for part, (s, n) in enumerate(_split_ranges(span.start, span.nbytes, tp)):
+            for proj, kind in split_tensors:
+                if split_ranges is not None:
+                    parts = split_ranges(layer, expert, proj, kind, tp)
+                else:
+                    span = source.locate(layer, expert, proj, kind)
+                    parts = [(span.path, st, nb) for st, nb in _split_ranges(span.start, span.nbytes, tp)]
+                if len(parts) != tp:
+                    raise ValueError(
+                        f"split_ranges({layer}, {expert}, {proj}, {kind}) returned {len(parts)} "
+                        f"range(s), expected one per TP part ({tp})"
+                    )
+                for part, (path, s, n) in enumerate(parts):
                     for st, nb, node, reason in _place_part(part, s, n, frac, nodes):
-                        segs.append(PlacementSegment(span.path, st, nb, node, layer, expert,
-                                                     proj, kind, part, reason))
-            for proj, kind in STREAMING_ONLY_TENSORS:
+                        segs.append(PlacementSegment(path, st, nb, node, layer, expert, proj, kind, part, reason))
+            for proj, kind in stream_only:
                 span = source.locate(layer, expert, proj, kind)
-                segs.append(PlacementSegment(span.path, span.start, span.nbytes, streaming_node,
-                                             layer, expert, proj, kind, None, "streaming-only"))
+                segs.append(
+                    PlacementSegment(
+                        span.path,
+                        span.start,
+                        span.nbytes,
+                        streaming_node,
+                        layer,
+                        expert,
+                        proj,
+                        kind,
+                        None,
+                        "streaming-only",
+                    )
+                )
     runs = _page_runs(segs)
     plan = PlacementPlan(tuple(segs), frac, source_kind, nodes, streaming_node, runs)
     # Every percentage this module prints, with the population it is over.
@@ -642,17 +711,30 @@ class MigrationReport:
         return (self.fault_bytes / GIB / self.fault_seconds) if self.fault_seconds > 0 else 0.0
 
     def merge(self, other: MigrationReport) -> None:
-        for name in ("planned_pages", "resident_pages", "examined_pages", "needed_move", "moved",
-                     "failed_pages", "retried_pages", "fault_planned_pages",
-                     "faulted_in", "fault_failed_pages", "fault_misplaced",
-                     "final_on_target", "final_off_target"):
+        for name in (
+            "planned_pages",
+            "resident_pages",
+            "examined_pages",
+            "needed_move",
+            "moved",
+            "failed_pages",
+            "retried_pages",
+            "fault_planned_pages",
+            "faulted_in",
+            "fault_failed_pages",
+            "fault_misplaced",
+            "final_on_target",
+            "final_off_target",
+        ):
             setattr(self, name, getattr(self, name) + getattr(other, name))
-        for dst, src in ((self.before_by_node, other.before_by_node),
-                         (self.after_by_node, other.after_by_node),
-                         (self.fault_by_node, other.fault_by_node),
-                         (self.fault_target_by_node, other.fault_target_by_node),
-                         (self.final_by_node, other.final_by_node),
-                         (self.errno_pages, other.errno_pages)):
+        for dst, src in (
+            (self.before_by_node, other.before_by_node),
+            (self.after_by_node, other.after_by_node),
+            (self.fault_by_node, other.fault_by_node),
+            (self.fault_target_by_node, other.fault_target_by_node),
+            (self.final_by_node, other.final_by_node),
+            (self.errno_pages, other.errno_pages),
+        ):
             for k, v in src.items():
                 dst[k] = dst.get(k, 0) + v
 
@@ -741,8 +823,7 @@ class MigrationReport:
             f"after_of_examined={ {k: f'{100 * v / res:.2f}%' for k, v in sorted(self.after_by_node.items())} } "
             f"errno={dict(sorted(self.errno_pages.items()))} "
             f"FINAL_of_all_resident={final} on_target={ok:.2f}% over {fin} page(s) "
-            f"in {self.seconds:.2f}s | "
-            + self.fault_str()
+            f"in {self.seconds:.2f}s | " + self.fault_str()
         )
 
 
@@ -765,11 +846,16 @@ class _Libc:
         self.sys_readahead = _SYS_READAHEAD[mach]
         self.libc = ctypes.CDLL("libc.so.6", use_errno=True)
         self.libc.mmap.restype = ctypes.c_void_p
-        self.libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
-                                   ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        self.libc.mmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_long,
+        ]
         self.libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-        self.libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
-                                      ctypes.POINTER(ctypes.c_ubyte)]
+        self.libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_ubyte)]
         self.libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 
     @classmethod
@@ -815,8 +901,7 @@ class _Libc:
         """``set_mempolicy(2)`` for **this thread** (a task attribute, not a
         process one -- see ``_bound_policy`` for why that matters)."""
         if node is None:
-            rc = self.libc.syscall(self.sys_set_mempolicy, MPOL_DEFAULT,
-                                   ctypes.c_void_p(None), ctypes.c_ulong(0))
+            rc = self.libc.syscall(self.sys_set_mempolicy, MPOL_DEFAULT, ctypes.c_void_p(None), ctypes.c_ulong(0))
         else:
             if not 0 <= node < _NODEMASK_BITS:
                 raise PlacementError(
@@ -824,21 +909,22 @@ class _Libc:
                     f"rather than letting the bit wrap onto a different node"
                 )
             nmask = (ctypes.c_ulong * 1)(1 << node)
-            rc = self.libc.syscall(self.sys_set_mempolicy, mode, nmask,
-                                   ctypes.c_ulong(_NODEMASK_BITS))
+            rc = self.libc.syscall(self.sys_set_mempolicy, mode, nmask, ctypes.c_ulong(_NODEMASK_BITS))
         if rc != 0:
-            raise PlacementError(
-                f"set_mempolicy(mode={mode}, node={node}) failed: "
-                f"{os.strerror(ctypes.get_errno())}"
-            )
+            raise PlacementError(f"set_mempolicy(mode={mode}, node={node}) failed: {os.strerror(ctypes.get_errno())}")
 
     def get_mempolicy(self) -> tuple[int, int]:
         """``(mode, nodemask)`` of this thread. Used to *prove* the reset ran."""
         mode = ctypes.c_int(0)
         nmask = (ctypes.c_ulong * 1)(0)
-        rc = self.libc.syscall(self.sys_get_mempolicy, ctypes.byref(mode), nmask,
-                               ctypes.c_ulong(_NODEMASK_BITS), ctypes.c_void_p(None),
-                               ctypes.c_ulong(0))
+        rc = self.libc.syscall(
+            self.sys_get_mempolicy,
+            ctypes.byref(mode),
+            nmask,
+            ctypes.c_ulong(_NODEMASK_BITS),
+            ctypes.c_void_p(None),
+            ctypes.c_ulong(0),
+        )
         if rc != 0:
             raise PlacementError(f"get_mempolicy failed: {os.strerror(ctypes.get_errno())}")
         return mode.value, nmask[0]
@@ -850,38 +936,34 @@ class _Libc:
         caller falls back to the per-page touch instead of skipping the
         population and getting ``-ENOENT`` from every ``move_pages``.
         """
-        rc = self.libc.madvise(ctypes.c_void_p(addr + first_page * PAGE_SIZE),
-                               ctypes.c_size_t(npages * PAGE_SIZE), MADV_POPULATE_READ)
+        rc = self.libc.madvise(
+            ctypes.c_void_p(addr + first_page * PAGE_SIZE), ctypes.c_size_t(npages * PAGE_SIZE), MADV_POPULATE_READ
+        )
         if rc == 0:
             return True
         err = ctypes.get_errno()
         if err == errno.EINVAL:  # pre-5.14 kernel: no such advice
             return False
-        raise PlacementError(
-            f"madvise(MADV_POPULATE_READ, {npages} pages) failed: {os.strerror(err)}")
+        raise PlacementError(f"madvise(MADV_POPULATE_READ, {npages} pages) failed: {os.strerror(err)}")
 
     def readahead(self, fd: int, offset: int, count: int) -> None:
         """``readahead(2)``. The page cache pages it allocates come from the
         *calling thread's* mempolicy, which is what makes the bind work."""
-        rc = self.libc.syscall(self.sys_readahead, fd, ctypes.c_long(offset),
-                               ctypes.c_size_t(count))
+        rc = self.libc.syscall(self.sys_readahead, fd, ctypes.c_long(offset), ctypes.c_size_t(count))
         if rc != 0:
             raise PlacementError(
-                f"readahead(fd={fd}, off={offset}, n={count}) failed: "
-                f"{os.strerror(ctypes.get_errno())}"
+                f"readahead(fd={fd}, off={offset}, n={count}) failed: {os.strerror(ctypes.get_errno())}"
             )
 
     def resident(self, addr: int, first_page: int, npages: int) -> list[int]:
         """Page indices (absolute, from ``first_page``) that are in the page cache."""
         vec = (ctypes.c_ubyte * npages)()
-        rc = self.libc.mincore(ctypes.c_void_p(addr + first_page * PAGE_SIZE),
-                               ctypes.c_size_t(npages * PAGE_SIZE), vec)
+        rc = self.libc.mincore(ctypes.c_void_p(addr + first_page * PAGE_SIZE), ctypes.c_size_t(npages * PAGE_SIZE), vec)
         if rc != 0:
             raise PlacementError(f"mincore failed: {os.strerror(ctypes.get_errno())}")
         return [first_page + i for i in range(npages) if vec[i] & 1]
 
-    def move(self, addr: int, pages: Sequence[int], node: int | None,
-             flags: int) -> list[int]:
+    def move(self, addr: int, pages: Sequence[int], node: int | None, flags: int) -> list[int]:
         """``move_pages`` over absolute page indices; returns ``status[]``.
 
         ``node=None`` is the query form (``nodes`` NULL), which reports where
@@ -891,16 +973,20 @@ class _Libc:
         arr = (ctypes.c_void_p * n)(*[addr + p * PAGE_SIZE for p in pages])
         status = (ctypes.c_int * n)()
         nodes = None if node is None else (ctypes.c_int * n)(*([node] * n))
-        rc = self.libc.syscall(self.sys_move_pages, 0, ctypes.c_ulong(n), arr,
-                               ctypes.cast(nodes, ctypes.c_void_p) if nodes is not None
-                               else ctypes.c_void_p(None),
-                               status, flags)
+        rc = self.libc.syscall(
+            self.sys_move_pages,
+            0,
+            ctypes.c_ulong(n),
+            arr,
+            ctypes.cast(nodes, ctypes.c_void_p) if nodes is not None else ctypes.c_void_p(None),
+            status,
+            flags,
+        )
         if rc < 0:
             # Only the whole-call failure. The per-page verdict is status[]:
             # rc==0 has been seen alongside "not one page moved".
             raise PlacementError(
-                f"move_pages(n={n}, node={node}, flags={flags}) failed: "
-                f"{os.strerror(ctypes.get_errno())}"
+                f"move_pages(n={n}, node={node}, flags={flags}) failed: {os.strerror(ctypes.get_errno())}"
             )
         return list(status)
 
@@ -1028,14 +1114,21 @@ class _bound_policy:
             logger.warning(
                 "kt numa_placement: set_mempolicy(MPOL_DEFAULT) reported a failure on thread "
                 "%s (%s) but get_mempolicy says the policy is already default; continuing",
-                threading.current_thread().name, err)
+                threading.current_thread().name,
+                err,
+            )
             return
         logger.critical(
             "kt numa_placement: could NOT reset the memory policy of thread %s (%s); "
             "get_mempolicy=(mode=%d, mask=%#x). That thread is left bound to node%d: every "
             "later allocation on it, and on every thread it creates from now on, is pinned "
             "to that node and will fail rather than fall back when the node is full.",
-            threading.current_thread().name, err, mode, mask, self.node)
+            threading.current_thread().name,
+            err,
+            mode,
+            mask,
+            self.node,
+        )
         # Never mask the body's exception with ours: the log above is the
         # report and the original error wins.
         if exc[0] is None:
@@ -1096,14 +1189,15 @@ def apply_placement(
         raise ValueError(f"migrate_scope must be one of {MIGRATE_SCOPES}, got {migrate_scope!r}")
     if fault_policy not in (MPOL_BIND, MPOL_PREFERRED):
         raise ValueError(
-            f"fault_policy must be MPOL_BIND ({MPOL_BIND}) or MPOL_PREFERRED "
-            f"({MPOL_PREFERRED}), got {fault_policy}"
+            f"fault_policy must be MPOL_BIND ({MPOL_BIND}) or MPOL_PREFERRED ({MPOL_PREFERRED}), got {fault_policy}"
         )
     if flags == MPOL_MF_MOVE:
         # Without MOVE_ALL, file pages kt also maps come back -EBUSY in bulk.
         # Allowed, but never silently.
-        logger.warning("kt numa_placement: MPOL_MF_MOVE without MOVE_ALL leaves a large -EBUSY "
-                       "tail on pages other processes also map")
+        logger.warning(
+            "kt numa_placement: MPOL_MF_MOVE without MOVE_ALL leaves a large -EBUSY "
+            "tail on pages other processes also map"
+        )
 
     libc = _Libc.get()
     total = MigrationReport()
@@ -1124,8 +1218,7 @@ def apply_placement(
             buf = (ctypes.c_char * size).from_address(addr)
             for lo, hi, node in runs:
                 for b in range(lo, hi, batch_pages):
-                    batches.append(_Batch(path, addr, size, fd, buf, b,
-                                          min(b + batch_pages, hi), node))
+                    batches.append(_Batch(path, addr, size, fd, buf, b, min(b + batch_pages, hi), node))
 
         # -- census: who is in the page cache and who is not ------------------
         def census(b: _Batch) -> None:
@@ -1144,8 +1237,7 @@ def apply_placement(
             # At the census, not in the fault leg: a dry run must answer "what
             # was the fault-in leg going to be asked for" without reading.
             if b.missing:
-                total.fault_target_by_node[b.node] = (
-                    total.fault_target_by_node.get(b.node, 0) + len(b.missing))
+                total.fault_target_by_node[b.node] = total.fault_target_by_node.get(b.node, 0) + len(b.missing)
 
         # The size of the read about to be done, per node, against what that
         # node has free right now: MPOL_BIND on a node that cannot take it
@@ -1157,15 +1249,21 @@ def apply_placement(
             try:
                 mem = read_node_memory(sorted(want))
                 for n, pages in sorted(want.items()):
-                    logger.info("kt numa_placement: fault-in will read %.2f GiB onto node%d "
-                                "(MemFree %.1f GiB)", pages * PAGE_SIZE / GIB, n,
-                                mem[n].mem_free / GIB)
+                    logger.info(
+                        "kt numa_placement: fault-in will read %.2f GiB onto node%d (MemFree %.1f GiB)",
+                        pages * PAGE_SIZE / GIB,
+                        n,
+                        mem[n].mem_free / GIB,
+                    )
                     if fault_policy == MPOL_BIND and pages * PAGE_SIZE > mem[n].mem_free:
                         logger.warning(
                             "kt numa_placement: MPOL_BIND wants %.2f GiB on node%d which has "
                             "%.1f GiB free -- the kernel will reclaim to make room; "
                             "MPOL_PREFERRED degrades to worse locality instead",
-                            pages * PAGE_SIZE / GIB, n, mem[n].mem_free / GIB)
+                            pages * PAGE_SIZE / GIB,
+                            n,
+                            mem[n].mem_free / GIB,
+                        )
             except PlacementError as exc:  # sysfs unreadable: say so, do not die
                 logger.warning("kt numa_placement: could not read node meminfo (%s)", exc)
 
@@ -1313,9 +1411,11 @@ def apply_placement(
             "kt numa_placement: only %.2f%% of the %d placed page(s) are on their planned node "
             "(%d off). The per-leg counters can all look clean while this is true; re-check with "
             "audit_placement() and compare against the fault-in leg's landed-vs-asked_for.",
-            100.0 * total.final_on_target / scored, scored, total.final_off_target)
+            100.0 * total.final_on_target / scored,
+            scored,
+            total.final_off_target,
+        )
     return total
-
 
 
 @dataclass
@@ -1344,8 +1444,7 @@ class PlacementAudit:
         self.resident_pages += other.resident_pages
         self.on_target += other.on_target
         self.off_target += other.off_target
-        for dst, src in ((self.by_node, other.by_node),
-                         (self.target_by_node, other.target_by_node)):
+        for dst, src in ((self.by_node, other.by_node), (self.target_by_node, other.target_by_node)):
             for k, v in src.items():
                 dst[k] = dst.get(k, 0) + v
 
@@ -1360,8 +1459,7 @@ class PlacementAudit:
         )
 
 
-def audit_placement(plan: PlacementPlan, *, threads: int = 8,
-                    batch_pages: int = 65536) -> PlacementAudit:
+def audit_placement(plan: PlacementPlan, *, threads: int = 8, batch_pages: int = 65536) -> PlacementAudit:
     """Read back where every resident planned page is. Moves nothing.
 
     Deliberately shares no state with ``apply_placement``: it re-mincores and
@@ -1376,8 +1474,7 @@ def audit_placement(plan: PlacementPlan, *, threads: int = 8,
         addr, size, fd = libc.map_readonly(path)
         try:
             buf = (ctypes.c_char * size).from_address(addr)
-            batches = [(b, min(b + batch_pages, hi), node)
-                       for lo, hi, node in runs for b in range(lo, hi, batch_pages)]
+            batches = [(b, min(b + batch_pages, hi), node) for lo, hi, node in runs for b in range(lo, hi, batch_pages)]
 
             def one(b, addr=addr, buf=buf) -> PlacementAudit:
                 lo, hi, node = b
@@ -1400,8 +1497,7 @@ def audit_placement(plan: PlacementPlan, *, threads: int = 8,
             if threads == 1 or len(batches) <= 1:
                 reports = [one(b) for b in batches]
             else:
-                with ThreadPoolExecutor(max_workers=threads,
-                                        thread_name_prefix="kt_audit") as pool:
+                with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="kt_audit") as pool:
                     reports = list(pool.map(one, batches))
             with lock:
                 for r in reports:
@@ -1435,13 +1531,28 @@ def place_weights(
     require_mutation: bool = False,
 ) -> tuple[PlacementPlan, MigrationReport]:
     """Plan + migrate in one call. The entry point wiring should use."""
-    plan = plan_placement(source, layers, experts, tp=tp, part_nodes=part_nodes,
-                          streaming_node=streaming_node, fraction=fraction,
-                          fraction_source=fraction_source, reserve_gib=reserve_gib)
-    report = apply_placement(plan, threads=threads, batch_pages=batch_pages,
-                             retries=retries, fault_in=fault_in,
-                             fault_policy=fault_policy, readahead_pages=readahead_pages,
-                             migrate_scope=migrate_scope, dry_run=dry_run)
+    plan = plan_placement(
+        source,
+        layers,
+        experts,
+        tp=tp,
+        part_nodes=part_nodes,
+        streaming_node=streaming_node,
+        fraction=fraction,
+        fraction_source=fraction_source,
+        reserve_gib=reserve_gib,
+    )
+    report = apply_placement(
+        plan,
+        threads=threads,
+        batch_pages=batch_pages,
+        retries=retries,
+        fault_in=fault_in,
+        fault_policy=fault_policy,
+        readahead_pages=readahead_pages,
+        migrate_scope=migrate_scope,
+        dry_run=dry_run,
+    )
     if require_mutation:
         report.require_applied()
     return plan, report
@@ -1480,20 +1591,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--batch-pages", type=int, default=65536)
     ap.add_argument("--retries", type=int, default=1, help="extra passes over -EBUSY pages")
-    ap.add_argument("--no-fault-in", action="store_true",
-                    help="skip the second leg: leave non-resident pages to chance")
-    ap.add_argument("--fault-policy", choices=("bind", "preferred"), default="bind",
-                    help="bind = exact but hard (reclaims a full node); preferred = graceful")
+    ap.add_argument(
+        "--no-fault-in", action="store_true", help="skip the second leg: leave non-resident pages to chance"
+    )
+    ap.add_argument(
+        "--fault-policy",
+        choices=("bind", "preferred"),
+        default="bind",
+        help="bind = exact but hard (reclaims a full node); preferred = graceful",
+    )
     ap.add_argument("--readahead-pages", type=int, default=512)
-    ap.add_argument("--migrate-scope", choices=MIGRATE_SCOPES, default="suspect",
-                    help="suspect = only what fault-in flagged plus what it never saw; "
-                         "all = re-examine everything (the old, slow arm); "
-                         "resident = negative control, never corrects the misplaced")
-    ap.add_argument("--explain", action="store_true",
-                    help="print every percentage with the population it is over, and stop")
-    ap.add_argument("--audit", action="store_true",
-                    help="after placing, re-read where EVERY planned page is (the only "
-                         "cross-scope-comparable number)")
+    ap.add_argument(
+        "--migrate-scope",
+        choices=MIGRATE_SCOPES,
+        default="suspect",
+        help="suspect = only what fault-in flagged plus what it never saw; "
+        "all = re-examine everything (the old, slow arm); "
+        "resident = negative control, never corrects the misplaced",
+    )
+    ap.add_argument(
+        "--explain", action="store_true", help="print every percentage with the population it is over, and stop"
+    )
+    ap.add_argument(
+        "--audit",
+        action="store_true",
+        help="after placing, re-read where EVERY planned page is (the only cross-scope-comparable number)",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
@@ -1505,32 +1628,49 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.mirror:
         if frac is None:
             # Same need as plan_placement's own derivation, computed the same way.
-            w13 = sum(src.locate(layer, expert, proj, kind).nbytes
-                      for layer in _parse_ints(args.layers)
-                      for expert in _parse_ints(args.experts)
-                      for proj, kind in SPLIT_TENSORS)
-            frac = derive_fraction(args.reserve_gib, args.tp, nodes=nodes,
-                                   need_bytes_per_part=w13 // args.tp)
+            w13 = sum(
+                src.locate(layer, expert, proj, kind).nbytes
+                for layer in _parse_ints(args.layers)
+                for expert in _parse_ints(args.experts)
+                for proj, kind in SPLIT_TENSORS
+            )
+            frac = derive_fraction(args.reserve_gib, args.tp, nodes=nodes, need_bytes_per_part=w13 // args.tp)
         frac = mirror_fraction(frac)
     if args.explain:
-        plan = plan_placement(src, _parse_ints(args.layers), _parse_ints(args.experts),
-                              tp=args.tp, part_nodes=nodes,
-                              streaming_node=args.streaming_node, fraction=frac,
-                              reserve_gib=args.reserve_gib)
+        plan = plan_placement(
+            src,
+            _parse_ints(args.layers),
+            _parse_ints(args.experts),
+            tp=args.tp,
+            part_nodes=nodes,
+            streaming_node=args.streaming_node,
+            fraction=frac,
+            reserve_gib=args.reserve_gib,
+        )
         print(plan.explain())
         return 0
     plan, report = place_weights(
-        src, _parse_ints(args.layers), _parse_ints(args.experts), tp=args.tp,
-        part_nodes=nodes, streaming_node=args.streaming_node, fraction=frac,
-        reserve_gib=args.reserve_gib, threads=args.threads,
-        batch_pages=args.batch_pages, retries=args.retries,
+        src,
+        _parse_ints(args.layers),
+        _parse_ints(args.experts),
+        tp=args.tp,
+        part_nodes=nodes,
+        streaming_node=args.streaming_node,
+        fraction=frac,
+        reserve_gib=args.reserve_gib,
+        threads=args.threads,
+        batch_pages=args.batch_pages,
+        retries=args.retries,
         fault_in=not args.no_fault_in,
         fault_policy=MPOL_BIND if args.fault_policy == "bind" else MPOL_PREFERRED,
-        readahead_pages=args.readahead_pages, migrate_scope=args.migrate_scope,
+        readahead_pages=args.readahead_pages,
+        migrate_scope=args.migrate_scope,
         dry_run=args.dry_run,
     )
-    print(f"plan: {plan.planned_pages} pages, by node {plan.planned_pages_by_node()}, "
-          f"fraction={[round(x, 4) for x in plan.fraction]} ({plan.fraction_source})")
+    print(
+        f"plan: {plan.planned_pages} pages, by node {plan.planned_pages_by_node()}, "
+        f"fraction={[round(x, 4) for x in plan.fraction]} ({plan.fraction_source})"
+    )
     print(f"apply: {report}")
     print(f"       {report.fault_str()}")
     if args.audit:

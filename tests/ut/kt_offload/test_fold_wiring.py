@@ -29,10 +29,10 @@ from vllm_ascend.kt_offload.resident_swap import (
 )
 
 E, SLOTS, CHUNK, TOPK = 12, 4, 3, 2
-MOE_LAYERS = (1, 2)          # not 0: a layer mix-up must be able to show
+MOE_LAYERS = (1, 2)  # not 0: a layer mix-up must be able to show
 NUM_LAYERS = 4
 OLD = (0, 1, 2, 3)
-HOT = (1, 5, 7, 10)          # keeps 1 (slot 1 -> 0), promotes 5/7/10, spans all four chunks
+HOT = (1, 5, 7, 10)  # keeps 1 (slot 1 -> 0), promotes 5/7/10, spans all four chunks
 #: one row per expert, per parameter; small but of four different widths
 PER_EXPERT = {"w13_weight": (6,), "w13_weight_scale": (2,), "w2_weight": (4,), "w2_weight_scale": (2,)}
 
@@ -103,10 +103,23 @@ class FakeProvider:
     def slot_for(self, chunk_index: int, expert_ids):
         raise AssertionError("the streaming chain is not exercised here (test_fold_swap.py does that)")
 
+    #: This fake serves ND chunks, so the fold must take the ND path. It is part
+    #: of the provider contract (``fold_swap`` reads it rather than guessing),
+    #: because guessing ND for a bank-backed provider staged 12,000 experts of
+    #: never-written bytes with every guard green.
+    nz_device = False
+
     def served_nd(self, chunk_index: int, expert_ids) -> dict[str, torch.Tensor]:
         ids = tuple(int(e) for e in expert_ids)
         self.served.append((self.layer, int(chunk_index), ids))
         return {n: torch.stack([expert_bytes(self.layer, e, n) for e in ids]) for n in SLOT_WEIGHT_ATTRS}
+
+    def served_nz(self, chunk_index: int, expert_ids):
+        raise AssertionError("this provider is in ND mode; the fold must not ask for NZ chunks")
+
+    @property
+    def nz_bytes_per_slot(self) -> dict[str, int]:
+        return {}
 
     def format_nd(self, staging: dict[str, torch.Tensor], n_rows: int) -> FakeSlot:
         out = {}
@@ -124,7 +137,7 @@ class FakeKt:
         # data_ptr; the tensor layer.py passed to the constructor is not it.
         self.gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
         self.gpu_experts_mask[list(resident)] = True
-        self.loaded = list(range(num_experts))          # KT_FULLSET_LOAD
+        self.loaded = list(range(num_experts))  # KT_FULLSET_LOAD
 
     def cpu_weight_expert_ids(self):
         return list(self.loaded)
@@ -136,12 +149,14 @@ class FakeKt:
 def _vcfg(profiled: bool = False):
     return SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(hidden_size=8, moe_intermediate_size=4,
-                                           num_experts_per_tok=TOPK, num_hidden_layers=NUM_LAYERS),
-            model="/m", enforce_eager=True),
+            hf_text_config=SimpleNamespace(
+                hidden_size=8, moe_intermediate_size=4, num_experts_per_tok=TOPK, num_hidden_layers=NUM_LAYERS
+            ),
+            model="/m",
+            enforce_eager=True,
+        ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
-        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="NONE"),
-                                           cudagraph_capture_sizes=[]),
+        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="NONE"), cudagraph_capture_sizes=[]),
         cache_config=SimpleNamespace(num_gpu_blocks=1234 if profiled else None),
     )
 
@@ -150,7 +165,8 @@ def make_module() -> torch.nn.Module:
     mod = torch.nn.Module()
     for name, shape in PER_EXPERT.items():
         mod.register_parameter(
-            name, torch.nn.Parameter(torch.zeros((SLOTS, *shape), dtype=torch.uint8), requires_grad=False))
+            name, torch.nn.Parameter(torch.zeros((SLOTS, *shape), dtype=torch.uint8), requires_grad=False)
+        )
     return mod
 
 
@@ -169,14 +185,19 @@ class Model:
     def __init__(self, monkeypatch, *, profiled: bool = False, resident=OLD):
         kl._reset_offload_registry()
         monkeypatch.setattr(kl, "_capturing", lambda: False)
-        monkeypatch.setattr(kl.KTLayerOffload, "_build_wrapper",
-                            lambda rt: FakeKt(E, rt.placement.resident_ids))
+        monkeypatch.setattr(kl.KTLayerOffload, "_build_wrapper", lambda rt: FakeKt(E, rt.placement.resident_ids))
         monkeypatch.setattr(torch_npu, "copy_memory_", _copy_memory_, raising=False)
         sets = [list(resident)] * NUM_LAYERS
         plan = build_plan(sets, E)
-        cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=1, num_resident_experts=SLOTS,
-                              stream_prefill=True, stream_prefill_min_tokens=4,
-                              stream_prefill_chunk_experts=CHUNK, dynamic_resident=True)
+        cfg = KTOffloadConfig(
+            enabled=True,
+            cpuinfer_threads=1,
+            num_resident_experts=SLOTS,
+            stream_prefill=True,
+            stream_prefill_min_tokens=4,
+            stream_prefill_chunk_experts=CHUNK,
+            dynamic_resident=True,
+        )
         self.rt: dict[int, kl.KTLayerOffload] = {}
         self.mod: dict[int, torch.nn.Module] = {}
         for i in MOE_LAYERS:
@@ -211,8 +232,9 @@ _SEQ = itertools.count(1)
 def publish_one_chunk(key: str | None = None, tokens: int = 32):
     """What the runner publishes for a prompt that fits in one prefill forward."""
     n = next(_SEQ)
-    w = prefill_window.PrefillWindow(key=key or f"req{n}", first=True, last=True, computed=0,
-                                     scheduled=tokens, prompt_len=tokens, seq=n)
+    w = prefill_window.PrefillWindow(
+        key=key or f"req{n}", first=True, last=True, computed=0, scheduled=tokens, prompt_len=tokens, seq=n
+    )
     prefill_window.publish(w)
     return w
 
@@ -271,7 +293,7 @@ def test_the_assembled_targets_are_what_the_forward_reads(model):
         for name in SLOT_WEIGHT_ATTRS:
             assert tg.weights[name] is getattr(model.mod[i], name)
         assert tg.kt_mask is rt.wrapper.gpu_experts_mask
-        assert tg.kt_cpu_weight_ids == ALL_CPU_WEIGHTS   # what this kt says it loaded
+        assert tg.kt_cpu_weight_ids == ALL_CPU_WEIGHTS  # what this kt says it loaded
 
 
 @pytest.mark.parametrize("key", ["slot_tables", "keep_tables", "weights", "kt_mask"])
@@ -326,7 +348,7 @@ def test_a_rebake_detaches_the_targets_and_the_commit_is_refused(model):
     assert "resident count" in str(before.value)
     assert "not what the forward reads" not in str(before.value)
 
-    rt.after_weights_loaded(mod)        # process_weights_after_loading runs again
+    rt.after_weights_loaded(mod)  # process_weights_after_loading runs again
     with pytest.raises(SwapError, match="not what the forward reads"):
         fold.committer.commit(*args)
     assert live_target_violations(fold.committer.targets(i), **rt.live_swap_objects()) != []
@@ -350,7 +372,7 @@ def test_the_step_number_is_one_per_forward_not_one_per_layer(model):
     fold = model.install()
     seen = []
     for _ in range(3):
-        for i in MOE_LAYERS:                     # a forward walks the layers in order
+        for i in MOE_LAYERS:  # a forward walks the layers in order
             model.rt[i]._fold_for_this_forward()
             seen.append(fold.step_source())
     assert seen == [1, 1, 2, 2, 3, 3]
@@ -386,7 +408,7 @@ def test_the_install_registers_the_end_of_prefill_check(model, monkeypatch):
 
     publish_one_chunk(key="never-folded")
     assert said == [], "nothing has ended yet"
-    prefill_window.publish(None)                       # the step after: not prefilling any more
+    prefill_window.publish(None)  # the step after: not prefilling any more
     assert len(said) == 1 and "never-folded" in said[0], said
     assert fold.coverage.prefills_without_commit == 1
 
@@ -418,8 +440,9 @@ def test_build_refuses_a_foreign_module(model):
 def test_build_refuses_before_the_tables_are_baked(monkeypatch):
     monkeypatch.setattr(kl.KTLayerOffload, "_build_wrapper", lambda rt: FakeKt(E, rt.placement.resident_ids))
     plan = build_plan([list(OLD)] * NUM_LAYERS, E)
-    rt = kl.KTLayerOffload(KTOffloadConfig(enabled=True, cpuinfer_threads=1, num_resident_experts=SLOTS),
-                           plan.layer(1), 1, _vcfg())
+    rt = kl.KTLayerOffload(
+        KTOffloadConfig(enabled=True, cpuinfer_threads=1, num_resident_experts=SLOTS), plan.layer(1), 1, _vcfg()
+    )
     with pytest.raises(RuntimeError, match="no module bound"):
         rt.live_swap_objects()
     with pytest.raises(RuntimeError, match="different module"):
@@ -438,12 +461,14 @@ def test_a_layer_with_no_kt_half_cannot_be_folded(monkeypatch):
     kl._reset_offload_registry()
     monkeypatch.setattr(kl, "_capturing", lambda: False)
     plan = build_plan([list(range(E))] * NUM_LAYERS, E)
-    rt = kl.KTLayerOffload(KTOffloadConfig(enabled=True, cpuinfer_threads=1, num_resident_experts=E),
-                           plan.layer(1), 1, _vcfg())
+    rt = kl.KTLayerOffload(
+        KTOffloadConfig(enabled=True, cpuinfer_threads=1, num_resident_experts=E), plan.layer(1), 1, _vcfg()
+    )
     mod = torch.nn.Module()
     for name, shape in PER_EXPERT.items():
-        mod.register_parameter(name, torch.nn.Parameter(torch.zeros((E, *shape), dtype=torch.uint8),
-                                                        requires_grad=False))
+        mod.register_parameter(
+            name, torch.nn.Parameter(torch.zeros((E, *shape), dtype=torch.uint8), requires_grad=False)
+        )
     rt.after_weights_loaded(mod)
     assert rt.wrapper is None
     with pytest.raises(RuntimeError, match="no kt wrapper"):
@@ -452,8 +477,7 @@ def test_a_layer_with_no_kt_half_cannot_be_folded(monkeypatch):
 
 
 def expected_placement(layer: int, ids=HOT) -> LayerPlacement:
-    return LayerPlacement(layer_idx=layer, num_experts=E, num_slots=SLOTS,
-                          resident_ids=tuple(sorted(ids)))
+    return LayerPlacement(layer_idx=layer, num_experts=E, num_slots=SLOTS, resident_ids=tuple(sorted(ids)))
 
 
 def test_the_commit_lands_on_the_objects_the_forward_reads(model):
@@ -485,9 +509,12 @@ def test_the_commit_lands_on_the_objects_the_forward_reads(model):
     # the other layer was not touched by this layer's commit
     other = model.rt[MOE_LAYERS[1]]
     assert fold.committer.placement(MOE_LAYERS[1]).resident_ids == OLD
-    assert torch.equal(other._slot_tables[torch.int32],
-                       LayerPlacement(layer_idx=MOE_LAYERS[1], num_experts=E, num_slots=SLOTS,
-                                      resident_ids=OLD).safe_slot_table(torch.int32))
+    assert torch.equal(
+        other._slot_tables[torch.int32],
+        LayerPlacement(layer_idx=MOE_LAYERS[1], num_experts=E, num_slots=SLOTS, resident_ids=OLD).safe_slot_table(
+            torch.int32
+        ),
+    )
 
 
 def test_every_layer_lands_and_the_coverage_is_the_chosen_set(model):
