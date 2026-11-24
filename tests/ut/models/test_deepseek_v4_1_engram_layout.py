@@ -40,13 +40,27 @@ def test_derived_shapes(layout):
 def test_row_index_is_token_major(layout):
     """Token-major, not head-major. Both orderings are dense and total, which
     is exactly why swapping them produces no error."""
-    assert layout.row_index(0, 0) == 0
-    assert layout.row_index(0, 23) == 23
-    assert layout.row_index(1, 0) == 24
-    assert layout.row_index(5, 7) == 127
+    assert layout.row_index(0, 0, 24) == 0
+    assert layout.row_index(0, 23, 24) == 23
+    assert layout.row_index(1, 0, 24) == 24
+    assert layout.row_index(5, 7, 24) == 127
     # every (token, col) pair maps to a distinct row, with no gaps
-    seen = {layout.row_index(t, c) for t in range(4) for c in range(24)}
+    seen = {layout.row_index(t, c, 24) for t in range(4) for c in range(24)}
     assert seen == set(range(96))
+
+
+def test_row_index_is_dense_over_the_local_columns(layout):
+    """The staging buffer holds only this rank's columns, so the stride is the
+    LOCAL count. Passing the model-wide 24 here under TP=4 is precisely the
+    bug the old refuse-all-sharding guard existed to prevent: it would leave
+    three quarters of the buffer unwritten and read ids for the wrong rows."""
+    local = 6                      # 24 hash columns over 4 ranks
+    assert layout.row_index(0, 0, local) == 0
+    assert layout.row_index(0, 5, local) == 5
+    assert layout.row_index(1, 0, local) == 6
+    seen = {layout.row_index(t, c, local)
+            for t in range(4) for c in range(local)}
+    assert seen == set(range(4 * local))
 
 
 def test_staging_sizes_match_the_measured_figures(layout):
@@ -57,27 +71,43 @@ def test_staging_sizes_match_the_measured_figures(layout):
     assert layout.staging_shapes(256) == ((6144, 256), (6144, 8))
 
 
+def test_staging_sizes_follow_the_local_column_count(layout):
+    """Under TP the buffer is sized for this rank's columns only; sizing it
+    with the model-wide count would over-allocate by the TP size and disagree
+    with the row count the fill path derives from part_n_hash_cols."""
+    assert layout.staging_shapes(256, 6) == ((1536, 256), (1536, 8))
+    assert layout.staging_bytes(256, 6) * 4 == layout.staging_bytes(256)
+    # the default stays the undivided count, i.e. the TP=1 behaviour
+    assert layout.staging_shapes(256, None) == layout.staging_shapes(256)
+
+
 # -- guard 1: the TP=1 degeneracy this numbering relies on --------------------
 
 
-def test_undivided_hash_columns_are_accepted(layout):
-    layout.assert_head_sharding_is_degenerate(24, 24, 0)
-
-
 @pytest.mark.parametrize("local,total,start", [
-    (12, 24, 0),     # sharded across two ranks
+    (24, 24, 0),     # TP=1: the undivided case
+    (12, 24, 0),     # sharded across two ranks ...
     (12, 24, 12),    # ... and this is the second one
-    (24, 24, 24),    # nonzero start with full width
-    (8, 8, 0),       # a different column count entirely
+    (6, 24, 18),     # TP=4, last rank -- the shape that used to be refused
 ])
-def test_any_sharding_is_refused(layout, local, total, start):
-    """Relying on a degenerate case is fine; relying on it silently is not.
+def test_well_formed_column_shards_are_accepted(layout, local, total, start):
+    """Sharding is supported now: the ids are global row numbers and every
+    rank maps the whole table, so a rank only gathers its own columns."""
+    layout.assert_column_shard_is_well_formed(local, total, start)
 
-    Under sharding row_index would keep returning valid row numbers for the
-    wrong rows, which is indistinguishable from working.
-    """
-    with pytest.raises(ValueError, match="undivided hash columns"):
-        layout.assert_head_sharding_is_degenerate(local, total, start)
+
+@pytest.mark.parametrize("local,total,start,match", [
+    (24, 24, 24, "of only 24"),       # window runs off the end
+    (6, 24, 20, "of only 24"),        # ... and so does an undivisible one
+    (8, 8, 0, "disagrees with"),      # a different column count entirely
+    (0, 24, 0, "degenerate"),         # owns nothing
+    (6, 24, -1, "degenerate"),        # negative start
+])
+def test_malformed_column_shard_is_refused(layout, local, total, start, match):
+    """A bad window would gather valid row numbers for the WRONG columns,
+    which no downstream check notices, so it has to fail here."""
+    with pytest.raises(ValueError, match=match):
+        layout.assert_column_shard_is_well_formed(local, total, start)
 
 
 # -- guard 2: config shapes against the files themselves ----------------------
@@ -161,14 +191,14 @@ def test_each_staging_row_holds_the_table_row_that_token_asked_for(layout):
     row_ids = np.empty(num_tokens * layout.n_hash_cols, dtype=np.int64)
     for t in range(num_tokens):
         for c in range(layout.n_hash_cols):
-            row_ids[layout.row_index(t, c)] = hash_ids[t, c]
+            row_ids[layout.row_index(t, c, layout.n_hash_cols)] = hash_ids[t, c]
 
     ow, os_ = _empty_staging(layout, num_tokens)
     gather_into_staging(wt, st, row_ids, ow, os_)
 
     for t in range(num_tokens):
         for c in range(layout.n_hash_cols):
-            r = layout.row_index(t, c)
+            r = layout.row_index(t, c, layout.n_hash_cols)
             want = hash_ids[t, c]
             assert np.array_equal(ow[r], wt[want]), (t, c)
             assert np.array_equal(os_[r], st[want]), (t, c)
@@ -194,7 +224,8 @@ def test_a_head_major_ordering_is_wrong_without_being_invalid(layout):
         ids = np.empty(num_tokens * layout.n_hash_cols, dtype=np.int64)
         for t in range(num_tokens):
             for c in range(layout.n_hash_cols):
-                r = (c * num_tokens + t) if head_major else layout.row_index(t, c)
+                r = ((c * num_tokens + t) if head_major
+                     else layout.row_index(t, c, layout.n_hash_cols))
                 ids[r] = hash_ids[t, c]
         ow, os_ = _empty_staging(layout, num_tokens)
         gather_into_staging(wt, st, ids, ow, os_)
@@ -242,7 +273,8 @@ def test_an_off_by_one_row_shift_is_wrong_without_being_invalid(layout):
         ids = np.empty(n_staging, dtype=np.int64)
         for t in range(num_tokens):
             for c in range(layout.n_hash_cols):
-                ids[(layout.row_index(t, c) + shift) % n_staging] = hash_ids[t, c]
+                ids[(layout.row_index(t, c, layout.n_hash_cols) + shift)
+                    % n_staging] = hash_ids[t, c]
         ow, os_ = _empty_staging(layout, num_tokens)
         gather_into_staging(wt, st, ids, ow, os_)
         return ow
